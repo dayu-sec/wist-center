@@ -337,7 +337,7 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     ) -> Result<GatewayCustomerBindingRecord, StoreError>;
     /// 查询全部网关-客户绑定。
     async fn list_customer_bindings(&self)
-        -> Result<Vec<GatewayCustomerBindingRecord>, StoreError>;
+    -> Result<Vec<GatewayCustomerBindingRecord>, StoreError>;
     /// 查询某 gateway 下的全部 Agent 状态（按 agent_id 排序）。
     async fn list_agents_by_gateway(
         &self,
@@ -632,11 +632,11 @@ impl FileStore {
     /// 生命周期：Provisioned → Initializing（幂等，Running 后不降级），并记录转变事件。
     pub fn mark_gateway_initializing(&self, gateway_id: &str) -> Result<(), StoreError> {
         let changed: bool = self.update(|snapshot| {
-            if let Some(stored) = snapshot.gateways.get_mut(gateway_id) {
-                if stored.lifecycle_state == Some(GatewayInstanceLifecycleState::Provisioned) {
-                    stored.lifecycle_state = Some(GatewayInstanceLifecycleState::Initializing);
-                    return true;
-                }
+            if let Some(stored) = snapshot.gateways.get_mut(gateway_id)
+                && stored.lifecycle_state == Some(GatewayInstanceLifecycleState::Provisioned)
+            {
+                stored.lifecycle_state = Some(GatewayInstanceLifecycleState::Initializing);
+                return true;
             }
             false
         })?;
@@ -1181,7 +1181,7 @@ fn unlock_file(file: &fs::File) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-extern "C" {
+unsafe extern "C" {
     fn flock(fd: std::os::raw::c_int, operation: std::os::raw::c_int) -> std::os::raw::c_int;
 }
 
@@ -1302,31 +1302,41 @@ mod tests {
         let path = test_store_path();
         let store = FileStore::new(&path);
         store.create_gateway("gw-b", "boot-x").expect("create");
-        assert!(store
-            .consume_bootstrap_token("gw-b", "boot-x")
-            .expect("consume"));
-        assert!(store.load().expect("load").gateways["gw-b"]
-            .bootstrap_token_hash
-            .is_empty());
+        assert!(
+            store
+                .consume_bootstrap_token("gw-b", "boot-x")
+                .expect("consume")
+        );
+        assert!(
+            store.load().expect("load").gateways["gw-b"]
+                .bootstrap_token_hash
+                .is_empty()
+        );
         // 已消费 → false（防重放）。
-        assert!(!store
-            .consume_bootstrap_token("gw-b", "boot-x")
-            .expect("re-consume"));
+        assert!(
+            !store
+                .consume_bootstrap_token("gw-b", "boot-x")
+                .expect("re-consume")
+        );
         // 错 token → false。
         let path2 = test_store_path();
         let store2 = FileStore::new(&path2);
         store2.create_gateway("gw-b", "boot-x").expect("create");
-        assert!(!store2
-            .consume_bootstrap_token("gw-b", "wrong")
-            .expect("wrong"));
+        assert!(
+            !store2
+                .consume_bootstrap_token("gw-b", "wrong")
+                .expect("wrong")
+        );
         // 已初始化 → false。
         let path3 = test_store_path();
         let store3 = FileStore::new(&path3);
         store3.create_gateway("gw-b", "boot-x").expect("create");
         store3.mark_gateway_initializing("gw-b").expect("init");
-        assert!(!store3
-            .consume_bootstrap_token("gw-b", "boot-x")
-            .expect("initialized"));
+        assert!(
+            !store3
+                .consume_bootstrap_token("gw-b", "boot-x")
+                .expect("initialized")
+        );
 
         for path in [path, path2, path3] {
             let _ = fs::remove_file(path);
@@ -1339,9 +1349,11 @@ mod tests {
         let store = FileStore::new(&path);
         store.create_gateway("gw-c", "boot-x").expect("create");
         let expires = Some("2026-09-01T00:00:00Z".to_string());
-        assert!(store
-            .update_gateway_credential("gw-c", "sha256:runtime", expires.clone())
-            .expect("update"));
+        assert!(
+            store
+                .update_gateway_credential("gw-c", "sha256:runtime", expires.clone())
+                .expect("update")
+        );
         let snapshot = store.load().expect("load");
         let stored = &snapshot.gateways["gw-c"];
         assert_eq!(stored.credential_token_hash, "sha256:runtime");
@@ -1351,9 +1363,11 @@ mod tests {
         );
         assert_eq!(stored.credential_expires_at, expires);
         // 未知网关 → false。
-        assert!(!store
-            .update_gateway_credential("gw-nope", "h", None)
-            .expect("unknown"));
+        assert!(
+            !store
+                .update_gateway_credential("gw-nope", "h", None)
+                .expect("unknown")
+        );
         let _ = fs::remove_file(path);
     }
 
@@ -1416,10 +1430,11 @@ mod tests {
             .consume_enrollment_token("enroll-tok-2")
             .expect_err("revoked reject");
         assert_eq!(err.reason(), &StoreReason::Enrollment);
-        assert!(err
-            .detail()
-            .as_deref()
-            .is_some_and(|reason| reason.starts_with("token status")));
+        assert!(
+            err.detail()
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("token status"))
+        );
         let err = store
             .revoke_enrollment_token("gw-999", &token2.token_id)
             .expect_err("gateway mismatch");
@@ -1453,10 +1468,12 @@ mod tests {
             .expect("lookup")
             .expect("some");
         assert_eq!(latest.token_id, "enroll-gw-001-2");
-        assert!(store
-            .get_enrollment_token_for_gateway("gw-999")
-            .expect("lookup")
-            .is_none());
+        assert!(
+            store
+                .get_enrollment_token_for_gateway("gw-999")
+                .expect("lookup")
+                .is_none()
+        );
 
         let _ = fs::remove_file(path);
     }

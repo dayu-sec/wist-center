@@ -3,17 +3,17 @@
 // schema 由 docker/initdb/01_schema.sql 在首次启动时建表。
 
 use orion_error::{conversion::ToStructError, prelude::*};
-use sqlx::{postgres::PgPoolOptions, FromRow, PgPool, Row};
-use wist_control::types::DateTime;
+use sqlx::{FromRow, PgPool, Row, postgres::PgPoolOptions};
 use wist_control::GatewayInstanceLifecycleState;
+use wist_control::types::DateTime;
 use wist_error::{StoreError, StoreReason};
 
 use crate::config::GatewayCredentialSeed;
 
 use super::{
-    sha256_hex, EnrollmentTokenIssue, GatewayCustomerBindingRecord, GatewayStatusUpdate,
-    LifecycleEvent, ReleaseRecord, Store, StoredAgent, StoredEnrollmentToken, StoredGateway,
-    StoredGatewayCredentialStatus, UpgradePlanRecord,
+    EnrollmentTokenIssue, GatewayCustomerBindingRecord, GatewayStatusUpdate, LifecycleEvent,
+    ReleaseRecord, Store, StoredAgent, StoredEnrollmentToken, StoredGateway,
+    StoredGatewayCredentialStatus, UpgradePlanRecord, sha256_hex,
 };
 
 #[derive(Debug, Clone)]

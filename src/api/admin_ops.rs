@@ -4,10 +4,10 @@
 use std::net::SocketAddr;
 
 use axum::{
-    extract::{connect_info::ConnectInfo, Path, Query, State},
+    Json,
+    extract::{Path, Query, State, connect_info::ConnectInfo},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    Json,
 };
 
 use wist_control::types::DateTime;
@@ -22,8 +22,8 @@ use wist_control::{
 use crate::infra::{StoreReason, StoredGateway, UpgradePlanRecord};
 
 use super::{
-    admin_auth::require_admin_bearer, build_control_center_trust_bundle,
-    control_center_tls_required, rate_limit, ApiState,
+    ApiState, admin_auth::require_admin_bearer, build_control_center_trust_bundle,
+    control_center_tls_required, rate_limit,
 };
 
 /// 创建网关实例请求体：对齐模型 `AdminCreateGatewayInstance`（gateway_name/requested_by）。
@@ -1636,10 +1636,12 @@ mod tests {
             serde_json::from_slice(&body).expect("json");
         // 证书内容随响应交付 + 安装命令挂载到 config.toml 引用的 trust_bundle 路径。
         assert!(returned.install.trust_bundle_pem.is_some());
-        assert!(returned
-            .install
-            .install_command
-            .contains("-v ./control-center.pem:/etc/wist-gateway/ca/control-center.pem:ro"));
+        assert!(
+            returned
+                .install
+                .install_command
+                .contains("-v ./control-center.pem:/etc/wist-gateway/ca/control-center.pem:ro")
+        );
         // 置备引导 Token 随 create 响应交付一次（admin 页面展示）；config.toml 不再在 create 生成。
         assert!(!returned.install.setup_token.is_empty());
 

@@ -174,9 +174,12 @@ impl CenterConfig {
 
 /// 读取可选 env URL：未设置或空/纯空白 → None。
 fn parse_optional_env_url(key: &str) -> Option<String> {
-    env::var(key)
-        .ok()
-        .map(|value| value.trim().to_string())
+    normalize_optional_url(env::var(key).ok())
+}
+
+/// 归一可选值：去空白后为空 → None。
+fn normalize_optional_url(raw: Option<String>) -> Option<String> {
+    raw.map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
 
@@ -241,17 +244,13 @@ mod tests {
     }
 
     #[test]
-    fn parses_optional_env_url_trimming_blank() {
-        // 测试专用 env key，避免与其他并行测试互相污染。
-        let key = "WARP_INSIGHT_CENTER_TEST_OPTIONAL_URL";
-        std::env::set_var(key, "http://127.0.0.1:8428");
+    fn normalize_optional_url_trims_blank() {
         assert_eq!(
-            parse_optional_env_url(key).as_deref(),
+            normalize_optional_url(Some("http://127.0.0.1:8428".to_string())).as_deref(),
             Some("http://127.0.0.1:8428")
         );
-        std::env::set_var(key, "  ");
-        assert_eq!(parse_optional_env_url(key), None);
-        std::env::remove_var(key);
-        assert_eq!(parse_optional_env_url(key), None);
+        assert_eq!(normalize_optional_url(Some("  ".to_string())), None);
+        assert_eq!(normalize_optional_url(Some(String::new())), None);
+        assert_eq!(normalize_optional_url(None), None);
     }
 }

@@ -3,13 +3,13 @@
 // 代码库统一采用 admin bearer token 模式（jwt 后续对齐）。
 
 use axum::{
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
 
 use crate::infra::sha256_hex;
 
-use super::{rate_limit, ApiState};
+use super::{ApiState, rate_limit};
 
 const ADMIN_AUTH_SCOPE: &str = "admin";
 

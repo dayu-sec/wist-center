@@ -3,12 +3,12 @@
 use std::sync::{Arc, Mutex};
 
 use axum::{
+    Router,
     extract::Request,
-    http::{header, HeaderValue},
-    middleware::{from_fn, Next},
+    http::{HeaderValue, header},
+    middleware::{Next, from_fn},
     response::Response,
     routing::{get, post},
-    Router,
 };
 
 use wist_control::ControlCenterTrustBundle;

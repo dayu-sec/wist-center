@@ -67,8 +67,8 @@ pub struct ObjectStorageArtifactStore {
 
 impl ObjectStorageArtifactStore {
     pub fn new(config: &ObjectStorageConfig) -> Result<Self, String> {
-        use aws_sdk_s3::config::{Credentials, Region};
         use aws_sdk_s3::Config;
+        use aws_sdk_s3::config::{Credentials, Region};
 
         let creds = Credentials::new(
             &config.access_key,
@@ -122,10 +122,10 @@ impl ArtifactStore for ObjectStorageArtifactStore {
 
 /// 按配置选择制品存储：对象存储初始化失败时回退本地文件。
 pub fn build_artifact_store(config: &CenterConfig) -> Arc<dyn ArtifactStore> {
-    if let Some(object_storage) = &config.object_storage {
-        if let Ok(store) = ObjectStorageArtifactStore::new(object_storage) {
-            return Arc::new(store);
-        }
+    if let Some(object_storage) = &config.object_storage
+        && let Ok(store) = ObjectStorageArtifactStore::new(object_storage)
+    {
+        return Arc::new(store);
     }
     Arc::new(LocalArtifactStore::new(
         config.artifact_dir.clone(),

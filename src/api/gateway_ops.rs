@@ -5,10 +5,10 @@
 use std::net::SocketAddr;
 
 use axum::{
-    extract::{connect_info::ConnectInfo, Path, Query, State},
-    http::{header, HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
     Json,
+    extract::{Path, Query, State, connect_info::ConnectInfo},
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
 };
 
 use wist_control::types::DateTime;
@@ -21,11 +21,11 @@ use wist_control::{
 };
 
 use crate::infra::{
-    derive_regist_token, new_secret_token, sha256_hex, EnrollmentTokenIssue, GatewayStatusUpdate,
-    StoreReason, StoredAgent, StoredGateway, StoredGatewayCredentialStatus,
+    EnrollmentTokenIssue, GatewayStatusUpdate, StoreReason, StoredAgent, StoredGateway,
+    StoredGatewayCredentialStatus, derive_regist_token, new_secret_token, sha256_hex,
 };
 
-use super::{build_control_center_trust_bundle, control_center_tls_required, rate_limit, ApiState};
+use super::{ApiState, build_control_center_trust_bundle, control_center_tls_required, rate_limit};
 
 const GATEWAY_AUTH_SCOPE: &str = "gateway";
 /// 注册自携带 token 鉴权，无网关身份可查，独立限流桶防 token 暴力枚举。
@@ -98,17 +98,16 @@ pub async fn submit_agent_status(
                 )
                     .into_response();
             }
-            if let Some(vm_url) = &state.config.victoriametrics_url {
-                if let Err(err) = crate::infra::vm::push_agent_status(
+            if let Some(vm_url) = &state.config.victoriametrics_url
+                && let Err(err) = crate::infra::vm::push_agent_status(
                     vm_client(),
                     vm_url,
                     &input.gateway_id,
                     &stored,
                 )
                 .await
-                {
-                    eprintln!("warn agent_status vm push failed: {err}");
-                }
+            {
+                eprintln!("warn agent_status vm push failed: {err}");
             }
             (
                 StatusCode::OK,
@@ -507,12 +506,11 @@ pub async fn submit_gateway_status(
                     .into_response();
             }
             // 时序历史：配置了 VictoriaMetrics 则推送指标（失败仅告警，不影响上报成功）。
-            if let Some(vm_url) = &state.config.victoriametrics_url {
-                if let Err(err) =
+            if let Some(vm_url) = &state.config.victoriametrics_url
+                && let Err(err) =
                     crate::infra::vm::push_gateway_status(vm_client(), vm_url, &update).await
-                {
-                    eprintln!("warn gateway_status vm push failed: {err}");
-                }
+            {
+                eprintln!("warn gateway_status vm push failed: {err}");
             }
             (
                 StatusCode::OK,
@@ -627,10 +625,10 @@ async fn authenticate_gateway(
     if gateway.credential_status != StoredGatewayCredentialStatus::Active {
         return Err((StatusCode::UNAUTHORIZED, "gateway credential is not active").into_response());
     }
-    if let Some(expires_at) = &gateway.credential_expires_at {
-        if credential_is_expired(expires_at) {
-            return Err((StatusCode::UNAUTHORIZED, "gateway credential is expired").into_response());
-        }
+    if let Some(expires_at) = &gateway.credential_expires_at
+        && credential_is_expired(expires_at)
+    {
+        return Err((StatusCode::UNAUTHORIZED, "gateway credential is expired").into_response());
     }
     rate_limit::clear_auth_failures(state, client_key, GATEWAY_AUTH_SCOPE);
     Ok(gateway)
@@ -727,7 +725,7 @@ pub async fn query_gateway_initialization_status(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{body::Body, http::Request, routing::post, Router};
+    use axum::{Router, body::Body, http::Request, routing::post};
     use http_body_util::BodyExt;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1104,10 +1102,12 @@ mod tests {
             Some(expected_regist.as_str())
         );
         assert!(!returned.config.server_tls_required);
-        assert!(returned
-            .config
-            .enrollment_token_id
-            .starts_with("enroll-gw-p"));
+        assert!(
+            returned
+                .config
+                .enrollment_token_id
+                .starts_with("enroll-gw-p")
+        );
 
         // bootstrap 一次性：置备成功后复用 → 401（已消费，且无运行期凭据）。
         let response = app
@@ -1229,13 +1229,15 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("*")
         );
-        assert!(response
-            .headers()
-            .get("access-control-allow-headers")
-            .expect("allow headers")
-            .to_str()
-            .expect("header value")
-            .contains("authorization"));
+        assert!(
+            response
+                .headers()
+                .get("access-control-allow-headers")
+                .expect("allow headers")
+                .to_str()
+                .expect("header value")
+                .contains("authorization")
+        );
     }
 
     #[tokio::test]

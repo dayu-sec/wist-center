@@ -268,10 +268,10 @@ fn parse_range_values(payload: &serde_json::Value) -> Vec<(i64, f64)> {
                 .get(1)
                 .and_then(serde_json::Value::as_str)
                 .and_then(|text| text.parse::<f64>().ok());
-            if let (Some(timestamp), Some(value)) = (timestamp, value) {
-                if value.is_finite() {
-                    values.push((timestamp.round() as i64, value));
-                }
+            if let (Some(timestamp), Some(value)) = (timestamp, value)
+                && value.is_finite()
+            {
+                values.push((timestamp.round() as i64, value));
             }
         }
     }
@@ -508,8 +508,10 @@ mod tests {
             status: "offline".to_string(),
             ..agent
         };
-        assert!(render_agent_lines("gw-x", &offline)
-            .starts_with("agent_up{agent_id=\"agent-1\",gateway_id=\"gw-x\"} 0 "));
+        assert!(
+            render_agent_lines("gw-x", &offline)
+                .starts_with("agent_up{agent_id=\"agent-1\",gateway_id=\"gw-x\"} 0 ")
+        );
     }
 
     #[test]
