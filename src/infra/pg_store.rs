@@ -226,9 +226,11 @@ impl Store for PgStore {
     }
 
     async fn list_gateways(&self) -> Result<Vec<StoredGateway>, StoreError> {
-        let rows: Vec<GatewayRow> = sqlx::query_as(&format!(
+        // 动态部分只有固定列名常量 GATEWAY_COLUMNS，无外部输入，故显式断言 SQL 安全
+        // （sqlx 0.9 起非字面量 SQL 需 AssertSqlSafe 或 QueryBuilder）。
+        let rows: Vec<GatewayRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {GATEWAY_COLUMNS} FROM gateways ORDER BY gateway_id"
-        ))
+        )))
         .fetch_all(&self.pool)
         .await
         .source_raw_err(StoreReason::Sql, "list gateways")?;
@@ -236,9 +238,10 @@ impl Store for PgStore {
     }
 
     async fn get_gateway(&self, gateway_id: &str) -> Result<Option<StoredGateway>, StoreError> {
-        let row: Option<GatewayRow> = sqlx::query_as(&format!(
+        // 同上：动态部分只有固定列名常量，用户输入走 `$1` 绑定参数。
+        let row: Option<GatewayRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {GATEWAY_COLUMNS} FROM gateways WHERE gateway_id = $1"
-        ))
+        )))
         .bind(gateway_id)
         .fetch_optional(&self.pool)
         .await

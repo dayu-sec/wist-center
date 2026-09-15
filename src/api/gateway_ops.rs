@@ -2,11 +2,9 @@
 // 镜像 wist-gateway 的 submit_agent_status：Bearer 鉴权（sha256 常数时间比较）→
 // store 落库最新状态 → 返回 GatewayStatusAcceptedReturned。
 
-use std::net::SocketAddr;
-
 use axum::{
     Json,
-    extract::{Path, Query, State, connect_info::ConnectInfo},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
@@ -25,7 +23,10 @@ use crate::infra::{
     StoredGatewayCredentialStatus, derive_regist_token, new_secret_token, sha256_hex,
 };
 
-use super::{ApiState, build_control_center_trust_bundle, control_center_tls_required, rate_limit};
+use super::{
+    ApiState, PeerConnectInfo, build_control_center_trust_bundle, control_center_tls_required,
+    rate_limit,
+};
 
 const GATEWAY_AUTH_SCOPE: &str = "gateway";
 /// 注册自携带 token 鉴权，无网关身份可查，独立限流桶防 token 暴力枚举。
@@ -65,7 +66,7 @@ pub struct AgentStatusEntry {
 pub async fn submit_agent_status(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
+    client: PeerConnectInfo,
     Json(input): Json<AgentStatusReportRequest>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
@@ -155,7 +156,7 @@ pub async fn download_release_artifact(
 /// 运行期 Bearer（initial-config / status）以新签发的凭据为准。
 pub async fn register_gateway(
     State(state): State<ApiState>,
-    client: Option<ConnectInfo<SocketAddr>>,
+    client: PeerConnectInfo,
     Json(input): Json<RegisterGateway>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
@@ -298,7 +299,7 @@ pub struct InitialConfigQueryParams {
 pub async fn get_gateway_initial_config(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
+    client: PeerConnectInfo,
     Query(params): Query<InitialConfigQueryParams>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
@@ -480,7 +481,7 @@ fn build_initial_config_json(
 pub async fn submit_gateway_status(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
+    client: PeerConnectInfo,
     Json(input): Json<ReportGatewayStatus>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
@@ -544,7 +545,7 @@ pub struct RenewGatewayCredentialRequest {
 pub async fn renew_gateway_credential(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
+    client: PeerConnectInfo,
     Json(input): Json<RenewGatewayCredentialRequest>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
@@ -667,7 +668,7 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 pub async fn verify_gateway_credential(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
+    client: PeerConnectInfo,
     Json(input): Json<VerifyGatewayCredential>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);

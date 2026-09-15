@@ -1,10 +1,11 @@
 // WarpInsightCenter 管理面 / 网关面 HTTP API。
 
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use axum::{
     Router,
-    extract::Request,
+    extract::{Extension, Request, connect_info::ConnectInfo},
     http::{HeaderValue, header},
     middleware::{Next, from_fn},
     response::Response,
@@ -34,6 +35,14 @@ use gateway_ops::{
     query_gateway_initialization_status, register_gateway, renew_gateway_credential,
     submit_agent_status, submit_gateway_status, verify_gateway_credential,
 };
+
+/// 提取 peer 连接信息（限流按 IP 分桶用；忽略可伪造的 `x-real-ip` / `x-forwarded-for`）。
+///
+/// axum 0.8 起 `Option<T>` 要求 `T: OptionalFromRequestParts`，而 `ConnectInfo<T>` 只实现了
+/// `FromRequestParts`（0.8 里实现了前者的只有 `MatchedPath` / `Path` / `Extension`），
+/// 因此包一层 `Extension`。语义与原来一致：取不到连接信息即 `None`（测试里 `oneshot`
+/// 不带 connect info 走的就是这条）。
+pub type PeerConnectInfo = Option<Extension<ConnectInfo<SocketAddr>>>;
 
 #[derive(Debug, Clone)]
 pub struct ApiState {
@@ -125,8 +134,9 @@ pub fn router_for(state: ApiState) -> Router {
             "/api/v1/gateway/credentials:renew",
             post(renew_gateway_credential),
         )
-        // 网关面：校验通讯凭据（VerifyGatewayCredentialFlow）——axum 下 `:` 会被当路径参数，
-        // 与 credentials:renew 冲突，故 verify 用斜杠路径。
+        // 网关面：校验通讯凭据（VerifyGatewayCredentialFlow）。
+        // 路径用斜杠形式是历史原因：axum ≤0.7 把段首 `:` 当路径参数，无法与 credentials:renew 共存。
+        // axum 0.8（matchit 0.8）已把 `:` 当字面量，该限制不再存在；路径保持不变以免破坏网关侧 wire 兼容。
         .route(
             "/api/v1/gateway/credentials/verify",
             post(verify_gateway_credential),
@@ -165,7 +175,7 @@ pub fn router_for(state: ApiState) -> Router {
         )
         // 管理面：实例初始配置（admin 侧查询）
         .route(
-            "/api/v1/admin/gateways/instances/:instance_id/config",
+            "/api/v1/admin/gateways/instances/{instance_id}/config",
             get(admin_get_gateway_initial_config),
         )
         // 管理面：网关列表聚合（AdminViewGatewayList，GET /api/v1/admin/gateways）
@@ -177,42 +187,42 @@ pub fn router_for(state: ApiState) -> Router {
         )
         // 管理面：单网关状态（AdminShowGatewayStatus）
         .route(
-            "/api/v1/admin/gateways/:gateway_id/status",
+            "/api/v1/admin/gateways/{gateway_id}/status",
             get(admin_show_gateway_status),
         )
         // 管理面：网关在线率（转发 VM avg_over_time）
         .route(
-            "/api/v1/admin/gateways/:gateway_id/status/uptime",
+            "/api/v1/admin/gateways/{gateway_id}/status/uptime",
             get(admin_get_gateway_uptime),
         )
         // 管理面：网关历史趋势（转发 VM query_range）
         .route(
-            "/api/v1/admin/gateways/:gateway_id/status/history",
+            "/api/v1/admin/gateways/{gateway_id}/status/history",
             get(admin_get_gateway_history),
         )
         // 管理面：单 Agent 历史趋势（转发 VM query_range）
         .route(
-            "/api/v1/admin/gateways/:gateway_id/agents/:agent_id/history",
+            "/api/v1/admin/gateways/{gateway_id}/agents/{agent_id}/history",
             get(admin_get_agent_history),
         )
         // 管理面：某 gateway 下的 Agent 状态列表
         .route(
-            "/api/v1/admin/gateways/:gateway_id/agents",
+            "/api/v1/admin/gateways/{gateway_id}/agents",
             get(admin_list_gateway_agents),
         )
         // 管理面：某 gateway 生命周期转变历史
         .route(
-            "/api/v1/admin/gateways/:gateway_id/lifecycle",
+            "/api/v1/admin/gateways/{gateway_id}/lifecycle",
             get(admin_list_gateway_lifecycle),
         )
         // 管理面：版本发布（wist-agentd / wist-gateway，镜像外部制品）
         .route(
-            "/api/v1/admin/releases/:component",
+            "/api/v1/admin/releases/{component}",
             post(admin_publish_release).get(admin_list_releases),
         )
         // 制品下载（本地镜像）
         .route(
-            "/api/v1/releases/artifact/:component/:version/:filename",
+            "/api/v1/releases/artifact/{component}/{version}/{filename}",
             get(download_release_artifact),
         )
         // 管理面：升级计划（创建/列表/批准，多目标+范围+多步执行）

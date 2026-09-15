@@ -1,11 +1,9 @@
 // 管理面接口：网关创建 + 列表聚合 / 状态卡片列表 / 单网关状态。
 // 数据来自 center store（ReceiveGatewayStatusReport 落库的最新状态）。
 
-use std::net::SocketAddr;
-
 use axum::{
     Json,
-    extract::{Path, Query, State, connect_info::ConnectInfo},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -22,7 +20,7 @@ use wist_control::{
 use crate::infra::{StoreReason, StoredGateway, UpgradePlanRecord};
 
 use super::{
-    ApiState, admin_auth::require_admin_bearer, build_control_center_trust_bundle,
+    ApiState, PeerConnectInfo, admin_auth::require_admin_bearer, build_control_center_trust_bundle,
     control_center_tls_required, rate_limit,
 };
 
@@ -75,7 +73,7 @@ pub struct AdminGatewayInstanceView {
 pub async fn admin_create_gateway_instance(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
+    client: PeerConnectInfo,
     Json(request): Json<AdminCreateGatewayInstanceRequest>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
@@ -215,7 +213,7 @@ pub struct AgentHistoryReturned {
 pub async fn admin_get_gateway_uptime(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
+    client: PeerConnectInfo,
     Path(gateway_id): Path<String>,
     Query(params): Query<GatewayUptimeQueryParams>,
 ) -> Response {
@@ -257,7 +255,7 @@ pub async fn admin_get_gateway_uptime(
 pub async fn admin_get_gateway_history(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
+    client: PeerConnectInfo,
     Path(gateway_id): Path<String>,
     Query(params): Query<GatewayHistoryQueryParams>,
 ) -> Response {
@@ -308,7 +306,7 @@ pub async fn admin_get_gateway_history(
 pub async fn admin_get_agent_history(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
+    client: PeerConnectInfo,
     Path((gateway_id, agent_id)): Path<(String, String)>,
     Query(params): Query<GatewayHistoryQueryParams>,
 ) -> Response {
@@ -391,7 +389,7 @@ fn toml_basic_string_escape(value: &str) -> String {
 pub async fn admin_list_gateway_instances(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
+    client: PeerConnectInfo,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
@@ -470,7 +468,7 @@ async fn download_artifact(client: &reqwest::Client, url: &str) -> Result<Vec<u8
 pub async fn admin_publish_release(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
+    client: PeerConnectInfo,
     Path(component): Path<String>,
     Json(request): Json<PublishReleaseRequest>,
 ) -> Response {
@@ -536,7 +534,7 @@ pub async fn admin_publish_release(
 pub async fn admin_list_releases(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
+    client: PeerConnectInfo,
     Path(component): Path<String>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
@@ -568,7 +566,7 @@ pub struct BindGatewayCustomerRequest {
 pub async fn admin_bind_gateway_customer(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
+    client: PeerConnectInfo,
     Json(request): Json<BindGatewayCustomerRequest>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
@@ -614,7 +612,7 @@ pub async fn admin_bind_gateway_customer(
 pub async fn admin_get_gateway_initial_config(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
+    client: PeerConnectInfo,
     Path(instance_id): Path<String>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
@@ -672,7 +670,7 @@ pub struct ApproveUpgradePlanRequest {
 pub async fn admin_create_upgrade_plan(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
+    client: PeerConnectInfo,
     Json(request): Json<CreateUpgradePlanRequest>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
@@ -717,7 +715,7 @@ pub async fn admin_create_upgrade_plan(
 pub async fn admin_list_upgrade_plans(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
+    client: PeerConnectInfo,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
@@ -737,7 +735,7 @@ pub async fn admin_list_upgrade_plans(
 pub async fn admin_approve_upgrade_plan(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
+    client: PeerConnectInfo,
     Json(request): Json<ApproveUpgradePlanRequest>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
@@ -767,7 +765,7 @@ pub async fn admin_approve_upgrade_plan(
 pub async fn admin_list_gateway_lifecycle(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
+    client: PeerConnectInfo,
     Path(gateway_id): Path<String>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
@@ -791,7 +789,7 @@ pub async fn admin_list_gateway_lifecycle(
 pub async fn admin_list_gateway_agents(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
+    client: PeerConnectInfo,
     Path(gateway_id): Path<String>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
@@ -828,7 +826,7 @@ pub async fn admin_list_gateway_agents(
 pub async fn admin_view_gateway_list(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
+    client: PeerConnectInfo,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
@@ -869,7 +867,7 @@ pub async fn admin_view_gateway_list(
 pub async fn admin_list_gateway_status(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
+    client: PeerConnectInfo,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
@@ -898,7 +896,7 @@ pub async fn admin_list_gateway_status(
 pub async fn admin_show_gateway_status(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
+    client: PeerConnectInfo,
     Path(gateway_id): Path<String>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
@@ -961,7 +959,7 @@ fn gateway_runtime_status(stored: &StoredGateway) -> GatewayRuntimeStatus {
 pub async fn admin_dispatch_global_policy(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
+    client: PeerConnectInfo,
     Json(input): Json<DispatchGlobalPolicy>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
@@ -985,7 +983,7 @@ pub async fn admin_dispatch_global_policy(
 pub async fn admin_dispatch_agent_fleet_command(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
+    client: PeerConnectInfo,
     Json(input): Json<DispatchAgentFleetCommand>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);

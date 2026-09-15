@@ -2,16 +2,15 @@
 // 桶 key 取自 peer 地址（ConnectInfo），忽略可伪造的 x-real-ip / x-forwarded-for。
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use axum::{
-    extract::connect_info::ConnectInfo,
+    extract::{Extension, connect_info::ConnectInfo},
     http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
 
-use super::ApiState;
+use super::{ApiState, PeerConnectInfo};
 
 const MAX_FAILURES_PER_WINDOW: u32 = 5;
 const FAILURE_WINDOW: Duration = Duration::from_secs(60);
@@ -31,10 +30,10 @@ struct RateLimitBucket {
     blocked_until: Option<Instant>,
 }
 
-/// 从 ConnectInfo 派生稳定的每客户端桶 key；无连接信息时（如测试）回退到共享桶。
-pub fn client_key(client: Option<ConnectInfo<SocketAddr>>) -> String {
+/// 从 peer 连接信息派生稳定的每客户端桶 key；无连接信息时（如测试）回退到共享桶。
+pub fn client_key(client: PeerConnectInfo) -> String {
     client
-        .map(|ConnectInfo(addr)| addr.ip().to_string())
+        .map(|Extension(ConnectInfo(addr))| addr.ip().to_string())
         .unwrap_or_else(|| "unknown".to_string())
 }
 
