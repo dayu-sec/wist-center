@@ -14,10 +14,10 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, OnceLock, Weak},
 };
 
-use wist_control::types::DateTime;
-use wist_control::{GatewayInstanceLifecycleState, UpgradeStep, UpgradeTarget};
 use orion_error::{conversion::ToStructError, prelude::*};
 use serde::{Deserialize, Serialize};
+use wist_control::types::DateTime;
+use wist_control::{GatewayInstanceLifecycleState, UpgradeStep, UpgradeTarget};
 
 use super::sha256_hex;
 use crate::config::GatewayCredentialSeed;

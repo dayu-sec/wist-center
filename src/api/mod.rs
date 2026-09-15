@@ -17,10 +17,8 @@ use crate::{config::CenterConfig, infra::ArtifactStore, infra::Store};
 
 mod admin_auth;
 mod admin_ops;
-pub mod admin_returned;
 mod gateway_ops;
 mod rate_limit;
-pub use admin_returned::*;
 
 use admin_ops::{
     admin_approve_upgrade_plan, admin_bind_gateway_customer, admin_create_gateway_instance,

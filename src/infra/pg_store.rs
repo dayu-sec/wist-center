@@ -2,10 +2,10 @@
 // 连接 compose 提供的 postgres:16（127.0.0.1:55432，demo/demo，库 insight_demo），
 // schema 由 docker/initdb/01_schema.sql 在首次启动时建表。
 
-use wist_control::types::DateTime;
-use wist_control::GatewayInstanceLifecycleState;
 use orion_error::{conversion::ToStructError, prelude::*};
 use sqlx::{postgres::PgPoolOptions, FromRow, PgPool, Row};
+use wist_control::types::DateTime;
+use wist_control::GatewayInstanceLifecycleState;
 use wist_error::{StoreError, StoreReason};
 
 use crate::config::GatewayCredentialSeed;

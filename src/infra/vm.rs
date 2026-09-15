@@ -191,15 +191,12 @@ pub async fn query_agent_history(
 ) -> Result<Vec<AgentMetricSample>, String> {
     let gateway_id = escape_label(gateway_id);
     let agent_id = escape_label(agent_id);
-    let online_query = format!(
-        "avg(agent_up{{gateway_id=\"{gateway_id}\",agent_id=\"{agent_id}\"}})"
-    );
-    let memory_query = format!(
-        "avg(agent_memory_bytes{{gateway_id=\"{gateway_id}\",agent_id=\"{agent_id}\"}})"
-    );
-    let cpu_query = format!(
-        "avg(agent_cpu_percent{{gateway_id=\"{gateway_id}\",agent_id=\"{agent_id}\"}})"
-    );
+    let online_query =
+        format!("avg(agent_up{{gateway_id=\"{gateway_id}\",agent_id=\"{agent_id}\"}})");
+    let memory_query =
+        format!("avg(agent_memory_bytes{{gateway_id=\"{gateway_id}\",agent_id=\"{agent_id}\"}})");
+    let cpu_query =
+        format!("avg(agent_cpu_percent{{gateway_id=\"{gateway_id}\",agent_id=\"{agent_id}\"}})");
     let latency_query = format!(
         "avg(agent_admin_latency_ms{{gateway_id=\"{gateway_id}\",agent_id=\"{agent_id}\"}})"
     );
@@ -468,10 +465,10 @@ mod tests {
     #[test]
     fn offline_maps_to_zero() {
         let text = render_prometheus_lines(&update_with("offline", "degraded"));
-        assert!(text.starts_with(
-            "gateway_up{gateway_id=\"gw-001\",instance_id=\"inst-1\"} 0 "
+        assert!(text.starts_with("gateway_up{gateway_id=\"gw-001\",instance_id=\"inst-1\"} 0 "));
+        assert!(text.contains(
+            "gateway_health{gateway_id=\"gw-001\",instance_id=\"inst-1\",health=\"degraded\"}"
         ));
-        assert!(text.contains("gateway_health{gateway_id=\"gw-001\",instance_id=\"inst-1\",health=\"degraded\"}"));
     }
 
     #[test]
@@ -507,10 +504,12 @@ mod tests {
         )));
 
         // offline → agent_up 0。
-        let offline = StoredAgent { status: "offline".to_string(), ..agent };
-        assert!(render_agent_lines("gw-x", &offline).starts_with(
-            "agent_up{agent_id=\"agent-1\",gateway_id=\"gw-x\"} 0 "
-        ));
+        let offline = StoredAgent {
+            status: "offline".to_string(),
+            ..agent
+        };
+        assert!(render_agent_lines("gw-x", &offline)
+            .starts_with("agent_up{agent_id=\"agent-1\",gateway_id=\"gw-x\"} 0 "));
     }
 
     #[test]
@@ -546,12 +545,15 @@ mod tests {
             vec![(1000, 20.0)],
             vec![(1000, 8.0)],
         );
-        assert_eq!(samples, vec![AgentMetricSample {
-            at: 1000,
-            online: Some(1.0),
-            memory_bytes: Some(268_435_456.0),
-            cpu_percent: Some(20.0),
-            admin_latency_ms: Some(8.0),
-        }]);
+        assert_eq!(
+            samples,
+            vec![AgentMetricSample {
+                at: 1000,
+                online: Some(1.0),
+                memory_bytes: Some(268_435_456.0),
+                cpu_percent: Some(20.0),
+                admin_latency_ms: Some(8.0),
+            }]
+        );
     }
 }
