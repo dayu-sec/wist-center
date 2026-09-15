@@ -622,7 +622,7 @@ impl FileStore {
         agents: &[StoredAgent],
     ) -> Result<(), StoreError> {
         self.update(|snapshot| {
-            for mut agent in agents.to_vec() {
+            for mut agent in agents.iter().cloned() {
                 agent.gateway_id = gateway_id.to_string();
                 snapshot.agents.insert(agent.agent_id.clone(), agent);
             }
@@ -834,7 +834,7 @@ impl FileStore {
         if content.trim().is_empty() {
             return Ok(CenterStoreSnapshot::default());
         }
-        Ok(serde_json::from_str(&content).source_err(StoreReason::Json, "parse store")?)
+        serde_json::from_str(&content).source_err(StoreReason::Json, "parse store")
     }
 
     fn save_snapshot(&self, snapshot: &CenterStoreSnapshot) -> Result<(), StoreError> {
@@ -1133,6 +1133,7 @@ impl FileLockGuard {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(path)
             .source_err(StoreReason::Io, "open lock file")?;
         lock_file_exclusive(&file).source_err(StoreReason::Io, "lock store file")?;
@@ -1218,7 +1219,7 @@ mod tests {
             },
         ];
         assert!(store.seed(&seeds).expect("seed"));
-        assert!(store.seed(&seeds).expect("seed again") == false);
+        assert!(!store.seed(&seeds).expect("seed again"));
 
         let snapshot = store.load().expect("load");
         assert_eq!(snapshot.gateways.len(), 2);

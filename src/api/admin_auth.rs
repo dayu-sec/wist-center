@@ -13,6 +13,8 @@ use super::{rate_limit, ApiState};
 
 const ADMIN_AUTH_SCOPE: &str = "admin";
 
+// axum `Response` 作为 Err 载荷是刻意设计：调用方直接 `if let Err(response) = ... { return response; }`。
+#[allow(clippy::result_large_err)]
 pub(super) fn require_admin_bearer(
     state: &ApiState,
     headers: &HeaderMap,

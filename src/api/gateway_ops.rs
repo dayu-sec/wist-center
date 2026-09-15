@@ -294,6 +294,7 @@ pub struct InitialConfigQueryParams {
 /// - **未初始化**（有 bootstrap、无运行期凭据）：Bearer 为一次性 BootstrapToken，
 ///   携带 X-Gateway-Identity-Token → 派生 RegistToken 落 enrollment → 消费 bootstrap → 出 config.toml。
 /// - **已初始化**（有运行期凭据）：现有 authenticate_gateway（Bearer RUNTIME_TOKEN）→ 出同一 config.toml。
+///
 /// 返回 `application/json`：`config` 为 GatewayInitialConfig，置备态同时返回明文 RegistToken。
 pub async fn get_gateway_initial_config(
     State(state): State<ApiState>,
@@ -443,7 +444,7 @@ async fn provision_gateway_initial_config(
         eprintln!("warn mark gateway initializing failed: {err}");
     }
     rate_limit::clear_auth_failures(state, client_key, GATEWAY_AUTH_SCOPE);
-    let config = build_initial_config_json(state, &gateway, instance_id, &enrollment.token_id);
+    let config = build_initial_config_json(state, gateway, instance_id, &enrollment.token_id);
     Json(InitialConfigReturned {
         config,
         regist_token: Some(regist_token),
@@ -584,6 +585,8 @@ pub async fn renew_gateway_credential(
     }
 }
 
+// 同 require_admin_bearer：`Response` 作为 Err 载荷是刻意设计（调用方 `return Err(response)`）。
+#[allow(clippy::result_large_err)]
 async fn authenticate_gateway(
     state: &ApiState,
     headers: &HeaderMap,
@@ -659,6 +662,66 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         diff |= (left_byte ^ right_byte) as usize;
     }
     diff == 0
+}
+
+/// 校验网关通讯凭据（VerifyGatewayCredentialFlow）：网关持 bearer 访问，中心比对
+/// 存储的 token hash（authenticate_gateway），通过即返回 valid 结果。
+pub async fn verify_gateway_credential(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    client: Option<ConnectInfo<SocketAddr>>,
+    Json(input): Json<VerifyGatewayCredential>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    match authenticate_gateway(&state, &headers, &input.gateway_id, &client_key).await {
+        Ok(_) => Json(GatewayCredentialVerificationResult {
+            gateway_id: input.gateway_id,
+            credential_id: input.credential_id,
+            status: "valid".to_string(),
+            verified_at: DateTime::now(),
+        })
+        .into_response(),
+        Err(response) => response,
+    }
+}
+
+/// 查询网关初始化状态（QueryGatewayInitializationStatus）：GET /api/v1/gateway/initialization-status。
+/// 供网关/前端初始化页判断是否已初始化：initialized = lifecycle_state != Provisioned；
+/// lifecycle_state 未记录（None）时按未初始化（Provisioned）处理。
+pub async fn query_gateway_initialization_status(
+    State(state): State<ApiState>,
+    Query(params): Query<QueryGatewayInitializationStatus>,
+) -> Response {
+    let Some(gateway_id) = params.instance_id.as_deref() else {
+        return (StatusCode::BAD_REQUEST, "missing instance_id").into_response();
+    };
+    let gateway = match state.store.get_gateway(gateway_id).await {
+        Ok(Some(gateway)) => gateway,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                format!("unknown gateway `{gateway_id}`"),
+            )
+                .into_response();
+        }
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to load gateway store: {err}"),
+            )
+                .into_response();
+        }
+    };
+    let lifecycle_state = gateway
+        .lifecycle_state
+        .unwrap_or(GatewayInstanceLifecycleState::Provisioned);
+    Json(GatewayInitializationStatus {
+        gateway_id: gateway.gateway_id.clone(),
+        instance_id: Some(gateway.instance_id.clone()),
+        lifecycle_state,
+        initialized: lifecycle_state != GatewayInstanceLifecycleState::Provisioned,
+    })
+    .into_response()
 }
 
 #[cfg(test)]
@@ -1322,64 +1385,4 @@ mod tests {
         );
         assert!(status.initialized);
     }
-}
-
-/// 校验网关通讯凭据（VerifyGatewayCredentialFlow）：网关持 bearer 访问，中心比对
-/// 存储的 token hash（authenticate_gateway），通过即返回 valid 结果。
-pub async fn verify_gateway_credential(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    client: Option<ConnectInfo<SocketAddr>>,
-    Json(input): Json<VerifyGatewayCredential>,
-) -> Response {
-    let client_key = rate_limit::client_key(client);
-    match authenticate_gateway(&state, &headers, &input.gateway_id, &client_key).await {
-        Ok(_) => Json(GatewayCredentialVerificationResult {
-            gateway_id: input.gateway_id,
-            credential_id: input.credential_id,
-            status: "valid".to_string(),
-            verified_at: DateTime::now(),
-        })
-        .into_response(),
-        Err(response) => response,
-    }
-}
-
-/// 查询网关初始化状态（QueryGatewayInitializationStatus）：GET /api/v1/gateway/initialization-status。
-/// 供网关/前端初始化页判断是否已初始化：initialized = lifecycle_state != Provisioned；
-/// lifecycle_state 未记录（None）时按未初始化（Provisioned）处理。
-pub async fn query_gateway_initialization_status(
-    State(state): State<ApiState>,
-    Query(params): Query<QueryGatewayInitializationStatus>,
-) -> Response {
-    let Some(gateway_id) = params.instance_id.as_deref() else {
-        return (StatusCode::BAD_REQUEST, "missing instance_id").into_response();
-    };
-    let gateway = match state.store.get_gateway(gateway_id).await {
-        Ok(Some(gateway)) => gateway,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                format!("unknown gateway `{gateway_id}`"),
-            )
-                .into_response();
-        }
-        Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load gateway store: {err}"),
-            )
-                .into_response();
-        }
-    };
-    let lifecycle_state = gateway
-        .lifecycle_state
-        .unwrap_or(GatewayInstanceLifecycleState::Provisioned);
-    Json(GatewayInitializationStatus {
-        gateway_id: gateway.gateway_id.clone(),
-        instance_id: Some(gateway.instance_id.clone()),
-        lifecycle_state,
-        initialized: lifecycle_state != GatewayInstanceLifecycleState::Provisioned,
-    })
-    .into_response()
 }
