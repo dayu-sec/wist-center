@@ -10,9 +10,9 @@ use axum::{
 
 use wist_control::types::DateTime;
 use wist_control::{
-    AdminGatewayCustomerBindingReturned, AdminGatewayListReturned, AdminGatewayStatusListReturned,
-    AdminGatewayStatusReturned, AgentFleetDispatchReceipt, AgentRuntimeStatus,
-    DispatchAgentFleetCommand, DispatchGlobalPolicy, GatewayCustomerBinding, GatewayInitialConfig,
+    AdminDispatchGlobalPolicy, AdminGatewayCustomerBindingReturned, AdminGatewayListReturned,
+    AdminGatewayStatusListReturned, AdminGatewayStatusReturned, AgentFleetDispatchReceipt,
+    AgentRuntimeStatus, DispatchAgentFleetCommand, GatewayCustomerBinding, GatewayInitialConfig,
     GatewayInitialConfigReturned, GatewayInstance, GatewayInstanceLifecycleState, GatewayListView,
     GatewayRuntimeStatus, GlobalPolicyDispatch, UpgradeStep, UpgradeTarget,
 };
@@ -960,7 +960,7 @@ pub async fn admin_dispatch_global_policy(
     State(state): State<ApiState>,
     headers: HeaderMap,
     client: PeerConnectInfo,
-    Json(input): Json<DispatchGlobalPolicy>,
+    Json(input): Json<AdminDispatchGlobalPolicy>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
