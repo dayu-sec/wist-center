@@ -1,0 +1,75 @@
+# wist-center 示例配置：本地开发可直接用。
+#
+#   mkdir -p ~/.wist-center && cp examples/local-dev.toml ~/.wist-center/wist-center.toml
+#
+# 这里是"手写配置"的路子：每个键都摊开写清楚，值就是代码里的内置默认值
+# （只有 admin_token 是额外给本地开发用的弱值），所以删掉任何一行都不影响启动。
+# 想省事就让 `wist-center init-config` 生成一份随机凭据的。
+#
+# 与仓库根目录 wist-center.toml 的关系：那份是 init-config 的**模板**（凭据位置留
+# ${...} 占位符），这份是**填好值的可运行副本**，两者键名完全一致。
+#
+# 加载顺序（后者覆盖前者）：本文件 → WARP_INSIGHT_CENTER_* 环境变量 → 内置默认值。
+# 值里可以写 ${VAR} 从环境变量取（该变量未设置会直接报错，不会静默用默认值）；
+# 相对路径按本文件所在目录解析。
+
+[server]
+# 监听地址。只绑回环 = 仅本机可访问；对外提供服务时要改。
+listen_addr = "127.0.0.1:3100"
+
+# 中心对外基地址：用来拼网关的初始化 URL，必须落在控制中心服务器证书的 SAN 内，
+# 否则网关在 server_tls_required=true 时对 init_url 的 TLS 主机名校验会失败。
+public_url = "https://center.warpinsight.example"
+
+# 网关 ↔ 中心 wire 协议版本（写进网关 config.toml 的 [protocol] version，两侧要一致）。
+protocol_version = "1.0"
+
+# 管理面 bearer token。留空 = 管理 API 不校验（只适合本机开发）。
+# 生产换成 init-config 生成的随机值，或写成 admin_token = "${WIST_CENTER_ADMIN_TOKEN}"
+# 由环境注入。
+admin_token = "dev-admin-token"
+
+[store]
+# 二选一：配了 database_url → PostgreSQL；留空 → 本地 JSON 文件（store_path）。
+# 换成 PG 时（DSN 带账号口令，同样别写进仓库）：
+#   database_url = "postgres://demo:demo@127.0.0.1:55432/insight_demo"
+database_url = ""
+
+# 文件存储路径（database_url 为空时生效）。
+store_path = "state/warp-insight-center-store.json"
+
+[telemetry]
+# 有值 → 每次网关状态上报额外把指标推给 VictoriaMetrics；留空 → 只存快照。
+victoriametrics_url = ""
+
+[security]
+# RegistToken 派生密钥（HMAC-SHA256）：由网关身份 token 派生一次性注册凭据。
+# 下面这个值等于代码里的开发态兜底值，生产必须换掉（init-config 生成，或 ${VAR} 注入）。
+# 轮换它不影响既有凭据 —— 中心只存派生结果 hash，不重算。
+hmac_secret = "dev-center-hmac-secret-change-me"
+
+# 运行期凭据（RUNTIME_TOKEN）有效期秒数；2592000 = 30 天。
+credential_ttl_seconds = 2592000
+
+# 控制中心 CA 证书（信任根，分发给网关作 control_center.trust_bundle）。
+# ${HOME} 由加载时展开（HOME 未设置会直接报错）；留空 → 用代码内置默认（同一路径）。
+ca_cert_path = "${HOME}/.wist-center/ca/control-center.pem"
+
+[artifacts]
+# 版本发布制品落盘目录（未启用对象存储时）。
+dir = "artifacts"
+
+# 生成网关安装命令时使用的镜像名。
+gateway_image = "wist-gateway:latest"
+
+# 云对象存储（S3 兼容，可选）：四项齐全才启用，缺任意一项都退回上面的本地 dir。
+object_storage_endpoint = ""
+object_storage_bucket = ""
+object_storage_access_key = ""
+object_storage_secret_key = ""
+
+[enrollment]
+# 启动时写进 store（只在缺失时写）的网关种子凭据，每项 `gateway_id:token`。
+# 开发时想省掉"先注册一次"的步骤可以填，例如：
+#   gateway_credentials = ["gw-demo:change-me"]
+gateway_credentials = []

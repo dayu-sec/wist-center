@@ -114,7 +114,7 @@ pub struct UpgradePlanRecord {
     pub approved_at: Option<DateTime>,
 }
 
-/// 一次版本发布记录（映射模型 WistAgentdRelease / WarpGateWayRelease）。
+/// 一次版本发布记录（映射模型 WistAgentdRelease / WarpGatewayRelease）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleaseRecord {
     pub version: String,

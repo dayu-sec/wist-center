@@ -49,9 +49,9 @@ This produces the `wist-center` binary in `target/release/`.
 cargo run
 ```
 
-With no environment configured, the service listens on `127.0.0.1:3100`, stores state in
-`state/warp-insight-center-store.json`, and runs *without* admin authentication — that mode is for
-local development only.
+With no configuration at all, the service listens on `127.0.0.1:3100`, keeps state under
+`~/.wist-center/state/`, and runs *without* admin authentication — that mode is for local
+development only.
 
 To bring up PostgreSQL and VictoriaMetrics as well:
 
@@ -69,18 +69,74 @@ The credentials in `docker-compose.yml` (`demo` / `demo`) are demo-only. The Pos
 applied automatically from [`docker/initdb/01_schema.sql`](docker/initdb/01_schema.sql) on first
 start.
 
+Exported variables only last for that shell, so the admin token changes on every launch. To keep one
+around, use a config file instead:
+
+```bash
+wist-center init-config          # ~/.wist-center/wist-center.toml, random admin token + HMAC secret
+cargo run
+```
+
+[`examples/local-dev.toml`](examples/local-dev.toml) is the same thing spelled out, ready to copy.
+See [Configuration](#configuration).
+
 ## Configuration
 
-Configuration is environment-driven; see [`src/config.rs`](src/config.rs) for the full definition.
+Settings are resolved in three layers, each overriding the one before it; see
+[`src/config.rs`](src/config.rs) for the full definition.
+
+1. the TOML file at `~/.wist-center/wist-center.toml` (point `WIST_CENTER_CONFIG` elsewhere to
+   change that; a missing file is simply skipped, so the binary also runs on environment variables
+   alone),
+2. `WARP_INSIGHT_CENTER_*` environment variables,
+3. built-in defaults.
+
+### Configuration file
+
+Generate a file rather than hand-editing one — `init-config` fills in freshly random credentials:
+
+```bash
+wist-center init-config                      # ~/.wist-center/wist-center.toml
+wist-center init-config /etc/wist-center.toml
+```
+
+It prints the generated admin token and HMAC secret once, and refuses to overwrite an existing
+file (rotating those credentials invalidates the token you already handed out, so the overwrite has
+been made deliberate: delete the file or pass another path). This is what makes the admin token
+survive restarts — otherwise it has to be re-pasted into the admin UI every launch.
+
+A ready-to-run example, with every key spelled out and the production caveats inline, lives at
+[`examples/local-dev.toml`](examples/local-dev.toml):
+
+```bash
+mkdir -p ~/.wist-center
+cp examples/local-dev.toml ~/.wist-center/wist-center.toml
+```
+
+Its values are the built-in defaults (`admin_token = "dev-admin-token"` is a weak dev-only value),
+so it doubles as the annotated reference for the schema. [`wist-center.toml`](wist-center.toml) in
+the repository root is the template `init-config` renders and defines the generated shape; it holds
+exactly the same set of keys, which a test keeps that way.
+
+In the file:
+
+- values may reference the environment as `${VAR}`; an unset variable is a load error.
+- relative paths (`store.store_path`, `artifacts.dir`, `security.ca_cert_path`) resolve against the
+  directory holding the file.
+- every key maps to the environment variable of the same meaning in the table below, so the file is
+  simply a place to put the values that should outlive a shell. (`enrollment.gateway_credentials`
+  is a TOML array of `gateway_id:token` entries; the variable takes the same entries comma-joined.)
+
+### Environment variables
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `WARP_INSIGHT_CENTER_LISTEN` | `127.0.0.1:3100` | HTTP listen address. |
 | `WARP_INSIGHT_CENTER_PUBLIC_URL` | `https://center.warpinsight.example` | Externally reachable base URL, used to build the gateway init URL. Must fall inside the control-center certificate SANs. |
-| `WARP_INSIGHT_CENTER_ADMIN_TOKEN` | *(unset)* | Admin bearer token. Unset → the admin API requires no authentication (development only). |
+| `WARP_INSIGHT_CENTER_ADMIN_TOKEN` | *(unset)* | Admin bearer token. Unset → the admin API requires no authentication (development only). Overrides `server.admin_token` from the file. |
 | `WARP_INSIGHT_CENTER_HMAC_SECRET` | dev placeholder | HMAC-SHA256 key used to derive RegistTokens. **Must be set in production.** Rotating it does not invalidate existing credentials, since only the derived hashes are stored. |
 | `WARP_INSIGHT_CENTER_DATABASE_URL` | *(unset)* | PostgreSQL DSN. Unset or empty → JSON file store. |
-| `WARP_INSIGHT_CENTER_STORE_PATH` | `state/warp-insight-center-store.json` | JSON store path. |
+| `WARP_INSIGHT_CENTER_STORE_PATH` | `state/warp-insight-center-store.json` (under the config-file directory) | JSON store path. |
 | `WARP_INSIGHT_CENTER_VICTORIAMETRICS_URL` | *(unset)* | VictoriaMetrics base URL. Unset or empty → no time-series push. |
 | `WARP_INSIGHT_CENTER_GATEWAY_CREDENTIALS` | *(unset)* | `gateway_id:token,...` seeds written into the store at boot when missing. |
 | `WARP_INSIGHT_CENTER_CREDENTIAL_TTL_SECONDS` | `2592000` (30 days) | Runtime credential lifetime. |
@@ -89,12 +145,17 @@ Configuration is environment-driven; see [`src/config.rs`](src/config.rs) for th
 | `WARP_INSIGHT_CENTER_OBJECT_STORAGE_BUCKET` | *(unset)* | Bucket that holds release artifacts. |
 | `WARP_INSIGHT_CENTER_OBJECT_STORAGE_ACCESS_KEY` | *(unset)* | Object-storage access key. |
 | `WARP_INSIGHT_CENTER_OBJECT_STORAGE_SECRET_KEY` | *(unset)* | Object-storage secret key. |
-| `WARP_INSIGHT_CENTER_CA_CERT_PATH` | `~/.warpinsight-center/ca/control-center.pem` | Trust root handed to gateways as their trust bundle. Missing file → no trust bundle. |
+| `WARP_INSIGHT_CENTER_CA_CERT_PATH` | `~/.wist-center/ca/control-center.pem` | Trust root handed to gateways as their trust bundle. Missing file → no trust bundle. |
 | `WARP_INSIGHT_CENTER_PROTOCOL_VERSION` | `1.0` | Gateway ↔ center wire protocol version. |
 | `WARP_INSIGHT_CENTER_GATEWAY_IMAGE` | `wist-gateway:latest` | Image reference used in the generated gateway install command. |
 
 All four `..._OBJECT_STORAGE_*` variables must be set together; if any is missing, release
 artifacts are written to `ARTIFACT_DIR` instead.
+
+For the on/off settings (`DATABASE_URL`, `VICTORIAMETRICS_URL`, `..._OBJECT_STORAGE_*`) an
+explicitly empty variable means "turn this off" and does override the file value — that is how a
+launcher disables a dependency it probed but does not want. For every other variable an empty value
+counts as unset, leaving the file value in place.
 
 ## HTTP API
 
@@ -153,8 +214,9 @@ These two check no credential:
 ```
 src/
   api/       # router, gateway-facing and admin-facing handlers, auth, rate limiting
-  config.rs  # env-driven CenterConfig
+  config.rs  # CenterConfig: config file + environment variables
   infra/     # store (PostgreSQL / JSON file), S3 artifacts, secrets, VictoriaMetrics
+examples/    # example wist-center.toml configs
 ```
 
 HTTP contract types (commands, responses, view models) come from

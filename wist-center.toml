@@ -1,0 +1,58 @@
+# wist-center 运行配置。
+#
+# 加载顺序（后者覆盖前者）：
+#   1. 本文件（默认 ~/.wist-center/wist-center.toml；可用 WIST_CENTER_CONFIG 指向别处。
+#      文件不存在则跳过这一层 —— 零配置也能跑，用默认值 + 环境变量）
+#   2. 环境变量 WARP_INSIGHT_CENTER_*（沿用既有契约，覆盖同名项）
+#   3. 代码内置默认值
+#
+# 值里可以写 ${VAR} 从环境变量取（未设置会报错）；相对路径按本文件所在目录解析。
+#
+# 生成：wist-center init-config [路径]
+#   —— 会把下面两个占位符替换成新生成的随机值，避免用可预测的默认凭据。
+#
+# 填好值、可直接复制运行的示例（键名与本文完全一致）：examples/local-dev.toml
+
+[server]
+listen_addr = "127.0.0.1:3100"
+# 中心对外地址：用于生成网关初始化 URL，必须落在控制中心服务器证书的 SAN 内。
+public_url = "https://center.warpinsight.example"
+# 网关 ↔ 中心 wire 协议版本（写入网关 config.toml 的 [protocol] version）。
+protocol_version = "1.0"
+# 管理面 token。留空 = 不要求鉴权（仅开发态）；生产必须设置。
+admin_token = "${WIST_CENTER_ADMIN_TOKEN}"
+
+[store]
+# 有值 → PostgreSQL（PgStore）；留空 → 本地 JSON 文件存储（store_path）。
+database_url = ""
+store_path = "state/warp-insight-center-store.json"
+
+[telemetry]
+# 有值 → 每次状态上报额外推送指标到 VictoriaMetrics；留空 → 不推送（仅存快照）。
+victoriametrics_url = ""
+
+[security]
+# RegistToken 派生密钥（HMAC-SHA256）。生产必须设置。
+# 轮换该密钥不影响既有凭据：中心只存派生结果，不重算。
+hmac_secret = "${WIST_CENTER_HMAC_SECRET}"
+# 运行期凭据（RUNTIME_TOKEN）有效期秒数，默认 30 天。
+credential_ttl_seconds = 2592000
+# 控制中心 CA 证书（分发给网关作 control_center.trust_bundle）。
+# ${HOME} 由加载时展开（HOME 未设置会直接报错）；文件不存在 → 不提供信任根。
+ca_cert_path = "${HOME}/.wist-center/ca/control-center.pem"
+
+[artifacts]
+# 版本发布制品落盘目录（未启用对象存储时）。
+dir = "artifacts"
+# 生成网关安装命令时使用的镜像名。
+gateway_image = "wist-gateway:latest"
+# 云对象存储（S3 兼容，可选）：四项齐全才启用，否则用上面的 dir 落本地。
+object_storage_endpoint = ""
+object_storage_bucket = ""
+object_storage_access_key = ""
+object_storage_secret_key = ""
+
+[enrollment]
+# 启动时写入 store（仅缺失时写入）的网关种子凭据，每项 `gateway_id:token`。
+# 例：gateway_credentials = ["gw-demo:change-me"]
+gateway_credentials = []
