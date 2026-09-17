@@ -1,6 +1,6 @@
 // ReceiveGatewayStatusReport 接收链路：POST /api/v1/gateway/status。
 // 镜像 wist-gateway 的 submit_agent_status：Bearer 鉴权（sha256 常数时间比较）→
-// store 落库最新状态 → 返回 GatewayStatusAcceptedReturned。
+// store 落库最新状态 → 返回 GatewayStatusAccepted。
 
 use axum::{
     Json,
@@ -12,9 +12,8 @@ use axum::{
 use wist_control::types::DateTime;
 use wist_control::{
     GatewayCredentialBundle, GatewayCredentialVerificationResult, GatewayEnrollmentResult,
-    GatewayEnrollmentResultReturned, GatewayInitialConfig, GatewayInitializationStatus,
-    GatewayInstanceLifecycleState, GatewayStatusAccepted, GatewayStatusAcceptedReturned,
-    QueryGatewayInitializationStatus, RegisterGateway, ReportGatewayStatus,
+    GatewayInitialConfig, GatewayInitializationStatus, GatewayInstanceLifecycleState,
+    GatewayStatusAccepted, QueryGatewayInitializationStatus, RegisterGateway, ReportGatewayStatus,
     VerifyGatewayCredential,
 };
 
@@ -246,15 +245,13 @@ pub async fn register_gateway(
         eprintln!("warn mark gateway initializing failed: {err}");
     }
     rate_limit::clear_auth_failures(&state, &client_key, GATEWAY_REGISTER_SCOPE);
-    Json(GatewayEnrollmentResultReturned {
-        result: GatewayEnrollmentResult {
-            status: "accepted".to_string(),
-            gateway_id: consumed.gateway_id.clone(),
-            instance_id: input.instance_id,
-            credential_id: bundle.credential_id.clone(),
-            initial_config: "v1".to_string(),
-            credential_bundle: bundle,
-        },
+    Json(GatewayEnrollmentResult {
+        status: "accepted".to_string(),
+        gateway_id: consumed.gateway_id.clone(),
+        instance_id: input.instance_id,
+        credential_id: bundle.credential_id.clone(),
+        initial_config: "v1".to_string(),
+        credential_bundle: bundle,
     })
     .into_response()
 }
@@ -515,12 +512,10 @@ pub async fn submit_gateway_status(
             }
             (
                 StatusCode::OK,
-                Json(GatewayStatusAcceptedReturned {
-                    receipt: GatewayStatusAccepted {
-                        gateway_id: input.gateway_id,
-                        instance_id: input.instance_id,
-                        accepted_at,
-                    },
+                Json(GatewayStatusAccepted {
+                    gateway_id: input.gateway_id,
+                    instance_id: input.instance_id,
+                    accepted_at,
                 }),
             )
                 .into_response()
@@ -906,9 +901,9 @@ mod tests {
             .await
             .expect("body")
             .to_bytes();
-        let returned: GatewayStatusAcceptedReturned = serde_json::from_slice(&body).expect("json");
-        assert_eq!(returned.receipt.gateway_id, "gw-001");
-        assert_eq!(returned.receipt.instance_id, "inst-1");
+        let returned: GatewayStatusAccepted = serde_json::from_slice(&body).expect("json");
+        assert_eq!(returned.gateway_id, "gw-001");
+        assert_eq!(returned.instance_id, "inst-1");
     }
 
     #[tokio::test]
@@ -977,13 +972,13 @@ mod tests {
             .await
             .expect("body")
             .to_bytes();
-        let returned: GatewayEnrollmentResultReturned =
+        let returned: GatewayEnrollmentResult =
             serde_json::from_slice(&response_body).expect("json");
-        assert_eq!(returned.result.status, "accepted");
-        assert_eq!(returned.result.gateway_id, "gw-001");
-        assert_eq!(returned.result.instance_id, "inst-1");
+        assert_eq!(returned.status, "accepted");
+        assert_eq!(returned.gateway_id, "gw-001");
+        assert_eq!(returned.instance_id, "inst-1");
         // 注册后签发独立运行期凭据（RUNTIME_TOKEN）：随机 bearer + 过期时间。
-        let bundle = &returned.result.credential_bundle;
+        let bundle = &returned.credential_bundle;
         assert!(
             bundle.bearer_token.starts_with("wic_"),
             "runtime token: {}",

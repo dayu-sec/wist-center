@@ -10,11 +10,11 @@ use axum::{
 
 use wist_control::types::DateTime;
 use wist_control::{
-    AdminDispatchGlobalPolicy, AdminGatewayCustomerBindingReturned, AdminGatewayListReturned,
-    AdminGatewayStatusListReturned, AdminGatewayStatusReturned, AgentFleetDispatchReceipt,
-    AgentRuntimeStatus, DispatchAgentFleetCommand, GatewayCustomerBinding, GatewayInitialConfig,
-    GatewayInitialConfigReturned, GatewayInstance, GatewayInstanceLifecycleState, GatewayListView,
-    GatewayRuntimeStatus, GlobalPolicyDispatch, UpgradeStep, UpgradeTarget,
+    AdminDispatchGlobalPolicy, AdminGatewayListReturned, AdminGatewayStatusListReturned,
+    AdminGatewayStatusReturned, AgentFleetDispatchReceipt, AgentRuntimeStatus,
+    DispatchAgentFleetCommand, GatewayCustomerBinding, GatewayInitialConfig, GatewayInstance,
+    GatewayInstanceLifecycleState, GatewayListView, GatewayRuntimeStatus, GlobalPolicyDispatch,
+    UpgradeStep, UpgradeTarget,
 };
 
 use crate::infra::{StoreReason, StoredGateway, UpgradePlanRecord};
@@ -597,13 +597,11 @@ pub async fn admin_bind_gateway_customer(
                 .into_response();
         }
     };
-    Json(AdminGatewayCustomerBindingReturned {
-        binding: GatewayCustomerBinding {
-            gateway_id: binding.gateway_id,
-            customer_id: binding.customer_id,
-            status: binding.status,
-            bound_at: binding.bound_at,
-        },
+    Json(GatewayCustomerBinding {
+        gateway_id: binding.gateway_id,
+        customer_id: binding.customer_id,
+        status: binding.status,
+        bound_at: binding.bound_at,
     })
     .into_response()
 }
@@ -638,15 +636,13 @@ pub async fn admin_get_gateway_initial_config(
         )
             .into_response();
     }
-    Json(GatewayInitialConfigReturned {
-        config: GatewayInitialConfig {
-            gateway_id: instance_id.clone(),
-            control_center_endpoint: state.config.public_url.clone(),
-            trust_bundle,
-            server_tls_required,
-            protocol_version: state.config.protocol_version.clone(),
-            enrollment_token_id,
-        },
+    Json(GatewayInitialConfig {
+        gateway_id: instance_id.clone(),
+        control_center_endpoint: state.config.public_url.clone(),
+        trust_bundle,
+        server_tls_required,
+        protocol_version: state.config.protocol_version.clone(),
+        enrollment_token_id,
     })
     .into_response()
 }
