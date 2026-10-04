@@ -1325,6 +1325,64 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn rejects_status_report_for_a_gateway_without_a_registered_certificate() {
+        // 网关已创建（有 bootstrap）但尚未注册（无登记指纹）→ 任何证书都不认。
+        let response = super::super::router_for(provision_state("boot-tok-x"))
+            .oneshot(with_identity(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/gateway/status")
+                    .header("content-type", "application/json")
+                    .body(Body::from(status_payload("gw-p")))
+                    .expect("request"),
+                client_identity("gw-p", TEST_FINGERPRINT),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn upgrade_plan_requires_a_client_certificate() {
+        let response = router()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/gateway/upgrade-plan?gateway_id=gw-001")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn upgrade_plan_returns_no_plan_for_a_registered_certificate() {
+        let response = router()
+            .oneshot(with_identity(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/gateway/upgrade-plan?gateway_id=gw-001")
+                    .body(Body::empty())
+                    .expect("request"),
+                client_identity("gw-001", TEST_FINGERPRINT),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let plan: GatewayUpgradePlan = serde_json::from_slice(&body).expect("json");
+        assert_eq!(plan.gateway_id, "gw-001");
+        assert!(!plan.has_plan);
+    }
+
     fn register_payload(token: &str) -> String {
         format!(
             r#"{{"enrollment_token":"{token}","instance_id":"inst-1","certificate_signing_request":{},"requested_at":"2026-08-11T00:00:00Z"}}"#,
