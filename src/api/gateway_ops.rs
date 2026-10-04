@@ -13,8 +13,9 @@ use wist_control::types::DateTime;
 use wist_control::{
     GatewayCredentialBundle, GatewayCredentialVerificationResult, GatewayEnrollmentResult,
     GatewayInitialConfig, GatewayInitializationStatus, GatewayInstanceLifecycleState,
-    GatewayStatusAccepted, QueryGatewayInitializationStatus, RegisterGateway, ReportGatewayStatus,
-    VerifyGatewayCredential,
+    GatewayStatusAccepted, GatewayUpgradePlan, GatewayUpgradeResultAccepted,
+    QueryGatewayInitializationStatus, RegisterGateway, ReportGatewayStatus,
+    ReportGatewayUpgradeResult, VerifyGatewayCredential,
 };
 
 use crate::infra::{
@@ -252,6 +253,98 @@ pub async fn register_gateway(
         credential_id: bundle.credential_id.clone(),
         initial_config: "v1".to_string(),
         credential_bundle: bundle,
+    })
+    .into_response()
+}
+
+/// 取升级目标：`GET /api/v1/gateway/upgrade-plan?gateway_id=`（Bearer rt_）。
+///
+/// 解析「覆盖本网关的、最新的已批准升级计划」，给出应升到的目标；无则 `has_plan=false`。见 CR-002 C2。
+pub async fn get_gateway_upgrade_plan(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    client: PeerConnectInfo,
+    Query(params): Query<InitialConfigQueryParams>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    let gateway_id = params.gateway_id.as_str();
+    if let Err(response) = authenticate_gateway(&state, &headers, gateway_id, &client_key).await {
+        return response;
+    }
+    match upgrade_plan_for(&state, gateway_id).await {
+        Ok(plan) => Json(plan).into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
+    }
+}
+
+async fn upgrade_plan_for(
+    state: &ApiState,
+    gateway_id: &str,
+) -> Result<GatewayUpgradePlan, String> {
+    let plans = state
+        .store
+        .list_upgrade_plans()
+        .await
+        .map_err(|err| format!("failed to load upgrade plans: {err}"))?;
+    // `list_upgrade_plans` 已按 created_at DESC：第一份覆盖本网关的 approved 即为目标。
+    for plan in &plans {
+        if plan.status != "approved" {
+            continue;
+        }
+        let covered = plan
+            .steps
+            .iter()
+            .any(|step| step.gateway_ids.iter().any(|id| id == gateway_id));
+        if !covered {
+            continue;
+        }
+        let target = plan.targets.first();
+        return Ok(GatewayUpgradePlan {
+            gateway_id: gateway_id.to_string(),
+            has_plan: true,
+            plan_id: Some(plan.plan_id.clone()),
+            component: target.map(|target| target.component.clone()),
+            to_version: target.map(|target| target.target_version.clone()),
+        });
+    }
+    Ok(GatewayUpgradePlan {
+        gateway_id: gateway_id.to_string(),
+        has_plan: false,
+        plan_id: None,
+        component: None,
+        to_version: None,
+    })
+}
+
+/// 升级结果回执：`POST /api/v1/gateway/upgrade-result`（Bearer rt_）。见 CR-002 C2。
+///
+/// 现在只落结构化事件日志 + 回 ack；持久化视图待补（CR-002 C2 follow-up）。
+pub async fn report_gateway_upgrade_result(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    client: PeerConnectInfo,
+    Json(input): Json<ReportGatewayUpgradeResult>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) =
+        authenticate_gateway(&state, &headers, &input.gateway_id, &client_key).await
+    {
+        return response;
+    }
+    eprintln!(
+        "event=GatewayUpgradeResult gateway_id={} work_id={} from={} to={} step={} status={} detail={}",
+        input.gateway_id,
+        input.work_id,
+        input.from_version,
+        input.to_version,
+        input.step,
+        input.status,
+        input.detail
+    );
+    Json(GatewayUpgradeResultAccepted {
+        gateway_id: input.gateway_id,
+        work_id: input.work_id,
+        accepted_at: wist_control::DateTime::now(),
     })
     .into_response()
 }

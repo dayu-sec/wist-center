@@ -31,9 +31,10 @@ use admin_ops::{
     admin_view_gateway_list,
 };
 use gateway_ops::{
-    download_release_artifact, get_gateway_initial_config, options_gateway_initial_config,
-    query_gateway_initialization_status, register_gateway, renew_gateway_credential,
-    submit_agent_status, submit_gateway_status, verify_gateway_credential,
+    download_release_artifact, get_gateway_initial_config, get_gateway_upgrade_plan,
+    options_gateway_initial_config, query_gateway_initialization_status, register_gateway,
+    renew_gateway_credential, report_gateway_upgrade_result, submit_agent_status,
+    submit_gateway_status, verify_gateway_credential,
 };
 
 /// 提取 peer 连接信息（限流按 IP 分桶用；忽略可伪造的 `x-real-ip` / `x-forwarded-for`）。
@@ -147,6 +148,16 @@ pub fn router_for(state: ApiState) -> Router {
             get(query_gateway_initialization_status)
                 .options(options_gateway_initial_config)
                 .layer(from_fn(gateway_initial_config_cors)),
+        )
+        // 网关面：取升级目标（GetGatewayUpgradePlan，CR-002 C2）
+        .route(
+            "/api/v1/gateway/upgrade-plan",
+            get(get_gateway_upgrade_plan),
+        )
+        // 网关面：升级结果回执（ReportGatewayUpgradeResult，CR-002 C2）
+        .route(
+            "/api/v1/gateway/upgrade-result",
+            post(report_gateway_upgrade_result),
         )
         // 管理面：下发全局策略（DispatchGlobalPolicyFlow）
         .route(
