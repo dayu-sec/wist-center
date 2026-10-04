@@ -348,14 +348,28 @@ impl CenterConfig {
             "security.credential_ttl_seconds",
             self.credential_ttl_seconds,
         )?;
-        // 服务端 TLS：证书与私钥要么都配（起 HTTPS），要么都不配（明文 HTTP）。
+        // 服务端 TLS：证书与私钥要么都配（起 HTTPS），要么都不配（明文 HTTP）；
+        // 配了就要求文件可读（fail-fast，避免启到一半才握手失败）。
         match (&self.server_cert_path, &self.server_key_path) {
             (Some(_), None) | (None, Some(_)) => {
                 return Err(config_validation(
                     "server.server_cert_path and server.server_key_path must be set together",
                 ));
             }
-            _ => {}
+            (Some(cert), Some(key)) => {
+                for (label, path) in [
+                    ("server.server_cert_path", cert),
+                    ("server.server_key_path", key),
+                ] {
+                    if !path.exists() {
+                        return Err(config_validation(format!(
+                            "{label} not found: {}",
+                            path.display()
+                        )));
+                    }
+                }
+            }
+            (None, None) => {}
         }
         Ok(())
     }
@@ -839,6 +853,28 @@ listen_addr = ""
             config_key_paths(include_str!("../examples/local-dev.toml")),
             config_key_paths(include_str!("../wist-center.toml"))
         );
+    }
+
+    #[test]
+    fn server_tls_paths_must_be_set_together() {
+        let _guard = env_guard();
+        // 只配证书、不配私钥 → 拒绝（否则会在启动时握手才失败）。
+        let path =
+            write_temp_config("[server]\nserver_cert_path = \"/tmp/wist-center-cert.pem\"\n");
+        let err =
+            CenterConfig::load_from_path(&path).expect_err("half-configured TLS must be rejected");
+        assert!(format!("{err}").contains("together"), "{err}");
+    }
+
+    #[test]
+    fn server_tls_paths_must_exist_when_configured() {
+        let _guard = env_guard();
+        let path = write_temp_config(
+            "[server]\nserver_cert_path = \"/tmp/wist-center-missing-cert.pem\"\nserver_key_path = \"/tmp/wist-center-missing-key.pem\"\n",
+        );
+        let err =
+            CenterConfig::load_from_path(&path).expect_err("missing TLS files must be rejected");
+        assert!(format!("{err}").contains("not found"), "{err}");
     }
 
     fn config_key_paths(text: &str) -> Vec<String> {

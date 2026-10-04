@@ -251,15 +251,31 @@ impl GatewayCa {
     }
 }
 
+/// 仅**校验 CSR 可解析**（不签发）——注册的**前置**校验：坏 CSR 不应白白消耗一次性注册 token。
+pub fn validate_csr(csr_pem: &str) -> Result<(), String> {
+    CertificateSigningRequestParams::from_pem(csr_pem)
+        .map(|_| ())
+        .map_err(|err| format!("failed to parse certificate signing request: {err}"))
+}
+
 /// 从文件载入 CA-G；缺失则**生成一把新的自签 CA-G 并落盘**（证书 0644 / 私钥 0600）。
+///
+/// **半在场**（只有证书或只有私钥）一律报错：不自动重生，以免换 CA 使已签出的网关证书全部失效。
 pub fn load_or_create(cert_path: &Path, key_path: &Path) -> Result<GatewayCa, String> {
-    if cert_path.exists() && key_path.exists() {
-        return GatewayCa::load(cert_path, key_path);
+    match (cert_path.exists(), key_path.exists()) {
+        (true, true) => GatewayCa::load(cert_path, key_path),
+        (false, false) => {
+            let (ca, cert_pem, key_pem) = GatewayCa::generate("Wist Gateway Client CA")?;
+            write_pem(cert_path, &cert_pem, 0o644)?;
+            write_pem(key_path, &key_pem, 0o600)?;
+            Ok(ca)
+        }
+        (true, false) | (false, true) => Err(format!(
+            "网关客户端 CA 不完整：{} 与 {} 必须同时存在（缺一不自动重生，以免换 CA 使已签证书全部失效）",
+            cert_path.display(),
+            key_path.display()
+        )),
     }
-    let (ca, cert_pem, key_pem) = GatewayCa::generate("Wist Gateway Client CA")?;
-    write_pem(cert_path, &cert_pem, 0o644)?;
-    write_pem(key_path, &key_pem, 0o600)?;
-    Ok(ca)
 }
 
 fn write_pem(path: &Path, content: &str, mode: u32) -> Result<(), String> {
@@ -424,5 +440,43 @@ mod tests {
         let (ca, ca_pem, key_pem) = GatewayCa::generate("Wist Gateway Client CA").expect("ca");
         let reloaded = GatewayCa::from_pem(&ca_pem, &key_pem).expect("reload");
         assert_eq!(reloaded.ca_certificate_pem(), ca.ca_certificate_pem());
+    }
+
+    #[test]
+    fn validate_csr_accepts_a_real_csr_and_rejects_garbage() {
+        assert!(validate_csr(&csr()).is_ok());
+        assert!(validate_csr("not a csr").is_err());
+        assert!(validate_csr("").is_err());
+    }
+
+    #[test]
+    fn load_or_create_generates_then_reloads_and_refuses_half_present_material() {
+        let dir = std::env::temp_dir().join(format!(
+            "wic-gateway-ca-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let cert = dir.join("gateway-client-ca.pem");
+        let key = dir.join("gateway-client-ca.key.pem");
+
+        // 首次：两文件都生成；再次：载入同一把 CA（证书不变）。
+        let first = load_or_create(&cert, &key).expect("create");
+        assert!(cert.exists() && key.exists());
+        let again = load_or_create(&cert, &key).expect("reload");
+        assert_eq!(first.ca_certificate_pem(), again.ca_certificate_pem());
+
+        // 半在场（只剩证书）→ 报错，且**不自动重生私钥**。
+        std::fs::remove_file(&key).expect("rm key");
+        assert!(load_or_create(&cert, &key).is_err());
+        assert!(
+            !key.exists(),
+            "不得自动重生私钥（否则已签网关证书全部失效）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

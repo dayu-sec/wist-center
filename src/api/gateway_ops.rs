@@ -1,6 +1,5 @@
-// ReceiveGatewayStatusReport 接收链路：POST /api/v1/gateway/status。
-// 镜像 wist-gateway 的 submit_agent_status：Bearer 鉴权（sha256 常数时间比较）→
-// store 落库最新状态 → 返回 GatewayStatusAccepted。
+// 网关面 HTTP API：状态 / 升级 / 凭据等由 **mTLS 客户端证书**认人（authorize_gateway_certificate）；
+// 唯 link-upstream 的**首次置备**用一次性 bootstrap bearer。
 
 use axum::{
     Json,
@@ -64,7 +63,7 @@ pub struct AgentStatusEntry {
     pub last_seen_at: wist_control::types::DateTime,
 }
 
-/// 接收 Gateway 上报的 Agent 状态：Bearer 按 gateway_id 凭证鉴权 → store upsert → VM 推送。
+/// 接收 Gateway 上报的 Agent 状态：以 mTLS 客户端证书鉴权 → store upsert → VM 推送。
 pub async fn submit_agent_status(
     State(state): State<ApiState>,
     identity: Option<Extension<VerifiedGatewayIdentity>>,
@@ -159,10 +158,10 @@ pub async fn download_release_artifact(
 }
 
 /// 网关注册：POST /api/v1/gateway/register。
-/// 对应模型 `RegisterGateway` + `RegisterGatewayFlow`：WarpGateway 持一次性
-/// RegistToken（enrollment token）提交注册。消费 token（防重放/限量/吊销/过期）后
-/// **签发独立运行期凭据（RUNTIME_TOKEN）**：RegistToken 只用于本次注册，
-/// 运行期 Bearer（link-upstream / status）以新签发的凭据为准。
+/// 对应模型 `RegisterGateway` + `RegisterGatewayFlow`：WarpGateway 持一次性 RegistToken
+/// （enrollment token）提交注册，中心用 CA-G 按其 CSR 签一张**网关专属客户端证书**（长期身份，mTLS）。
+///
+/// 先校验 CSR 可解析，再消费 token —— 坏 CSR 不白白消耗一次性注册 token。
 pub async fn register_gateway(
     State(state): State<ApiState>,
     client: PeerConnectInfo,
@@ -174,6 +173,15 @@ pub async fn register_gateway(
         rate_limit::check_rate_limit(&state, &client_key, GATEWAY_REGISTER_SCOPE)
     {
         return response;
+    }
+    // 先校验 CSR（不签发）：坏 CSR 不应消耗一次性注册 token。
+    if let Err(reason) = crate::infra::validate_csr(&input.certificate_signing_request) {
+        rate_limit::record_auth_failure(&state, &client_key, GATEWAY_REGISTER_SCOPE);
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("invalid certificate signing request: {reason}"),
+        )
+            .into_response();
     }
     let consumed = match state
         .store
@@ -400,10 +408,10 @@ pub struct InitialConfigQueryParams {
 }
 
 /// 链接上级 / 拉取网关初始配置：GET /api/v1/gateway/link-upstream。
-/// 对齐模型 `ProvisionGatewayFlow`；gateway 面 Bearer 鉴权。两种状态：
-/// - **未初始化**（有 bootstrap、无运行期凭据）：Bearer 为一次性 BootstrapToken，
+/// 对齐模型 `ProvisionGatewayFlow`。两种状态：
+/// - **未初始化**（有 bootstrap、无客户端证书）：Bearer 为一次性 BootstrapToken，
 ///   携带 X-Gateway-Identity-Token → 派生 RegistToken 落 enrollment → 消费 bootstrap → 出 config.toml。
-/// - **已初始化**（有运行期凭据）：现有 authenticate_gateway（Bearer RUNTIME_TOKEN）→ 出同一 config.toml。
+/// - **已初始化**（已有客户端证书）：由 mTLS 客户端证书鉴权 → 出同一 config.toml。
 ///
 /// 返回 `application/json`：`config` 为 GatewayInitialConfig，置备态同时返回明文 RegistToken。
 pub async fn get_gateway_initial_config(
@@ -573,7 +581,7 @@ async fn provision_gateway_initial_config(
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct InitialConfigReturned {
     pub config: GatewayInitialConfig,
-    /// 置备路径：RegistToken 明文（注册用）；已初始化路径：None（已用运行期凭据）。
+    /// 置备路径：RegistToken 明文（注册用）；已初始化路径：None（已有客户端证书）。
     pub regist_token: Option<String>,
 }
 
@@ -1059,7 +1067,7 @@ mod tests {
         }
     }
 
-    /// 构造"已创建未置备"网关（create_gateway 存 bootstrap hash、无运行期凭据）的完整路由。
+    /// 构造"已创建未置备"网关（create_gateway 存 bootstrap hash、无客户端证书）的完整路由。
     fn provision_state(bootstrap_token: &str) -> ApiState {
         // 临时文件用「纳秒 + 原子计数器」命名，避免并发测试同纳秒撞同一路径导致 Conflict。
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1189,6 +1197,132 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn rejects_status_report_when_certificate_identity_does_not_match_body() {
+        let response = router()
+            .oneshot(with_identity(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/gateway/status")
+                    .header("content-type", "application/json")
+                    .body(Body::from(status_payload("gw-001")))
+                    .expect("request"),
+                client_identity("gw-002", TEST_FINGERPRINT),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn rejects_status_report_when_certificate_is_expired() {
+        let state = test_state();
+        // 登记凭据已过期（指纹仍匹配）→ 仍拒（与身份到期两回事）。
+        state
+            .store
+            .update_gateway_credential(
+                "gw-001",
+                TEST_FINGERPRINT,
+                Some("2000-01-01T00:00:00+00:00".to_string()),
+            )
+            .await
+            .expect("update");
+        let response = super::super::router_for(state)
+            .oneshot(with_identity(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/gateway/status")
+                    .header("content-type", "application/json")
+                    .body(Body::from(status_payload("gw-001")))
+                    .expect("request"),
+                client_identity("gw-001", TEST_FINGERPRINT),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn verify_gateway_credential_accepts_a_registered_certificate() {
+        let response = router()
+            .oneshot(with_identity(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/gateway/credentials/verify")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"gateway_id":"gw-001","certificate_serial":"01"}"#,
+                    ))
+                    .expect("request"),
+                client_identity("gw-001", TEST_FINGERPRINT),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let result: GatewayCredentialVerificationResult =
+            serde_json::from_slice(&body).expect("json");
+        assert_eq!(result.gateway_id, "gw-001");
+        assert_eq!(result.certificate_serial, "01");
+        assert_eq!(result.status, "valid");
+    }
+
+    #[tokio::test]
+    async fn verify_gateway_credential_rejects_without_a_client_certificate() {
+        let response = router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/gateway/credentials/verify")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"gateway_id":"gw-001","certificate_serial":"01"}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn register_rejects_a_bad_csr_without_consuming_the_token() {
+        let state = register_state("enroll-bad-csr");
+        let app = super::super::router_for(state);
+        let bad = r#"{"enrollment_token":"enroll-bad-csr","instance_id":"inst-1","certificate_signing_request":"not a csr","requested_at":"2026-08-11T00:00:00Z"}"#;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/gateway/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(bad))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        // token 未被消费：同一 token + 合法 CSR 重试 → 200。
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/gateway/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(register_payload("enroll-bad-csr")))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     fn register_payload(token: &str) -> String {
