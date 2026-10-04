@@ -298,6 +298,8 @@ async fn upgrade_plan_for(
         if !covered {
             continue;
         }
+        // 现模型的 `GatewayUpgradePlan` 只承载**单组件**目标；多组件计划这里取第一个
+        // （要精确到组件，需把 `GatewayUpgradePlan` 扩成列表，届时同步发 `wist-control`）。
         let target = plan.targets.first();
         return Ok(GatewayUpgradePlan {
             gateway_id: gateway_id.to_string(),
