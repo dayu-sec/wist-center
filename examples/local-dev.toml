@@ -29,6 +29,11 @@ protocol_version = "1.0"
 # 由环境注入。
 admin_token = "dev-admin-token"
 
+# 服务端 TLS 证书/私钥（PEM）。两者都配 → 起 HTTPS（服务器证书 = CA-S 签）并校网关客户端证书（CA-G）；
+# 都留空 → 明文 HTTP（dev / 反代兑底）。相对路径按本配置目录解析；必须成对配。
+server_cert_path = ""
+server_key_path = ""
+
 [store]
 # 二选一：配了 database_url → PostgreSQL；留空 → 本地 JSON 文件（store_path）。
 # 换成 PG 时（DSN 带账号口令，同样别写进仓库）：

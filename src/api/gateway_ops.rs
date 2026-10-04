@@ -972,6 +972,8 @@ mod tests {
             config: crate::config::CenterConfig {
                 listen_addr: "127.0.0.1:3100".to_string(),
                 store_path: std::env::temp_dir().join(format!("wic-api-test-{nanos}.json")),
+                server_cert_path: None,
+                server_key_path: None,
                 gateway_credentials: Vec::new(),
                 admin_token_hash: None,
                 database_url: None,
@@ -1030,6 +1032,8 @@ mod tests {
             config: crate::config::CenterConfig {
                 listen_addr: "127.0.0.1:3100".to_string(),
                 store_path: std::env::temp_dir().join(format!("wic-register-{nanos}.json")),
+                server_cert_path: None,
+                server_key_path: None,
                 gateway_credentials: Vec::new(),
                 admin_token_hash: None,
                 database_url: None,
@@ -1073,6 +1077,8 @@ mod tests {
             config: crate::config::CenterConfig {
                 listen_addr: "127.0.0.1:3100".to_string(),
                 store_path: path.clone(),
+                server_cert_path: None,
+                server_key_path: None,
                 gateway_credentials: Vec::new(),
                 admin_token_hash: None,
                 database_url: None,
@@ -1565,6 +1571,8 @@ mod tests {
             config: crate::config::CenterConfig {
                 listen_addr: "127.0.0.1:3100".to_string(),
                 store_path: std::env::temp_dir().join(format!("wic-register-revoked-{nanos}.json")),
+                server_cert_path: None,
+                server_key_path: None,
                 gateway_credentials: Vec::new(),
                 admin_token_hash: None,
                 database_url: None,

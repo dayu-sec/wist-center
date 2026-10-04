@@ -8,5 +8,7 @@ pub mod secret;
 pub use secret::*;
 pub mod store;
 pub use store::*;
+pub mod tls;
+pub use tls::*;
 pub mod vm;
 pub use vm::*;

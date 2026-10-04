@@ -1,9 +1,17 @@
 // @jumo generated
 // WarpInsightCenter 上级聚合控制中心服务（crate: wist-center）：接收 WarpGateway 状态上报。
 
-use std::{error::Error, path::PathBuf, sync::Arc};
+use std::{error::Error, net::SocketAddr, path::PathBuf, sync::Arc};
 
-use wist_center::infra::{FileStore, PgStore, Store};
+use axum::extract::{ConnectInfo, Request, State};
+use axum::middleware::{Next, from_fn_with_state};
+use axum::response::Response;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto::Builder;
+use hyper_util::service::TowerToHyperService;
+use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
+use wist_center::infra::{FileStore, PgStore, Store, VerifiedGatewayIdentity};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -28,22 +36,42 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .await
         .map_err(|err| err.into_boxed_std())?;
     let addr = config.listen_addr.clone();
+    // 服务端 TLS 材料（成对配）：配了就起 HTTPS 并校网关客户端证书。
+    let server_tls = config
+        .server_cert_path
+        .clone()
+        .zip(config.server_key_path.clone());
     let (gateway_ca_cert_path, gateway_ca_key_path) =
         wist_center::config::resolved_gateway_client_ca_paths();
     let gateway_ca = Arc::new(
         wist_center::infra::gateway_ca::load_or_create(&gateway_ca_cert_path, &gateway_ca_key_path)
             .map_err(|err| -> Box<dyn Error + Send + Sync> { err.into() })?,
     );
+    let gateway_ca_pem = gateway_ca.ca_certificate_pem().to_string();
     let app = wist_center::api::router(config, store, gateway_ca);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let listener = TcpListener::bind(&addr).await?;
     println!("wist-center config: {}", config_path.display());
-    println!("wist-center listening on http://{addr}");
-    // 注入真实 peer 地址供限流按 IP 分桶（忽略可伪造的 x-real-ip / x-forwarded-for）。
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .await?;
+    match server_tls {
+        Some((cert_path, key_path)) => {
+            let tls_config = wist_center::infra::load_gateway_mtls_server_config(
+                &cert_path,
+                &key_path,
+                &gateway_ca_pem,
+            )
+            .map_err(|err| -> Box<dyn Error + Send + Sync> { err.into() })?;
+            println!("wist-center listening on https://{addr}");
+            serve_tls(listener, app, tls_config).await?;
+        }
+        None => {
+            println!("wist-center listening on http://{addr}");
+            // 注入真实 peer 地址供限流按 IP 分桶（忽略可伪造的 x-real-ip / x-forwarded-for）。
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await?;
+        }
+    }
     Ok(())
 }
 
@@ -83,4 +111,80 @@ fn init_config_command(out_arg: Option<&str>) -> Result<(), Box<dyn Error + Send
     println!("hmac secret: {hmac_secret}");
     println!("  —— RegistToken 派生密钥，请妥善保存（轮换不影响既有网关凭据）");
     Ok(())
+}
+
+/// 每条连接注入请求扩展的东西：对端地址（限流）与 mTLS 证书身份（鉴权）。
+///
+/// `client_identity` 只能由本进程在握手后写入 —— 它走 `request.extensions_mut()`，
+/// 客户端无法通过 HTTP 头伪造。
+#[derive(Clone)]
+struct ConnectionContext {
+    peer: SocketAddr,
+    client_identity: Option<VerifiedGatewayIdentity>,
+}
+
+async fn inject_connection_context(
+    State(context): State<ConnectionContext>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    request
+        .extensions_mut()
+        .insert(ConnectInfo::<SocketAddr>(context.peer));
+    if let Some(identity) = context.client_identity {
+        request.extensions_mut().insert(identity);
+    }
+    next.run(request).await
+}
+
+/// HTTPS 监听：rustls 终止 TLS（服务器证书）+ 校客户端证书（CA-G），
+/// 握手后从连接里取已验证的网关身份并注入每个请求（与网关侧 `serve_tls` 同构）。
+async fn serve_tls(
+    listener: TcpListener,
+    app: axum::Router,
+    tls_config: rustls::ServerConfig,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let acceptor = TlsAcceptor::from(Arc::new(tls_config));
+    loop {
+        let (stream, peer_addr) = listener.accept().await?;
+        let acceptor = acceptor.clone();
+        let service = app.clone();
+        tokio::spawn(async move {
+            let tls_stream = match acceptor.accept(stream).await {
+                Ok(stream) => stream,
+                Err(err) => {
+                    eprintln!("failed TLS handshake from {peer_addr}: {err}");
+                    return;
+                }
+            };
+            // 握手期已由 CA-G 验链；能解出身份就注入，解不出（缺 URI SAN / 段非法）
+            // 就不当作已认证 —— 交给应用层回 401，而不是静默放行。
+            let client_identity = match wist_center::infra::peer_leaf_certificate_der(
+                tls_stream.get_ref().1,
+            ) {
+                Some(der) => match VerifiedGatewayIdentity::from_certificate_der(&der) {
+                    Ok(identity) => Some(identity),
+                    Err(err) => {
+                        eprintln!(
+                            "mTLS client certificate from {peer_addr} has no usable gateway identity: {err}"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+            let io = TokioIo::new(tls_stream);
+            // 注入真实 peer 地址供限流按 IP 分桶，不能靠可伪造的 x-real-ip / x-forwarded-for。
+            let context = ConnectionContext {
+                peer: peer_addr,
+                client_identity,
+            };
+            let service = service.layer(from_fn_with_state(context, inject_connection_context));
+            let service = TowerToHyperService::new(service);
+            let builder = Builder::new(TokioExecutor::new());
+            if let Err(err) = builder.serve_connection(io, service).await {
+                eprintln!("failed to serve HTTPS connection from {peer_addr}: {err}");
+            }
+        });
+    }
 }

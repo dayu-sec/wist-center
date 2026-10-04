@@ -21,6 +21,10 @@ public_url = "https://center.warpinsight.example"
 protocol_version = "1.0"
 # 管理面 token。留空 = 不要求鉴权（仅开发态）；生产必须设置。
 admin_token = "${WIST_CENTER_ADMIN_TOKEN}"
+# 服务端 TLS 证书/私钥（PEM）。两者都配 → 起 HTTPS（服务器证书 = CA-S 签）并校网关客户端证书（CA-G）；
+# 都留空 → 明文 HTTP（dev / 反代兑底）。生产用 CA-S 签的服务器证书；相对路径按本配置目录解析。
+server_cert_path = ""
+server_key_path = ""
 
 [store]
 # 有值 → PostgreSQL（PgStore）；留空 → 本地 JSON 文件存储（store_path）。

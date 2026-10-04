@@ -41,6 +41,8 @@ const ENV_OBJECT_STORAGE_BUCKET: &str = "WARP_INSIGHT_CENTER_OBJECT_STORAGE_BUCK
 const ENV_OBJECT_STORAGE_ACCESS_KEY: &str = "WARP_INSIGHT_CENTER_OBJECT_STORAGE_ACCESS_KEY";
 const ENV_OBJECT_STORAGE_SECRET_KEY: &str = "WARP_INSIGHT_CENTER_OBJECT_STORAGE_SECRET_KEY";
 const ENV_CA_CERT_PATH: &str = "WARP_INSIGHT_CENTER_CA_CERT_PATH";
+const ENV_SERVER_CERT_PATH: &str = "WARP_INSIGHT_CENTER_SERVER_CERT_PATH";
+const ENV_SERVER_KEY_PATH: &str = "WARP_INSIGHT_CENTER_SERVER_KEY_PATH";
 const ENV_PROTOCOL_VERSION: &str = "WARP_INSIGHT_CENTER_PROTOCOL_VERSION";
 const ENV_HMAC_SECRET: &str = "WARP_INSIGHT_CENTER_HMAC_SECRET";
 const ENV_CREDENTIAL_TTL_SECONDS: &str = "WARP_INSIGHT_CENTER_CREDENTIAL_TTL_SECONDS";
@@ -59,6 +61,12 @@ const DEFAULT_CREDENTIAL_TTL_SECONDS: i64 = 30 * 24 * 3600;
 pub struct CenterConfig {
     pub listen_addr: String,
     pub store_path: PathBuf,
+    /// 服务端 TLS 证书/私钥（PEM）。**两者都配** → 起 HTTPS（服务器证书 = CA-S 签）并
+    /// 校网关客户端证书（CA-G）；**都未配** → 明文 HTTP（dev / 反代兑底）。来源：
+    /// `server.server_cert_path`/`server.server_key_path` 或
+    /// `WARP_INSIGHT_CENTER_SERVER_CERT_PATH`/`_KEY_PATH`（必须成对配）。
+    pub server_cert_path: Option<PathBuf>,
+    pub server_key_path: Option<PathBuf>,
     /// seed 网关凭证：gateway_id:token 列表，启动时写入 store（缺失才写）。
     pub gateway_credentials: Vec<GatewayCredentialSeed>,
     /// 管理面 token hash（读取接口迭代用，本次未启用）。
@@ -143,6 +151,8 @@ struct RawServerConfig {
     public_url: Option<String>,
     protocol_version: Option<String>,
     admin_token: Option<String>,
+    server_cert_path: Option<String>,
+    server_key_path: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -273,10 +283,17 @@ impl CenterConfig {
         let ca_cert_path = normalize_optional(security.ca_cert_path)
             .map(|path| absolutize_path(config_dir, Path::new(&path)))
             .unwrap_or_else(default_ca_cert_path);
+        // 服务端 TLS：成对配（validate 会卡住只配一半）；相对路径按配置目录解析。
+        let server_cert_path = normalize_optional(serve.server_cert_path)
+            .map(|path| absolutize_path(config_dir, Path::new(&path)));
+        let server_key_path = normalize_optional(serve.server_key_path)
+            .map(|path| absolutize_path(config_dir, Path::new(&path)));
         Ok(Self {
             listen_addr: serve
                 .listen_addr
                 .unwrap_or_else(|| DEFAULT_LISTEN.to_string()),
+            server_cert_path,
+            server_key_path,
             store_path: absolutize_path(
                 config_dir,
                 Path::new(
@@ -331,6 +348,15 @@ impl CenterConfig {
             "security.credential_ttl_seconds",
             self.credential_ttl_seconds,
         )?;
+        // 服务端 TLS：证书与私钥要么都配（起 HTTPS），要么都不配（明文 HTTP）。
+        match (&self.server_cert_path, &self.server_key_path) {
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(config_validation(
+                    "server.server_cert_path and server.server_key_path must be set together",
+                ));
+            }
+            _ => {}
+        }
         Ok(())
     }
 }
@@ -401,6 +427,8 @@ fn apply_env_overrides(raw: &mut RawCenterConfig) {
     override_scalar(&mut raw.artifacts.gateway_image, ENV_GATEWAY_IMAGE);
     override_scalar(&mut raw.security.hmac_secret, ENV_HMAC_SECRET);
     override_scalar(&mut raw.security.ca_cert_path, ENV_CA_CERT_PATH);
+    override_scalar(&mut raw.server.server_cert_path, ENV_SERVER_CERT_PATH);
+    override_scalar(&mut raw.server.server_key_path, ENV_SERVER_KEY_PATH);
     override_optional(&mut raw.store.store_path, ENV_STORE_PATH);
     override_optional(&mut raw.artifacts.dir, ENV_ARTIFACT_DIR);
     // 开关：env **显式设过** 就覆盖 —— 置空即"明确关闭"（例如关掉 PG / 时序推送）。

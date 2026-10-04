@@ -31,6 +31,14 @@ rcgen = { version = "0.13", features = ["x509-parser"] }
 x509-parser = "0.16"
 time = { version = "0.3", features = ["std"] }
 
+# 中心服务端 TLS/mTLS：服务器证书（CA-S）+ 校网关客户端证书（CA-G）。
+# 与网关侧 infra/tls.rs 同构（WebPkiClientVerifier + allow_unauthenticated、握手后取客户端叶证书）。
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rustls-pki-types = "1"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+hyper = "1"
+hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service", "http1", "http2"] }
+
 #wist-control = { path = "../wist-control" }
 #wist-error = { path = "../wist-error" }
 orion-error = { version = "0.8", features = ["derive", "serde_json"] }

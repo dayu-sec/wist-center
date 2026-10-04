@@ -1062,6 +1062,8 @@ mod tests {
             config: CenterConfig {
                 listen_addr: "127.0.0.1:3100".to_string(),
                 store_path: std::env::temp_dir().join("unused.json"),
+                server_cert_path: None,
+                server_key_path: None,
                 gateway_credentials: Vec::new(),
                 admin_token_hash: Some(super::super::super::infra::sha256_hex("admin-tok")),
                 database_url: None,
@@ -1207,6 +1209,8 @@ mod tests {
             config: CenterConfig {
                 listen_addr: "127.0.0.1:3100".to_string(),
                 store_path: std::env::temp_dir().join(format!("wic-never-{nanos}.json")),
+                server_cert_path: None,
+                server_key_path: None,
                 gateway_credentials: Vec::new(),
                 admin_token_hash: Some(super::super::super::infra::sha256_hex("admin-tok")),
                 database_url: None,
@@ -1383,6 +1387,8 @@ mod tests {
             config: CenterConfig {
                 listen_addr: "127.0.0.1:3100".to_string(),
                 store_path: std::env::temp_dir().join("unused.json"),
+                server_cert_path: None,
+                server_key_path: None,
                 gateway_credentials: Vec::new(),
                 admin_token_hash: Some(super::super::super::infra::sha256_hex("admin-tok")),
                 database_url: None,
@@ -1593,6 +1599,8 @@ mod tests {
             config: CenterConfig {
                 listen_addr: "127.0.0.1:3100".to_string(),
                 store_path: std::env::temp_dir().join(format!("wic-create-tb-{nanos}.json")),
+                server_cert_path: None,
+                server_key_path: None,
                 gateway_credentials: Vec::new(),
                 admin_token_hash: Some(super::super::super::infra::sha256_hex("admin-tok")),
                 database_url: None,
