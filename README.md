@@ -20,7 +20,7 @@ artifacts.
 ## Features
 
 - **Gateway onboarding** — one-time bootstrap credentials, initial `config.toml` provisioning with
-  a derived RegistToken, plus runtime credential renewal and verification.
+  a derived RegistToken, plus client-certificate (mTLS) rotation and verification.
 - **Status ingestion** — accepts gateway status reports and the per-gateway agent status lists;
   optionally pushes each report to VictoriaMetrics for history.
 - **Fleet admin API** — gateway list and status cards, per-gateway status / uptime / history,
@@ -30,8 +30,8 @@ artifacts.
 - **Release and upgrade** — publish `wist-agentd` / `wist-gateway` artifacts to a local directory
   or object storage, and create / list / approve multi-step upgrade plans.
 - **Auth and rate limiting** — admin bearer token (SHA-256, constant-time compare) and gateway
-  runtime credentials; per-peer-IP rate limiting that deliberately ignores the spoofable
-  `x-real-ip` and `x-forwarded-for` headers.
+  client certificates (mTLS, verified against CA-G on the TLS handshake); per-peer-IP rate limiting
+  that deliberately ignores the spoofable `x-real-ip` and `x-forwarded-for` headers.
 - **Two storage backends** — PostgreSQL when a database URL is set, otherwise a plain JSON file
   store, so `cargo test` and local runs need no infrastructure.
 
@@ -139,13 +139,15 @@ In the file:
 | `WARP_INSIGHT_CENTER_STORE_PATH` | `state/warp-insight-center-store.json` (under the config-file directory) | JSON store path. |
 | `WARP_INSIGHT_CENTER_VICTORIAMETRICS_URL` | *(unset)* | VictoriaMetrics base URL. Unset or empty → no time-series push. |
 | `WARP_INSIGHT_CENTER_GATEWAY_CREDENTIALS` | *(unset)* | `gateway_id:token,...` seeds written into the store at boot when missing. |
-| `WARP_INSIGHT_CENTER_CREDENTIAL_TTL_SECONDS` | `2592000` (30 days) | Runtime credential lifetime. |
+| `WARP_INSIGHT_CENTER_CREDENTIAL_TTL_SECONDS` | `2592000` (30 days) | Gateway **client-certificate** lifetime (register/renew). |
 | `WARP_INSIGHT_CENTER_ARTIFACT_DIR` | `artifacts` | Local release-artifact directory. |
 | `WARP_INSIGHT_CENTER_OBJECT_STORAGE_ENDPOINT` | *(unset)* | S3-compatible endpoint (MinIO, AWS S3, …). |
 | `WARP_INSIGHT_CENTER_OBJECT_STORAGE_BUCKET` | *(unset)* | Bucket that holds release artifacts. |
 | `WARP_INSIGHT_CENTER_OBJECT_STORAGE_ACCESS_KEY` | *(unset)* | Object-storage access key. |
 | `WARP_INSIGHT_CENTER_OBJECT_STORAGE_SECRET_KEY` | *(unset)* | Object-storage secret key. |
 | `WARP_INSIGHT_CENTER_CA_CERT_PATH` | `~/.wist-center/ca/control-center.pem` | Trust root handed to gateways as their trust bundle. Missing file → no trust bundle. |
+| `WARP_INSIGHT_CENTER_SERVER_CERT_PATH` | *(unset)* | Server TLS certificate (PEM). Set **together with** the key → the center serves HTTPS and verifies gateway client certificates (CA-G); unset → plain HTTP. |
+| `WARP_INSIGHT_CENTER_SERVER_KEY_PATH` | *(unset)* | Server TLS private key (PEM). |
 | `WARP_INSIGHT_CENTER_PROTOCOL_VERSION` | `1.0` | Gateway ↔ center wire protocol version. |
 | `WARP_INSIGHT_CENTER_GATEWAY_IMAGE` | `wist-gateway:latest` | Image reference used in the generated gateway install command. |
 
@@ -165,12 +167,12 @@ Authenticated by the gateway's own credential:
 
 | Method | Path | Credential |
 | --- | --- | --- |
-| `POST` | `/api/v1/gateway/register` | one-time enrollment token carried in the request body |
-| `GET` | `/api/v1/gateway/link-upstream` | one-time bootstrap token before initialization, runtime token afterwards |
-| `POST` | `/api/v1/gateway/status` | runtime Bearer token |
-| `POST` | `/api/v1/gateway/agents/status` | runtime Bearer token |
-| `POST` | `/api/v1/gateway/credentials:renew` | runtime Bearer token; the old one is invalidated on success |
-| `POST` | `/api/v1/gateway/credentials/verify` | runtime Bearer token |
+| `POST` | `/api/v1/gateway/register` | one-time enrollment token carried in the request body; returns a client certificate |
+| `GET` | `/api/v1/gateway/link-upstream` | one-time bootstrap token before initialization; client certificate (mTLS) afterwards |
+| `POST` | `/api/v1/gateway/status` | client certificate (mTLS) |
+| `POST` | `/api/v1/gateway/agents/status` | client certificate (mTLS) |
+| `POST` | `/api/v1/gateway/credentials:renew` | client certificate (mTLS); the old certificate is invalidated on success |
+| `POST` | `/api/v1/gateway/credentials/verify` | client certificate (mTLS) |
 
 ### Admin-facing
 

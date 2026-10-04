@@ -137,7 +137,7 @@ pub fn router_for(state: ApiState) -> Router {
                 .options(options_gateway_initial_config)
                 .layer(from_fn(gateway_initial_config_cors)),
         )
-        // 网关面：续期运行期凭据（RenewGatewayCredential，旧 token 立即失效）
+        // 网关面：轮换网关客户端证书（RenewGatewayCredential，旧证书作废）
         .route(
             "/api/v1/gateway/credentials:renew",
             post(renew_gateway_credential),

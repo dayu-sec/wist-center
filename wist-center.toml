@@ -39,7 +39,7 @@ victoriametrics_url = ""
 # RegistToken 派生密钥（HMAC-SHA256）。生产必须设置。
 # 轮换该密钥不影响既有凭据：中心只存派生结果，不重算。
 hmac_secret = "${WIST_CENTER_HMAC_SECRET}"
-# 运行期凭据（RUNTIME_TOKEN）有效期秒数，默认 30 天。
+# 网关客户端证书有效期秒数（register / renew 签出证书的 TTL）；2592000 = 30 天。
 credential_ttl_seconds = 2592000
 # 控制中心 CA 证书（分发给网关作 control_center.trust_bundle）。
 # ${HOME} 由加载时展开（HOME 未设置会直接报错）；文件不存在 → 不提供信任根。

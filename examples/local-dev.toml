@@ -53,7 +53,7 @@ victoriametrics_url = ""
 # 轮换它不影响既有凭据 —— 中心只存派生结果 hash，不重算。
 hmac_secret = "dev-center-hmac-secret-change-me"
 
-# 运行期凭据（RUNTIME_TOKEN）有效期秒数；2592000 = 30 天。
+# 网关客户端证书有效期秒数（register / renew 签出证书的 TTL）；2592000 = 30 天。
 credential_ttl_seconds = 2592000
 
 # 控制中心 CA 证书（信任根，分发给网关作 control_center.trust_bundle）。

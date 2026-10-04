@@ -911,6 +911,17 @@ mod tests {
         )
     }
 
+    /// 并发测试用临时状态文件：纳秒 + 进程内原子序号，避免同纳秒撞同一路径导致 Conflict。
+    fn temp_state_path(prefix: &str) -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let sequence = COUNTER.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!("{prefix}-{nanos}-{sequence}.json"))
+    }
+
     /// 与 `test_state` 登记在册的凭据指纹一致（模拟「持本网关证书的 mTLS 对端」）。
     const TEST_FINGERPRINT: &str =
         "abababababababababababababababababababababababababababababababab";
@@ -955,12 +966,8 @@ mod tests {
     }
 
     fn test_state() -> ApiState {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("wic-api-test-{nanos}.json"));
-        let store = FileStore::new(path);
+        let path = temp_state_path("wic-api-test");
+        let store = FileStore::new(&path);
         store
             .seed(&[GatewayCredentialSeed {
                 gateway_id: "gw-001".to_string(),
@@ -979,7 +986,7 @@ mod tests {
         ApiState {
             config: crate::config::CenterConfig {
                 listen_addr: "127.0.0.1:3100".to_string(),
-                store_path: std::env::temp_dir().join(format!("wic-api-test-{nanos}.json")),
+                store_path: path,
                 server_cert_path: None,
                 server_key_path: None,
                 gateway_credentials: Vec::new(),
@@ -1013,11 +1020,7 @@ mod tests {
 
     /// 构造带 seed 网关 + 注册 Token 的完整路由（register 端点走 router_for）。
     fn register_state(enrollment_token: &str) -> ApiState {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("wic-register-{nanos}.json"));
+        let path = temp_state_path("wic-register");
         let store = FileStore::new(&path);
         store
             .seed(&[GatewayCredentialSeed {
@@ -1039,7 +1042,7 @@ mod tests {
         ApiState {
             config: crate::config::CenterConfig {
                 listen_addr: "127.0.0.1:3100".to_string(),
-                store_path: std::env::temp_dir().join(format!("wic-register-{nanos}.json")),
+                store_path: path,
                 server_cert_path: None,
                 server_key_path: None,
                 gateway_credentials: Vec::new(),

@@ -100,7 +100,8 @@ pub struct CenterConfig {
     /// 派生后中心只存结果 hash、不重算，故轮换该密钥不影响既有凭据校验；
     /// 生产必须配置（配置文件的 `security.hmac_secret` 或 `WARP_INSIGHT_CENTER_HMAC_SECRET`）。
     pub hmac_secret: String,
-    /// 运行期凭据（RUNTIME_TOKEN）有效期秒数（镜像 wist-gateway 的 credential_ttl_seconds）。
+    /// 网关**客户端证书**有效期秒数（register / renew 签出证书的 TTL）。
+    /// env：`WARP_INSIGHT_CENTER_CREDENTIAL_TTL_SECONDS`。
     pub credential_ttl_seconds: i64,
 }
 
