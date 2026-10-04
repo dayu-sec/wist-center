@@ -1,5 +1,7 @@
 pub mod artifacts;
 pub use artifacts::*;
+pub mod gateway_ca;
+pub use gateway_ca::*;
 pub mod pg_store;
 pub use pg_store::*;
 pub mod secret;
