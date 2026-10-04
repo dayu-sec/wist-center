@@ -152,7 +152,7 @@ pub async fn download_release_artifact(
 /// 对应模型 `RegisterGateway` + `RegisterGatewayFlow`：WarpGateway 持一次性
 /// RegistToken（enrollment token）提交注册。消费 token（防重放/限量/吊销/过期）后
 /// **签发独立运行期凭据（RUNTIME_TOKEN）**：RegistToken 只用于本次注册，
-/// 运行期 Bearer（initial-config / status）以新签发的凭据为准。
+/// 运行期 Bearer（link-upstream / status）以新签发的凭据为准。
 pub async fn register_gateway(
     State(state): State<ApiState>,
     client: PeerConnectInfo,
@@ -263,7 +263,7 @@ fn issue_runtime_credential(
     gateway_id: &str,
     instance_id: &str,
 ) -> Result<(GatewayCredentialBundle, String, Option<String>), String> {
-    let bearer_token = new_secret_token("wic")?;
+    let bearer_token = new_secret_token("rt")?;
     let credential_id = new_secret_token("cred")?;
     let issued_at_time = chrono::Utc::now();
     let issued_at = issued_at_time.to_rfc3339();
@@ -283,10 +283,10 @@ fn issue_runtime_credential(
 
 #[derive(serde::Deserialize)]
 pub struct InitialConfigQueryParams {
-    pub instance_id: Option<String>,
+    pub gateway_id: String,
 }
 
-/// 拉取网关初始配置：GET /api/v1/gateway/initial-config。
+/// 链接上级 / 拉取网关初始配置：GET /api/v1/gateway/link-upstream。
 /// 对齐模型 `ProvisionGatewayFlow`；gateway 面 Bearer 鉴权。两种状态：
 /// - **未初始化**（有 bootstrap、无运行期凭据）：Bearer 为一次性 BootstrapToken，
 ///   携带 X-Gateway-Identity-Token → 派生 RegistToken 落 enrollment → 消费 bootstrap → 出 config.toml。
@@ -300,13 +300,11 @@ pub async fn get_gateway_initial_config(
     Query(params): Query<InitialConfigQueryParams>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
-    let Some(instance_id) = params.instance_id.as_deref() else {
-        return (StatusCode::BAD_REQUEST, "missing instance_id").into_response();
-    };
+    let gateway_id = params.gateway_id.as_str();
     // 安全 #1（fail-closed）：TLS 开启但未配置信任根 → 拒绝服务，
     // 避免网关在无法校验中心证书的情况下继续初始化（可被中间人）。
     if control_center_tls_required(&state.config)
-        && build_control_center_trust_bundle(&state.config, instance_id).is_none()
+        && build_control_center_trust_bundle(&state.config, gateway_id).is_none()
     {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -314,7 +312,7 @@ pub async fn get_gateway_initial_config(
         )
             .into_response();
     }
-    let gateway = match state.store.get_gateway(instance_id).await {
+    let gateway = match state.store.get_gateway(gateway_id).await {
         Ok(Some(gateway)) => gateway,
         Ok(None) => {
             rate_limit::record_auth_failure(&state, &client_key, GATEWAY_AUTH_SCOPE);
@@ -333,25 +331,25 @@ pub async fn get_gateway_initial_config(
         return provision_gateway_initial_config(
             &state,
             &headers,
-            instance_id,
+            gateway_id,
             &gateway,
             &client_key,
         )
         .await;
     }
     // 已初始化 → 现有运行期凭据鉴权。
-    match authenticate_gateway(&state, &headers, instance_id, &client_key).await {
+    match authenticate_gateway(&state, &headers, gateway_id, &client_key).await {
         Ok(gateway) => {
             let enrollment_token_id = state
                 .store
-                .get_enrollment_token_for_gateway(instance_id)
+                .get_enrollment_token_for_gateway(gateway_id)
                 .await
                 .ok()
                 .flatten()
                 .map(|token| token.token_id)
                 .unwrap_or_default();
             let config =
-                build_initial_config_json(&state, &gateway, instance_id, &enrollment_token_id);
+                build_initial_config_json(&state, &gateway, gateway_id, &enrollment_token_id);
             Json(InitialConfigReturned {
                 config,
                 regist_token: None,
@@ -367,7 +365,7 @@ pub async fn get_gateway_initial_config(
 async fn provision_gateway_initial_config(
     state: &ApiState,
     headers: &HeaderMap,
-    instance_id: &str,
+    gateway_id: &str,
     gateway: &StoredGateway,
     client_key: &str,
 ) -> Response {
@@ -391,12 +389,12 @@ async fn provision_gateway_initial_config(
             .into_response();
     };
     // 派生 RegistToken：HMAC(center_secret, "gateway-reg:" + gateway_id + ":" + identity_token)。
-    let regist_token = derive_regist_token(&state.config.hmac_secret, instance_id, identity_token);
+    let regist_token = derive_regist_token(&state.config.hmac_secret, gateway_id, identity_token);
     // 落 enrollment token（sha256(regist_token)，max_uses=1，Active），供 /register 一次性消费。
     let enrollment = match state
         .store
         .create_enrollment_token(
-            instance_id,
+            gateway_id,
             &EnrollmentTokenIssue {
                 token: regist_token.clone(),
                 issued_by: "provision".to_string(),
@@ -417,7 +415,7 @@ async fn provision_gateway_initial_config(
     // 成功落库 RegistToken 后才消费 bootstrap（一次性；网络抖动可重试置备）。
     match state
         .store
-        .consume_bootstrap_token(instance_id, bootstrap_token)
+        .consume_bootstrap_token(gateway_id, bootstrap_token)
         .await
     {
         Ok(true) => {}
@@ -437,11 +435,11 @@ async fn provision_gateway_initial_config(
         }
     }
     // 生命周期：Provisioned → Initializing。
-    if let Err(err) = state.store.mark_gateway_initializing(instance_id).await {
+    if let Err(err) = state.store.mark_gateway_initializing(gateway_id).await {
         eprintln!("warn mark gateway initializing failed: {err}");
     }
     rate_limit::clear_auth_failures(state, client_key, GATEWAY_AUTH_SCOPE);
-    let config = build_initial_config_json(state, gateway, instance_id, &enrollment.token_id);
+    let config = build_initial_config_json(state, gateway, gateway_id, &enrollment.token_id);
     Json(InitialConfigReturned {
         config,
         regist_token: Some(regist_token),
@@ -462,13 +460,13 @@ pub struct InitialConfigReturned {
 fn build_initial_config_json(
     state: &ApiState,
     gateway: &StoredGateway,
-    instance_id: &str,
+    gateway_id: &str,
     enrollment_token_id: &str,
 ) -> GatewayInitialConfig {
     GatewayInitialConfig {
         gateway_id: gateway.gateway_id.clone(),
         control_center_endpoint: state.config.public_url.trim_end_matches('/').to_string(),
-        trust_bundle: build_control_center_trust_bundle(&state.config, instance_id),
+        trust_bundle: build_control_center_trust_bundle(&state.config, gateway_id),
         server_tls_required: control_center_tls_required(&state.config),
         protocol_version: state.config.protocol_version.clone(),
         enrollment_token_id: enrollment_token_id.to_string(),
@@ -686,9 +684,7 @@ pub async fn query_gateway_initialization_status(
     State(state): State<ApiState>,
     Query(params): Query<QueryGatewayInitializationStatus>,
 ) -> Response {
-    let Some(gateway_id) = params.instance_id.as_deref() else {
-        return (StatusCode::BAD_REQUEST, "missing instance_id").into_response();
-    };
+    let gateway_id = params.gateway_id.as_str();
     let gateway = match state.store.get_gateway(gateway_id).await {
         Ok(Some(gateway)) => gateway,
         Ok(None) => {
@@ -980,7 +976,7 @@ mod tests {
         // 注册后签发独立运行期凭据（RUNTIME_TOKEN）：随机 bearer + 过期时间。
         let bundle = &returned.credential_bundle;
         assert!(
-            bundle.bearer_token.starts_with("wic_"),
+            bundle.bearer_token.starts_with("rt_"),
             "runtime token: {}",
             bundle.bearer_token
         );
@@ -1065,7 +1061,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/api/v1/gateway/initial-config?instance_id=gw-p")
+                    .uri("/api/v1/gateway/link-upstream?gateway_id=gw-p")
                     .header("authorization", "Bearer boot-tok-p")
                     .header("x-gateway-identity-token", "identity-p")
                     .body(Body::empty())
@@ -1111,7 +1107,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/api/v1/gateway/initial-config?instance_id=gw-p")
+                    .uri("/api/v1/gateway/link-upstream?gateway_id=gw-p")
                     .header("authorization", "Bearer boot-tok-p")
                     .header("x-gateway-identity-token", "identity-p")
                     .body(Body::empty())
@@ -1127,7 +1123,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/api/v1/gateway/initial-config?instance_id=gw-p")
+                    .uri("/api/v1/gateway/link-upstream?gateway_id=gw-p")
                     .header("authorization", "Bearer wrong-boot")
                     .header("x-gateway-identity-token", "identity-p")
                     .body(Body::empty())
@@ -1168,7 +1164,7 @@ mod tests {
             .expect("body")
             .to_bytes();
         let renewed: GatewayCredentialBundle = serde_json::from_slice(&body).expect("json");
-        assert!(renewed.bearer_token.starts_with("wic_"));
+        assert!(renewed.bearer_token.starts_with("rt_"));
         assert_ne!(renewed.bearer_token, "cred-tok");
 
         // 旧凭据立即失效 → 401；新凭据 → 200。
@@ -1207,7 +1203,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("OPTIONS")
-                    .uri("/api/v1/gateway/initial-config?instance_id=gw-001")
+                    .uri("/api/v1/gateway/link-upstream?gateway_id=gw-001")
                     .header("origin", "http://127.0.0.1:5174")
                     .header("access-control-request-method", "GET")
                     .header("access-control-request-headers", "authorization")
@@ -1334,7 +1330,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/api/v1/gateway/initialization-status?instance_id=gw-p")
+                    .uri("/api/v1/gateway/initialization-status?gateway_id=gw-p")
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -1363,7 +1359,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/api/v1/gateway/initialization-status?instance_id=gw-p")
+                    .uri("/api/v1/gateway/initialization-status?gateway_id=gw-p")
                     .body(Body::empty())
                     .expect("request"),
             )

@@ -104,7 +104,7 @@ pub async fn admin_create_gateway_instance(
     {
         Ok(stored) => {
             let init_endpoint = format!(
-                "{}/api/v1/gateway/initial-config?instance_id={}",
+                "{}/api/v1/gateway/link-upstream?gateway_id={}",
                 state.config.public_url.trim_end_matches('/'),
                 stored.gateway_id
             );
@@ -409,7 +409,7 @@ pub async fn admin_list_gateway_instances(
         .into_iter()
         .map(|gateway| {
             let init_url = format!(
-                "{}/api/v1/gateway/initial-config?instance_id={}",
+                "{}/api/v1/gateway/link-upstream?gateway_id={}",
                 state.config.public_url.trim_end_matches('/'),
                 gateway.gateway_id
             );
@@ -606,12 +606,12 @@ pub async fn admin_bind_gateway_customer(
     .into_response()
 }
 
-/// 查询实例初始配置（admin 侧）：GET /api/v1/admin/gateways/instances/:instance_id/config。
+/// 查询网关初始配置（admin 侧）：GET /api/v1/admin/gateways/:gateway_id/config。
 pub async fn admin_get_gateway_initial_config(
     State(state): State<ApiState>,
     headers: HeaderMap,
     client: PeerConnectInfo,
-    Path(instance_id): Path<String>,
+    Path(gateway_id): Path<String>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
@@ -620,14 +620,14 @@ pub async fn admin_get_gateway_initial_config(
     // 配置引用该网关最近签发的一个注册 Token（config.toml [enrollment] token_id）。
     let enrollment_token_id = state
         .store
-        .get_enrollment_token_for_gateway(&instance_id)
+        .get_enrollment_token_for_gateway(&gateway_id)
         .await
         .ok()
         .flatten()
         .map(|token| token.token_id)
         .unwrap_or_default();
     let server_tls_required = control_center_tls_required(&state.config);
-    let trust_bundle = build_control_center_trust_bundle(&state.config, &instance_id);
+    let trust_bundle = build_control_center_trust_bundle(&state.config, &gateway_id);
     // 安全 #1（fail-closed）：TLS 开启但未配置信任根 → 拒绝服务。
     if server_tls_required && trust_bundle.is_none() {
         return (
@@ -637,7 +637,7 @@ pub async fn admin_get_gateway_initial_config(
             .into_response();
     }
     Json(GatewayInitialConfig {
-        gateway_id: instance_id.clone(),
+        gateway_id: gateway_id.clone(),
         control_center_endpoint: state.config.public_url.clone(),
         trust_bundle,
         server_tls_required,
@@ -1443,15 +1443,15 @@ mod tests {
             returned.instance.lifecycle_state,
             GatewayInstanceLifecycleState::Provisioned
         );
-        assert!(returned.install.init_url.contains("initial-config"));
+        assert!(returned.install.init_url.contains("link-upstream"));
         assert!(returned.install.install_command.starts_with("docker run"));
         assert_eq!(
             returned.install.init_curl,
-            "curl -H \"Authorization: Bearer tok-create\" -H \"X-Gateway-Identity-Token: <gateway-identity>\" \"http://127.0.0.1:3100/api/v1/gateway/initial-config?instance_id=gw-create\""
+            "curl -H \"Authorization: Bearer tok-create\" -H \"X-Gateway-Identity-Token: <gateway-identity>\" \"http://127.0.0.1:3100/api/v1/gateway/link-upstream?gateway_id=gw-create\""
         );
         assert_eq!(
             returned.install.init_url,
-            "http://127.0.0.1:3100/api/v1/gateway/initial-config?instance_id=gw-create"
+            "http://127.0.0.1:3100/api/v1/gateway/link-upstream?gateway_id=gw-create"
         );
 
         // 实例列表公开可重复获取的初始化 URL，但不重复返回安装命令或凭证。
@@ -1489,7 +1489,7 @@ mod tests {
             .expect("created instance");
         assert_eq!(
             created.init_url,
-            "http://127.0.0.1:3100/api/v1/gateway/initial-config?instance_id=gw-create"
+            "http://127.0.0.1:3100/api/v1/gateway/link-upstream?gateway_id=gw-create"
         );
 
         // 重复创建同一 gateway_id → 409。

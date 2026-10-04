@@ -2,3 +2,4 @@
 .report
 .run*
 .DS_Store
+state/

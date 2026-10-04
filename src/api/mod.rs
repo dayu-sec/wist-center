@@ -122,9 +122,9 @@ pub fn router_for(state: ApiState) -> Router {
         .route("/api/v1/gateway/agents/status", post(submit_agent_status))
         // 网关面：WarpGateway 持注册 Token 注册（RegisterGatewayFlow）
         .route("/api/v1/gateway/register", post(register_gateway))
-        // 网关面：Gateway 拉取初始配置（初始化 URL 指向此端点；返回 application/json）
+        // 网关面：Gateway 链接上级 link-upstream（初始化 URL 指向此端点；返回 application/json）
         .route(
-            "/api/v1/gateway/initial-config",
+            "/api/v1/gateway/link-upstream",
             get(get_gateway_initial_config)
                 .options(options_gateway_initial_config)
                 .layer(from_fn(gateway_initial_config_cors)),
@@ -175,7 +175,7 @@ pub fn router_for(state: ApiState) -> Router {
         )
         // 管理面：实例初始配置（admin 侧查询）
         .route(
-            "/api/v1/admin/gateways/instances/{instance_id}/config",
+            "/api/v1/admin/gateways/{gateway_id}/config",
             get(admin_get_gateway_initial_config),
         )
         // 管理面：网关列表聚合（AdminViewGatewayList，GET /api/v1/admin/gateways）

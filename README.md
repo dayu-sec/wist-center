@@ -166,7 +166,7 @@ Authenticated by the gateway's own credential:
 | Method | Path | Credential |
 | --- | --- | --- |
 | `POST` | `/api/v1/gateway/register` | one-time enrollment token carried in the request body |
-| `GET` | `/api/v1/gateway/initial-config` | one-time bootstrap token before initialization, runtime token afterwards |
+| `GET` | `/api/v1/gateway/link-upstream` | one-time bootstrap token before initialization, runtime token afterwards |
 | `POST` | `/api/v1/gateway/status` | runtime Bearer token |
 | `POST` | `/api/v1/gateway/agents/status` | runtime Bearer token |
 | `POST` | `/api/v1/gateway/credentials:renew` | runtime Bearer token; the old one is invalidated on success |
@@ -187,7 +187,7 @@ All require the admin Bearer token:
 | `GET` | `/api/v1/admin/gateways/:gateway_id/agents/:agent_id/history` |
 | `GET` | `/api/v1/admin/gateways/:gateway_id/lifecycle` |
 | `POST` / `GET` | `/api/v1/admin/gateways/instances` |
-| `GET` | `/api/v1/admin/gateways/instances/:instance_id/config` |
+| `GET` | `/api/v1/admin/gateways/:gateway_id/config` |
 | `POST` | `/api/v1/admin/gateways/bind` |
 | `POST` | `/api/v1/admin/policies/global` |
 | `POST` | `/api/v1/gateway/agents/dispatch` |
@@ -207,7 +207,7 @@ These two check no credential:
 | `GET` | `/api/v1/gateway/initialization-status` | Reports whether an instance is initialized, keyed only by `instance_id`. |
 | `GET` | `/api/v1/releases/artifact/:component/:version/:filename` | Serves files directly from `WARP_INSIGHT_CENTER_ARTIFACT_DIR`. |
 
-`OPTIONS /api/v1/gateway/initial-config` is also open, as CORS preflight.
+`OPTIONS /api/v1/gateway/link-upstream` is also open, as CORS preflight.
 
 ## Repository layout
 
