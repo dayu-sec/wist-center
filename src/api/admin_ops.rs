@@ -1009,6 +1009,14 @@ mod tests {
         infra::FileStore,
     };
 
+    fn test_gateway_ca() -> std::sync::Arc<crate::infra::gateway_ca::GatewayCa> {
+        std::sync::Arc::new(
+            crate::infra::gateway_ca::GatewayCa::generate("Wist Test Gateway CA")
+                .expect("gateway ca")
+                .0,
+        )
+    }
+
     fn test_store() -> FileStore {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1072,6 +1080,7 @@ mod tests {
                 std::env::temp_dir().join("wic-artifacts"),
                 "http://127.0.0.1:3100",
             )),
+            gateway_ca: test_gateway_ca(),
             rate_limits: std::sync::Arc::new(std::sync::Mutex::new(
                 super::super::rate_limit::RateLimitState::default(),
             )),
@@ -1216,6 +1225,7 @@ mod tests {
                 std::env::temp_dir().join("wic-artifacts"),
                 "http://127.0.0.1:3100",
             )),
+            gateway_ca: test_gateway_ca(),
             rate_limits: std::sync::Arc::new(std::sync::Mutex::new(
                 super::super::rate_limit::RateLimitState::default(),
             )),
@@ -1391,6 +1401,7 @@ mod tests {
                 std::env::temp_dir().join("wic-artifacts"),
                 "http://127.0.0.1:3100",
             )),
+            gateway_ca: test_gateway_ca(),
             rate_limits: std::sync::Arc::new(std::sync::Mutex::new(
                 super::super::rate_limit::RateLimitState::default(),
             )),
@@ -1602,6 +1613,7 @@ mod tests {
                 std::env::temp_dir().join("wic-artifacts"),
                 "http://127.0.0.1:3100",
             )),
+            gateway_ca: test_gateway_ca(),
             rate_limits: std::sync::Arc::new(std::sync::Mutex::new(
                 super::super::rate_limit::RateLimitState::default(),
             )),

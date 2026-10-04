@@ -4,23 +4,25 @@
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
 
-use wist_control::types::DateTime;
-use wist_control::{
+use wist_contracts::gateway_control::{
     GatewayCredentialBundle, GatewayCredentialVerificationResult, GatewayEnrollmentResult,
+    RegisterGateway, RenewGatewayCredential, VerifyGatewayCredential,
+};
+use wist_control::{
     GatewayInitialConfig, GatewayInitializationStatus, GatewayInstanceLifecycleState,
     GatewayStatusAccepted, GatewayUpgradePlan, GatewayUpgradeResultAccepted,
-    QueryGatewayInitializationStatus, RegisterGateway, ReportGatewayStatus,
-    ReportGatewayUpgradeResult, VerifyGatewayCredential,
+    QueryGatewayInitializationStatus, ReportGatewayStatus, ReportGatewayUpgradeResult,
 };
 
 use crate::infra::{
     EnrollmentTokenIssue, GatewayStatusUpdate, StoreReason, StoredAgent, StoredGateway,
-    StoredGatewayCredentialStatus, derive_regist_token, new_secret_token, sha256_hex,
+    StoredGatewayCredentialStatus, VerifiedGatewayIdentity, derive_regist_token, new_secret_token,
+    sha256_hex,
 };
 
 use super::{
@@ -65,12 +67,19 @@ pub struct AgentStatusEntry {
 /// 接收 Gateway 上报的 Agent 状态：Bearer 按 gateway_id 凭证鉴权 → store upsert → VM 推送。
 pub async fn submit_agent_status(
     State(state): State<ApiState>,
-    headers: HeaderMap,
+    identity: Option<Extension<VerifiedGatewayIdentity>>,
     client: PeerConnectInfo,
     Json(input): Json<AgentStatusReportRequest>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
-    match authenticate_gateway(&state, &headers, &input.gateway_id, &client_key).await {
+    match authorize_gateway_certificate(
+        &state,
+        identity.as_ref().map(|identity| &identity.0),
+        &input.gateway_id,
+        &client_key,
+    )
+    .await
+    {
         Ok(_) => {
             let stored: Vec<StoredAgent> = input
                 .agents
@@ -212,31 +221,53 @@ pub async fn register_gateway(
         )
             .into_response();
     }
-    // 注册成功：签发独立运行期凭据（RUNTIME_TOKEN），覆盖引导后的空运行期凭据。
-    // 镜像 wist-gateway renew_agent_credential：新 token + credential_id + 过期，原子替换。
-    let (bundle, credential_hash, credential_expires_at) =
-        match issue_runtime_credential(&state.config, &consumed.gateway_id, &input.instance_id) {
-            Ok(issued) => issued,
-            Err(reason) => {
-                return (StatusCode::INTERNAL_SERVER_ERROR, reason).into_response();
-            }
-        };
+    // 注册成功：用 **CA-G** 按网关 CSR 签一张「每网关一张」客户端证书（长期身份，取代运行期 bearer）。
+    let issued = match state.gateway_ca.issue_client_certificate(
+        &input.certificate_signing_request,
+        &consumed.gateway_id,
+        state.config.credential_ttl_seconds,
+    ) {
+        Ok(issued) => issued,
+        Err(reason) => {
+            rate_limit::record_auth_failure(&state, &client_key, GATEWAY_REGISTER_SCOPE);
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("invalid certificate signing request: {reason}"),
+            )
+                .into_response();
+        }
+    };
+    // 存证书指纹（供吊销/拒绝名单）；过期时间 = 证书 not_after。
     let updated = state
         .store
         .update_gateway_credential(
             &consumed.gateway_id,
-            &credential_hash,
-            credential_expires_at,
+            &issued.fingerprint_sha256_hex,
+            Some(issued.not_after.clone()),
         )
         .await
         .unwrap_or(false);
     if !updated {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to persist gateway runtime credential".to_string(),
+            "failed to persist gateway client certificate".to_string(),
         )
             .into_response();
     }
+    let credential_id = match new_secret_token("cred") {
+        Ok(id) => id,
+        Err(reason) => return (StatusCode::INTERNAL_SERVER_ERROR, reason).into_response(),
+    };
+    let bundle = GatewayCredentialBundle {
+        credential_id,
+        gateway_id: consumed.gateway_id.clone(),
+        instance_id: Some(input.instance_id.clone()),
+        certificate: issued.certificate_pem.clone(),
+        ca_bundle: None,
+        issued_at: issued.not_before.clone(),
+        not_before: Some(issued.not_before.clone()),
+        not_after: Some(issued.not_after.clone()),
+    };
     // 生命周期：Provisioned → Initializing（注册成功即进入初始化）。
     if let Err(err) = state
         .store
@@ -257,18 +288,25 @@ pub async fn register_gateway(
     .into_response()
 }
 
-/// 取升级目标：`GET /api/v1/gateway/upgrade-plan?gateway_id=`（Bearer rt_）。
+/// 取升级目标：`GET /api/v1/gateway/upgrade-plan?gateway_id=`（mTLS 客户端证书鉴权）。
 ///
 /// 解析「覆盖本网关的、最新的已批准升级计划」，给出应升到的目标；无则 `has_plan=false`。见 CR-002 C2。
 pub async fn get_gateway_upgrade_plan(
     State(state): State<ApiState>,
-    headers: HeaderMap,
+    identity: Option<Extension<VerifiedGatewayIdentity>>,
     client: PeerConnectInfo,
     Query(params): Query<InitialConfigQueryParams>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     let gateway_id = params.gateway_id.as_str();
-    if let Err(response) = authenticate_gateway(&state, &headers, gateway_id, &client_key).await {
+    if let Err(response) = authorize_gateway_certificate(
+        &state,
+        identity.as_ref().map(|identity| &identity.0),
+        gateway_id,
+        &client_key,
+    )
+    .await
+    {
         return response;
     }
     match upgrade_plan_for(&state, gateway_id).await {
@@ -318,18 +356,23 @@ async fn upgrade_plan_for(
     })
 }
 
-/// 升级结果回执：`POST /api/v1/gateway/upgrade-result`（Bearer rt_）。见 CR-002 C2。
+/// 升级结果回执：`POST /api/v1/gateway/upgrade-result`（mTLS 客户端证书）。见 CR-002 C2。
 ///
 /// 现在只落结构化事件日志 + 回 ack；持久化视图待补（CR-002 C2 follow-up）。
 pub async fn report_gateway_upgrade_result(
     State(state): State<ApiState>,
-    headers: HeaderMap,
+    identity: Option<Extension<VerifiedGatewayIdentity>>,
     client: PeerConnectInfo,
     Json(input): Json<ReportGatewayUpgradeResult>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
-    if let Err(response) =
-        authenticate_gateway(&state, &headers, &input.gateway_id, &client_key).await
+    if let Err(response) = authorize_gateway_certificate(
+        &state,
+        identity.as_ref().map(|identity| &identity.0),
+        &input.gateway_id,
+        &client_key,
+    )
+    .await
     {
         return response;
     }
@@ -351,31 +394,6 @@ pub async fn report_gateway_upgrade_result(
     .into_response()
 }
 
-/// 签发独立运行期凭据（RUNTIME_TOKEN）：随机 bearer + credential_id + 过期时间。
-/// 返回 (credential bundle, sha256(bearer) 落库用, expires_at rfc3339)。
-fn issue_runtime_credential(
-    config: &crate::config::CenterConfig,
-    gateway_id: &str,
-    instance_id: &str,
-) -> Result<(GatewayCredentialBundle, String, Option<String>), String> {
-    let bearer_token = new_secret_token("rt")?;
-    let credential_id = new_secret_token("cred")?;
-    let issued_at_time = chrono::Utc::now();
-    let issued_at = issued_at_time.to_rfc3339();
-    let expires_at =
-        (issued_at_time + chrono::Duration::seconds(config.credential_ttl_seconds)).to_rfc3339();
-    let bundle = GatewayCredentialBundle {
-        credential_id: credential_id.clone(),
-        gateway_id: gateway_id.to_string(),
-        instance_id: instance_id.to_string(),
-        auth_scheme: "bearer".to_string(),
-        bearer_token: bearer_token.clone(),
-        issued_at: DateTime::from_rfc3339(&issued_at).unwrap_or_else(DateTime::now),
-        expires_at: DateTime::from_rfc3339(&expires_at).unwrap_or_else(DateTime::now),
-    };
-    Ok((bundle, sha256_hex(&bearer_token), Some(expires_at)))
-}
-
 #[derive(serde::Deserialize)]
 pub struct InitialConfigQueryParams {
     pub gateway_id: String,
@@ -391,6 +409,7 @@ pub struct InitialConfigQueryParams {
 pub async fn get_gateway_initial_config(
     State(state): State<ApiState>,
     headers: HeaderMap,
+    identity: Option<Extension<VerifiedGatewayIdentity>>,
     client: PeerConnectInfo,
     Query(params): Query<InitialConfigQueryParams>,
 ) -> Response {
@@ -432,8 +451,15 @@ pub async fn get_gateway_initial_config(
         )
         .await;
     }
-    // 已初始化 → 现有运行期凭据鉴权。
-    match authenticate_gateway(&state, &headers, gateway_id, &client_key).await {
+    // 已初始化 → 以现有 mTLS 客户端证书鉴权。
+    match authorize_gateway_certificate(
+        &state,
+        identity.as_ref().map(|identity| &identity.0),
+        gateway_id,
+        &client_key,
+    )
+    .await
+    {
         Ok(gateway) => {
             let enrollment_token_id = state
                 .store
@@ -570,12 +596,19 @@ fn build_initial_config_json(
 
 pub async fn submit_gateway_status(
     State(state): State<ApiState>,
-    headers: HeaderMap,
+    identity: Option<Extension<VerifiedGatewayIdentity>>,
     client: PeerConnectInfo,
     Json(input): Json<ReportGatewayStatus>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
-    match authenticate_gateway(&state, &headers, &input.gateway_id, &client_key).await {
+    match authorize_gateway_certificate(
+        &state,
+        identity.as_ref().map(|identity| &identity.0),
+        &input.gateway_id,
+        &client_key,
+    )
+    .await
+    {
         Ok(_) => {
             let accepted_at = input.reported_at.clone();
             let update = GatewayStatusUpdate {
@@ -617,79 +650,109 @@ pub async fn submit_gateway_status(
     }
 }
 
-/// 按 binding 的 `actor_identity WarpGateway.id from credential.gateway_id`：
-/// bearer token → 匹配 store 中该 gateway 的凭证 hash（常数时间比较）→
-/// Active 且未过期 → 与上报 gateway_id 一致。
-/// 续期运行期凭据请求体：以当前 RUNTIME_TOKEN 鉴权后签发新凭据。
-#[derive(serde::Deserialize)]
-pub struct RenewGatewayCredentialRequest {
-    pub gateway_id: String,
-    pub instance_id: String,
-}
-
-/// 续期运行期凭据：POST /api/v1/gateway/credentials:renew。
-/// 以当前 RUNTIME_TOKEN 鉴权（authenticate_gateway）→ 签发新 RUNTIME_TOKEN + credential_id
-/// → 原子替换 hash → 旧 token 立即失效。镜像 wist-gateway `renew_agent_credential`。
+/// 轮换网关客户端证书：POST /api/v1/gateway/credentials:renew。
+///
+/// 以**当前客户端证书**（mTLS）证明身份 → 用 CA-G 按新 CSR 签一张新证书 →
+/// 原子替换登记指纹 → 旧证书立即失效。镜像 wist-gateway `renew_agent_credential`（证书轮换）。
 pub async fn renew_gateway_credential(
     State(state): State<ApiState>,
-    headers: HeaderMap,
+    identity: Option<Extension<VerifiedGatewayIdentity>>,
     client: PeerConnectInfo,
-    Json(input): Json<RenewGatewayCredentialRequest>,
+    Json(input): Json<RenewGatewayCredential>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
-    match authenticate_gateway(&state, &headers, &input.gateway_id, &client_key).await {
-        Ok(_) => {
-            let (bundle, credential_hash, credential_expires_at) = match issue_runtime_credential(
-                &state.config,
-                &input.gateway_id,
-                &input.instance_id,
-            ) {
-                Ok(issued) => issued,
-                Err(reason) => {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, reason).into_response();
-                }
-            };
-            let updated = state
-                .store
-                .update_gateway_credential(
-                    &input.gateway_id,
-                    &credential_hash,
-                    credential_expires_at,
-                )
-                .await
-                .unwrap_or(false);
-            if !updated {
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    "invalid gateway credential".to_string(),
-                )
-                    .into_response();
-            }
-            rate_limit::clear_auth_failures(&state, &client_key, GATEWAY_AUTH_SCOPE);
-            (StatusCode::OK, Json(bundle)).into_response()
-        }
-        Err(response) => response,
+    if let Err(response) = authorize_gateway_certificate(
+        &state,
+        identity.as_ref().map(|identity| &identity.0),
+        &input.gateway_id,
+        &client_key,
+    )
+    .await
+    {
+        return response;
     }
+    let issued = match state.gateway_ca.issue_client_certificate(
+        &input.certificate_signing_request,
+        &input.gateway_id,
+        state.config.credential_ttl_seconds,
+    ) {
+        Ok(issued) => issued,
+        Err(reason) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("invalid certificate signing request: {reason}"),
+            )
+                .into_response();
+        }
+    };
+    let updated = state
+        .store
+        .update_gateway_credential(
+            &input.gateway_id,
+            &issued.fingerprint_sha256_hex,
+            Some(issued.not_after.clone()),
+        )
+        .await
+        .unwrap_or(false);
+    if !updated {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to persist renewed gateway client certificate".to_string(),
+        )
+            .into_response();
+    }
+    eprintln!(
+        "event=GatewayCredentialRenewed gateway_id={} old_serial={} new_serial={}",
+        input.gateway_id, input.current_certificate_serial, issued.serial_hex
+    );
+    let credential_id = match new_secret_token("cred") {
+        Ok(id) => id,
+        Err(reason) => return (StatusCode::INTERNAL_SERVER_ERROR, reason).into_response(),
+    };
+    let bundle = GatewayCredentialBundle {
+        credential_id,
+        gateway_id: input.gateway_id,
+        instance_id: None,
+        certificate: issued.certificate_pem.clone(),
+        ca_bundle: None,
+        issued_at: issued.not_before.clone(),
+        not_before: Some(issued.not_before.clone()),
+        not_after: Some(issued.not_after.clone()),
+    };
+    rate_limit::clear_auth_failures(&state, &client_key, GATEWAY_AUTH_SCOPE);
+    (StatusCode::OK, Json(bundle)).into_response()
 }
 
-// 同 require_admin_bearer：`Response` 作为 Err 载荷是刻意设计（调用方 `return Err(response)`）。
+/// 网关面鉴权：**由 mTLS 客户端证书认人**（不再有 bearer）。
+///
+/// 证书在 TLS 握手期已由 CA-G 验链（[`VerifiedGatewayIdentity`] 即其产物）；这里只判：
+/// 证书身份与请求体 `gateway_id` 是否一致、登记是否 Active、指纹是否在册、是否未过期。
+/// 任一不满足即 401，正文带稳定 `code`，供网关侧按码自愈（镜像网关给 agent 的口径）。
 #[allow(clippy::result_large_err)]
-async fn authenticate_gateway(
+async fn authorize_gateway_certificate(
     state: &ApiState,
-    headers: &HeaderMap,
+    identity: Option<&VerifiedGatewayIdentity>,
     gateway_id: &str,
     client_key: &str,
 ) -> Result<StoredGateway, Response> {
     if let Some(response) = rate_limit::check_rate_limit(state, client_key, GATEWAY_AUTH_SCOPE) {
         return Err(response);
     }
-    let Some(token) = bearer_token(headers) else {
-        // 缺 token 属未认证请求，不计入暴力尝试。
-        return Err((StatusCode::UNAUTHORIZED, "missing bearer credential").into_response());
+    let Some(identity) = identity else {
+        // 没带证书属未认证请求，不计入暴力尝试。
+        return Err(unauthorized_code("certificate_required"));
     };
-    let token_hash = sha256_hex(token);
+    // 证书身份是权威：不接受「证书说是 A、请求体说是 B」。
+    if identity.gateway_id != gateway_id {
+        rate_limit::record_auth_failure(state, client_key, GATEWAY_AUTH_SCOPE);
+        return Err(unauthorized_code("certificate_mismatch"));
+    }
     let gateway = match state.store.get_gateway(gateway_id).await {
-        Ok(gateway) => gateway,
+        Ok(Some(gateway)) => gateway,
+        Ok(None) => {
+            rate_limit::record_auth_failure(state, client_key, GATEWAY_AUTH_SCOPE);
+            return Err(unauthorized_code("unknown_gateway"));
+        }
         Err(err) => {
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -698,31 +761,36 @@ async fn authenticate_gateway(
                 .into_response());
         }
     };
-    let Some(gateway) = gateway else {
-        rate_limit::record_auth_failure(state, client_key, GATEWAY_AUTH_SCOPE);
-        return Err((StatusCode::UNAUTHORIZED, "unknown gateway credential").into_response());
-    };
-    // 网关身份由 `actor_identity WarpGateway.id from credential.gateway_id` 表达：
-    // 这里按上报 gateway_id 查到的凭证做常数时间 token 比较，即身份一致性校验。
+    // 登记在册的凭据指纹必须与出示证书一致：轮换 / 吊销后旧证书立即失效。
     if !constant_time_eq(
         gateway.credential_token_hash.as_bytes(),
-        token_hash.as_bytes(),
+        identity.fingerprint_sha256.as_bytes(),
     ) {
         rate_limit::record_auth_failure(state, client_key, GATEWAY_AUTH_SCOPE);
-        return Err((StatusCode::UNAUTHORIZED, "invalid gateway credential").into_response());
+        return Err(unauthorized_code("certificate_not_registered"));
     }
     if gateway.credential_status != StoredGatewayCredentialStatus::Active {
-        return Err((StatusCode::UNAUTHORIZED, "gateway credential is not active").into_response());
+        return Err(unauthorized_code("certificate_not_active"));
     }
     if let Some(expires_at) = &gateway.credential_expires_at
         && credential_is_expired(expires_at)
     {
-        return Err((StatusCode::UNAUTHORIZED, "gateway credential is expired").into_response());
+        return Err(unauthorized_code("certificate_expired"));
     }
     rate_limit::clear_auth_failures(state, client_key, GATEWAY_AUTH_SCOPE);
     Ok(gateway)
 }
 
+/// 401 正文里带一个稳定 `code`，网关侧按它决定要不要自愈。
+fn unauthorized_code(code: &str) -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        format!("gateway identity rejected: {code}"),
+    )
+        .into_response()
+}
+
+/// 一次性 bootstrap 的 Bearer 解析（link-upstream 置备路径仍用引导券，非长期身份）。
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)?
@@ -751,21 +819,28 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     diff == 0
 }
 
-/// 校验网关通讯凭据（VerifyGatewayCredentialFlow）：网关持 bearer 访问，中心比对
-/// 存储的 token hash（authenticate_gateway），通过即返回 valid 结果。
+/// 校验网关通讯凭据（VerifyGatewayCredentialFlow）：以 mTLS 客户端证书鉴权，
+/// 通过即回 valid 结果（`certificate_serial` 取自被验证书）。
 pub async fn verify_gateway_credential(
     State(state): State<ApiState>,
-    headers: HeaderMap,
+    identity: Option<Extension<VerifiedGatewayIdentity>>,
     client: PeerConnectInfo,
     Json(input): Json<VerifyGatewayCredential>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
-    match authenticate_gateway(&state, &headers, &input.gateway_id, &client_key).await {
+    match authorize_gateway_certificate(
+        &state,
+        identity.as_ref().map(|identity| &identity.0),
+        &input.gateway_id,
+        &client_key,
+    )
+    .await
+    {
         Ok(_) => Json(GatewayCredentialVerificationResult {
             gateway_id: input.gateway_id,
-            credential_id: input.credential_id,
+            certificate_serial: input.certificate_serial,
             status: "valid".to_string(),
-            verified_at: DateTime::now(),
+            verified_at: chrono::Utc::now().to_rfc3339(),
         })
         .into_response(),
         Err(response) => response,
@@ -812,13 +887,64 @@ pub async fn query_gateway_initialization_status(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Router, body::Body, http::Request, routing::post};
+    use axum::{Router, body::Body, http::Request};
     use http_body_util::BodyExt;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tower::ServiceExt;
 
     use crate::{api::ApiState, config::GatewayCredentialSeed, infra::FileStore};
+
+    fn test_gateway_ca() -> std::sync::Arc<crate::infra::gateway_ca::GatewayCa> {
+        std::sync::Arc::new(
+            crate::infra::gateway_ca::GatewayCa::generate("Wist Test Gateway CA")
+                .expect("gateway ca")
+                .0,
+        )
+    }
+
+    /// 与 `test_state` 登记在册的凭据指纹一致（模拟「持本网关证书的 mTLS 对端」）。
+    const TEST_FINGERPRINT: &str =
+        "abababababababababababababababababababababababababababababababab";
+    const OTHER_FINGERPRINT: &str =
+        "00000000000000000000000000000000000000000000000000000000000000ff";
+    const TEST_EXPIRES_AT: &str = "2099-01-01T00:00:00+00:00";
+
+    /// 造一张合法 CSR（PEM）：私钥不上送，只交公钥。
+    fn csr() -> String {
+        use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
+        let key = KeyPair::generate().expect("key");
+        let mut params = CertificateParams::default();
+        params.distinguished_name = DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "gateway");
+        params
+            .serialize_request(&key)
+            .expect("csr")
+            .pem()
+            .expect("csr pem")
+    }
+
+    /// 构造 mTLS 握手后注入的网关身份（`fingerprint` 要与登记在册的一致才认）。
+    fn client_identity(gateway_id: &str, fingerprint: &str) -> VerifiedGatewayIdentity {
+        VerifiedGatewayIdentity {
+            gateway_id: gateway_id.to_string(),
+            fingerprint_sha256: fingerprint.to_string(),
+            serial_hex: "01".to_string(),
+            not_before: "2026-01-01T00:00:00+00:00".to_string(),
+            not_after: TEST_EXPIRES_AT.to_string(),
+        }
+    }
+
+    /// 把 mTLS 身份塞进请求扩展（运行期由 TLS 层注入，测试里手动注入）。
+    fn with_identity(
+        mut request: Request<Body>,
+        identity: VerifiedGatewayIdentity,
+    ) -> Request<Body> {
+        request.extensions_mut().insert(identity);
+        request
+    }
 
     fn test_state() -> ApiState {
         let nanos = SystemTime::now()
@@ -834,6 +960,14 @@ mod tests {
                 expires_at: None,
             }])
             .expect("seed");
+        // 登记凭据改为「证书指纹」，与 `client_identity` 对齐（mTLS 口径）。
+        store
+            .update_gateway_credential(
+                "gw-001",
+                TEST_FINGERPRINT,
+                Some(TEST_EXPIRES_AT.to_string()),
+            )
+            .expect("credential");
         ApiState {
             config: crate::config::CenterConfig {
                 listen_addr: "127.0.0.1:3100".to_string(),
@@ -856,6 +990,7 @@ mod tests {
                 std::env::temp_dir().join("wic-artifacts"),
                 "http://127.0.0.1:3100",
             )),
+            gateway_ca: test_gateway_ca(),
             rate_limits: std::sync::Arc::new(std::sync::Mutex::new(
                 super::super::rate_limit::RateLimitState::default(),
             )),
@@ -863,10 +998,7 @@ mod tests {
     }
 
     fn router() -> Router {
-        let state = test_state();
-        Router::new()
-            .route("/api/v1/gateway/status", post(submit_gateway_status))
-            .with_state(state)
+        super::super::router_for(test_state())
     }
 
     /// 构造带 seed 网关 + 注册 Token 的完整路由（register 端点走 router_for）。
@@ -916,6 +1048,7 @@ mod tests {
                 std::env::temp_dir().join("wic-artifacts"),
                 "http://127.0.0.1:3100",
             )),
+            gateway_ca: test_gateway_ca(),
             rate_limits: std::sync::Arc::new(std::sync::Mutex::new(
                 super::super::rate_limit::RateLimitState::default(),
             )),
@@ -958,6 +1091,7 @@ mod tests {
                 std::env::temp_dir().join("wic-artifacts"),
                 "http://127.0.0.1:3100",
             )),
+            gateway_ca: test_gateway_ca(),
             rate_limits: std::sync::Arc::new(std::sync::Mutex::new(
                 super::super::rate_limit::RateLimitState::default(),
             )),
@@ -971,17 +1105,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepts_status_report_with_valid_credential() {
+    async fn accepts_status_report_with_valid_client_certificate() {
         let response = router()
-            .oneshot(
+            .oneshot(with_identity(
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/gateway/status")
                     .header("content-type", "application/json")
-                    .header("authorization", "Bearer secret-token-1")
                     .body(Body::from(status_payload("gw-001")))
                     .expect("request"),
-            )
+                client_identity("gw-001", TEST_FINGERPRINT),
+            ))
             .await
             .expect("response");
 
@@ -998,14 +1132,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_report_with_invalid_credential() {
+    async fn rejects_report_without_client_certificate() {
         let response = router()
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/gateway/status")
                     .header("content-type", "application/json")
-                    .header("authorization", "Bearer wrong-token")
                     .body(Body::from(status_payload("gw-001")))
                     .expect("request"),
             )
@@ -1016,17 +1149,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_report_with_unknown_gateway() {
+    async fn rejects_report_with_unregistered_certificate() {
+        // 身份是 gw-001，但出示证书的指纹不在册（未注册 / 已轮换作废）→ 401。
         let response = router()
-            .oneshot(
+            .oneshot(with_identity(
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/gateway/status")
                     .header("content-type", "application/json")
-                    .header("authorization", "Bearer secret-token-1")
+                    .body(Body::from(status_payload("gw-001")))
+                    .expect("request"),
+                client_identity("gw-001", OTHER_FINGERPRINT),
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn rejects_report_with_unknown_gateway() {
+        let response = router()
+            .oneshot(with_identity(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/gateway/status")
+                    .header("content-type", "application/json")
                     .body(Body::from(status_payload("gw-999")))
                     .expect("request"),
-            )
+                client_identity("gw-999", TEST_FINGERPRINT),
+            ))
             .await
             .expect("response");
 
@@ -1035,15 +1187,18 @@ mod tests {
 
     fn register_payload(token: &str) -> String {
         format!(
-            r#"{{"enrollment_token":"{token}","instance_id":"inst-1","requested_at":"2026-08-11T00:00:00Z"}}"#
+            r#"{{"enrollment_token":"{token}","instance_id":"inst-1","certificate_signing_request":{},"requested_at":"2026-08-11T00:00:00Z"}}"#,
+            serde_json::to_string(&csr()).expect("csr json")
         )
     }
 
     #[tokio::test]
     async fn register_consumes_token_once_then_rejects_replay() {
-        let app = super::super::router_for(register_state("enroll-tok-a"));
+        let state = register_state("enroll-tok-a");
+        let store = state.store.clone();
+        let app = super::super::router_for(state);
 
-        // 首次注册 → 200 accepted + 注册回执。
+        // 首次注册 → 200 accepted + 注册回执（含客户端证书）。
         let response = app
             .clone()
             .oneshot(
@@ -1068,17 +1223,17 @@ mod tests {
         assert_eq!(returned.status, "accepted");
         assert_eq!(returned.gateway_id, "gw-001");
         assert_eq!(returned.instance_id, "inst-1");
-        // 注册后签发独立运行期凭据（RUNTIME_TOKEN）：随机 bearer + 过期时间。
+        // 注册后签发**客户端证书**（mTLS 长期身份）：不再有 bearer。
         let bundle = &returned.credential_bundle;
         assert!(
-            bundle.bearer_token.starts_with("rt_"),
-            "runtime token: {}",
-            bundle.bearer_token
+            bundle.certificate.contains("BEGIN CERTIFICATE"),
+            "certificate: {}",
+            bundle.certificate
         );
-        assert_eq!(bundle.auth_scheme, "bearer");
+        assert!(bundle.ca_bundle.is_none());
         assert_eq!(bundle.gateway_id, "gw-001");
-        assert_eq!(bundle.instance_id, "inst-1");
-        assert!(bundle.expires_at > bundle.issued_at);
+        assert_eq!(bundle.instance_id.as_deref(), Some("inst-1"));
+        assert!(bundle.not_after.is_some());
 
         // 防重放：同一 token 二次注册 → 401（Exhausted）。
         let response = app
@@ -1095,52 +1250,45 @@ mod tests {
             .expect("response");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
-        // 运行期分离核心断言：注册后只有新签发的 RUNTIME_TOKEN 有效。
-        let runtime_token = bundle.bearer_token.clone();
-        // RegistToken（enroll-tok-a）作 Bearer 调 status → 401（已消费，且非运行期凭据）。
+        // 注册把登记凭据换成了**签出证书的指纹**：以它为 mTLS 身份调 status → 200。
+        let registered = store
+            .get_gateway("gw-001")
+            .await
+            .expect("get")
+            .expect("registered");
+        let issued_fingerprint = registered.credential_token_hash.clone();
+        assert_eq!(issued_fingerprint.len(), 64, "{issued_fingerprint}");
         let response = app
             .clone()
-            .oneshot(
+            .oneshot(with_identity(
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/gateway/status")
                     .header("content-type", "application/json")
-                    .header("authorization", "Bearer enroll-tok-a")
                     .body(Body::from(status_payload("gw-001")))
                     .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        // 种子运行期凭据（cred-tok）被新凭据替换 → 401。
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/gateway/status")
-                    .header("content-type", "application/json")
-                    .header("authorization", "Bearer cred-tok")
-                    .body(Body::from(status_payload("gw-001")))
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        // 新签发的 RUNTIME_TOKEN → 200。
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/gateway/status")
-                    .header("content-type", "application/json")
-                    .header("authorization", format!("Bearer {runtime_token}"))
-                    .body(Body::from(status_payload("gw-001")))
-                    .expect("request"),
-            )
+                client_identity("gw-001", &issued_fingerprint),
+            ))
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+
+        // 旧登记凭据（seed 的 cred-tok hash）不再是有效证书身份 → 401。
+        let stale_fingerprint = sha256_hex("cred-tok");
+        assert_ne!(stale_fingerprint, issued_fingerprint);
+        let response = app
+            .oneshot(with_identity(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/gateway/status")
+                    .header("content-type", "application/json")
+                    .body(Body::from(status_payload("gw-001")))
+                    .expect("request"),
+                client_identity("gw-001", &stale_fingerprint),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -1230,25 +1378,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn renew_gateway_credential_rotates_and_invalidates_old() {
-        use axum::{body::Body, http::Request};
-        use http_body_util::BodyExt;
-        use tower::ServiceExt;
-        // 以 seed 运行期凭据作为当前凭据（authenticate_gateway 可过），renew 轮换。
-        let app = super::super::router_for(register_state("enroll-r"));
+    async fn renew_gateway_credential_rotates_the_client_certificate() {
+        let state = register_state("enroll-r");
+        let store = state.store.clone();
+        let app = super::super::router_for(state);
+
+        // 先注册，拿到第一张客户端证书（登记指纹落库）。
         let response = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/v1/gateway/credentials:renew")
+                    .uri("/api/v1/gateway/register")
                     .header("content-type", "application/json")
-                    .header("authorization", "Bearer cred-tok")
-                    .body(Body::from(
-                        r#"{"gateway_id":"gw-001","instance_id":"inst-1"}"#,
-                    ))
+                    .body(Body::from(register_payload("enroll-r")))
                     .expect("request"),
             )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let old_fingerprint = store
+            .get_gateway("gw-001")
+            .await
+            .expect("get")
+            .expect("registered")
+            .credential_token_hash;
+        assert_eq!(old_fingerprint.len(), 64);
+
+        // 轮换：以当前证书（mTLS 身份）+ 新 CSR → 200 新证书。
+        let renew_body = format!(
+            r#"{{"gateway_id":"gw-001","current_certificate_serial":"deadbeef","certificate_signing_request":{},"requested_at":"2026-08-11T00:00:00Z"}}"#,
+            serde_json::to_string(&csr()).expect("csr json")
+        );
+        let response = app
+            .clone()
+            .oneshot(with_identity(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/gateway/credentials:renew")
+                    .header("content-type", "application/json")
+                    .body(Body::from(renew_body))
+                    .expect("request"),
+                client_identity("gw-001", &old_fingerprint),
+            ))
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
@@ -1259,34 +1431,50 @@ mod tests {
             .expect("body")
             .to_bytes();
         let renewed: GatewayCredentialBundle = serde_json::from_slice(&body).expect("json");
-        assert!(renewed.bearer_token.starts_with("rt_"));
-        assert_ne!(renewed.bearer_token, "cred-tok");
+        assert!(
+            renewed.certificate.contains("BEGIN CERTIFICATE"),
+            "certificate: {}",
+            renewed.certificate
+        );
+        assert_eq!(renewed.gateway_id, "gw-001");
+        // 轮换请求体不带 instance_id（模型同口径），故回执里留空。
+        assert!(renewed.instance_id.is_none());
+        assert!(renewed.not_after.is_some());
 
-        // 旧凭据立即失效 → 401；新凭据 → 200。
+        // 旧证书指纹立即失效 → 401；新登记指纹 → 200。
+        let new_fingerprint = store
+            .get_gateway("gw-001")
+            .await
+            .expect("get")
+            .expect("registered")
+            .credential_token_hash;
+        assert_ne!(new_fingerprint, old_fingerprint);
+
         let response = app
             .clone()
-            .oneshot(
+            .oneshot(with_identity(
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/gateway/status")
                     .header("content-type", "application/json")
-                    .header("authorization", "Bearer cred-tok")
                     .body(Body::from(status_payload("gw-001")))
                     .expect("request"),
-            )
+                client_identity("gw-001", &old_fingerprint),
+            ))
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
         let response = app
-            .oneshot(
+            .oneshot(with_identity(
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/gateway/status")
                     .header("content-type", "application/json")
-                    .header("authorization", format!("Bearer {}", renewed.bearer_token))
                     .body(Body::from(status_payload("gw-001")))
                     .expect("request"),
-            )
+                client_identity("gw-001", &new_fingerprint),
+            ))
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
@@ -1395,6 +1583,7 @@ mod tests {
                 std::env::temp_dir().join("wic-artifacts"),
                 "http://127.0.0.1:3100",
             )),
+            gateway_ca: test_gateway_ca(),
             rate_limits: std::sync::Arc::new(std::sync::Mutex::new(
                 super::super::rate_limit::RateLimitState::default(),
             )),

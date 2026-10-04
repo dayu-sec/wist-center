@@ -343,6 +343,28 @@ fn default_ca_cert_path() -> PathBuf {
         .join("control-center.pem")
 }
 
+/// 网关客户端证书 CA（**CA-G**）私钥/证书路径。
+///
+/// 默认 `~/.wist-center/ca/gateway-client-ca.{pem,key.pem}`；可用
+/// `WARP_INSIGHT_CENTER_GATEWAY_CLIENT_CA_CERT_PATH` / `..._KEY_PATH` 覆盖。
+/// 与服务器证书的 CA（control-center.pem）**单开**。
+pub fn resolved_gateway_client_ca_paths() -> (PathBuf, PathBuf) {
+    let dir = PathBuf::from(env::var("HOME").unwrap_or_default())
+        .join(".wist-center")
+        .join("ca");
+    let cert = env::var("WARP_INSIGHT_CENTER_GATEWAY_CLIENT_CA_CERT_PATH")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dir.join("gateway-client-ca.pem"));
+    let key = env::var("WARP_INSIGHT_CENTER_GATEWAY_CLIENT_CA_KEY_PATH")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dir.join("gateway-client-ca.key.pem"));
+    (cert, key)
+}
+
 /// 展开文件里所有 `${VAR}`。
 fn expand_raw_env(raw: &mut RawCenterConfig) -> Result<(), ConfigError> {
     for value in [

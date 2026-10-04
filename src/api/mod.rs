@@ -51,6 +51,8 @@ pub struct ApiState {
     pub store: Arc<dyn Store>,
     pub artifact_store: Arc<dyn ArtifactStore>,
     pub rate_limits: Arc<Mutex<rate_limit::RateLimitState>>,
+    /// 网关客户端证书 CA（CA-G）：`register` 据此按 CSR 签每网关一张客户端证书。
+    pub gateway_ca: Arc<crate::infra::gateway_ca::GatewayCa>,
 }
 
 /// 控制中心是否要求 TLS：按 `public_url` scheme 推导（https → true，http → false）。
@@ -104,13 +106,18 @@ async fn gateway_initial_config_cors(request: Request, next: Next) -> Response {
     response
 }
 
-pub fn router(config: CenterConfig, store: Arc<dyn Store>) -> Router {
+pub fn router(
+    config: CenterConfig,
+    store: Arc<dyn Store>,
+    gateway_ca: Arc<crate::infra::gateway_ca::GatewayCa>,
+) -> Router {
     let artifact_store = crate::infra::build_artifact_store(&config);
     router_for(ApiState {
         config,
         store,
         artifact_store,
         rate_limits: Arc::new(Mutex::new(rate_limit::RateLimitState::default())),
+        gateway_ca,
     })
 }
 

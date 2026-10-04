@@ -17,6 +17,7 @@ use rcgen::{
 use ring::digest::{SHA256, digest};
 use ring::rand::{SecureRandom, SystemRandom};
 use time::{Duration, OffsetDateTime};
+use x509_parser::prelude::{FromDer, GeneralName, X509Certificate};
 
 /// `notBefore` 回拨（容忍两端时钟偏差）。
 pub const CLIENT_CERT_NOT_BEFORE_SKEW_SECONDS: i64 = 300;
@@ -34,6 +35,66 @@ pub fn gateway_id_from_uri(uri: &str) -> Option<String> {
     uri.strip_prefix(GATEWAY_URI_PREFIX)
         .filter(|id| !id.is_empty())
         .map(str::to_string)
+}
+
+/// 由 mTLS 握手带进来、并**已由 CA-G 验链通过**的网关身份。
+///
+/// 与 [`GatewayCa`] 签出的证书同口径：`gateway_id` 直接取自 URI SAN，指纹/序列号/有效期
+/// 供「证书与登记是否一致」的判定、吊销与审计使用（见 `api::gateway_ops`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedGatewayIdentity {
+    pub gateway_id: String,
+    /// 证书 DER 的 SHA-256（小写 hex）。
+    pub fingerprint_sha256: String,
+    /// 证书序列号（小写 hex，无分隔符）。
+    pub serial_hex: String,
+    /// 证书生效时刻（RFC3339）。
+    pub not_before: String,
+    /// 证书到期时刻（RFC3339）。
+    pub not_after: String,
+}
+
+impl VerifiedGatewayIdentity {
+    /// 从**已验证**的客户端叶证书 DER 解出身份与有效期。
+    ///
+    /// 证书来自 rustls 的 `WebPkiClientVerifier`：链路、有效期与 `EKU=clientAuth` 已经过关，
+    /// 这里只解主体（URI SAN → `gateway_id`）。
+    pub fn from_certificate_der(certificate_der: &[u8]) -> Result<Self, String> {
+        let (_, certificate) = X509Certificate::from_der(certificate_der)
+            .map_err(|err| format!("failed to parse client certificate: {err}"))?;
+        let gateway_id = gateway_id_from_certificate(&certificate)?;
+        let validity = certificate.validity();
+        Ok(Self {
+            gateway_id,
+            fingerprint_sha256: hex_lower(digest(&SHA256, certificate_der).as_ref()),
+            serial_hex: hex_lower(certificate.raw_serial()),
+            not_before: rfc3339_from_unix(validity.not_before.timestamp()),
+            not_after: rfc3339_from_unix(validity.not_after.timestamp()),
+        })
+    }
+}
+
+/// 从已解析证书的 URI SAN 还原 `gateway_id`（没有网关 URI SAN 即报错）。
+fn gateway_id_from_certificate(certificate: &X509Certificate<'_>) -> Result<String, String> {
+    let san = certificate
+        .subject_alternative_name()
+        .map_err(|err| format!("failed to read client certificate SAN: {err}"))?
+        .ok_or_else(|| "client certificate has no subject alternative name".to_string())?;
+    for name in &san.value.general_names {
+        if let GeneralName::URI(uri) = name
+            && let Some(gateway_id) = gateway_id_from_uri(uri)
+        {
+            return Ok(gateway_id);
+        }
+    }
+    Err("client certificate has no gateway URI SAN".to_string())
+}
+
+/// x509 的 `ASN1Time` 只给 unix 秒，这里统一走 chrono 输出 RFC3339。
+fn rfc3339_from_unix(seconds: i64) -> String {
+    chrono::DateTime::from_timestamp(seconds, 0)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_else(|| seconds.to_string())
 }
 
 /// 签出的网关客户端证书。
@@ -156,11 +217,10 @@ impl GatewayCa {
 
         let mut params = CertificateParams::default();
         params.distinguished_name = distinguished_name;
-        params.subject_alt_names = vec![SanType::URI(
-            uri.clone()
-                .try_into()
-                .map_err(|_| format!("gateway URI is not a valid IA5 string: {uri}"))?,
-        )];
+        params.subject_alt_names =
+            vec![SanType::URI(uri.clone().try_into().map_err(|_| {
+                format!("gateway URI is not a valid IA5 string: {uri}")
+            })?)];
         params.is_ca = IsCa::ExplicitNoCa;
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
@@ -174,18 +234,16 @@ impl GatewayCa {
             .signed_by(&csr.public_key, &self.issuer, &self.issuer_key)
             .map_err(|err| format!("failed to sign gateway client certificate: {err}"))?;
         let certificate_der = certificate.der().to_vec();
-        let serial_bytes = certificate
-            .params()
-            .serial_number
-            .as_ref()
-            .map(SerialNumber::to_bytes)
-            .unwrap_or_default();
+        // 序列号以**签出证书的 DER**为准（x509-parser 读回），保证与对端出示证书时的口径一致。
+        let (_, parsed) = X509Certificate::from_der(&certificate_der)
+            .map_err(|err| format!("failed to re-parse signed gateway certificate: {err}"))?;
+        let serial_hex = hex_lower(parsed.raw_serial());
 
         Ok(IssuedGatewayCertificate {
             certificate_pem: certificate.pem(),
             fingerprint_sha256_hex: hex_lower(digest(&SHA256, &certificate_der).as_ref()),
             certificate_der,
-            serial_hex: hex_lower(&serial_bytes),
+            serial_hex,
             not_before: to_rfc3339(params_not_before(certificate.params())),
             not_after: to_rfc3339(params_not_after(certificate.params())),
             gateway_uri: uri,
@@ -193,11 +251,44 @@ impl GatewayCa {
     }
 }
 
+/// 从文件载入 CA-G；缺失则**生成一把新的自签 CA-G 并落盘**（证书 0644 / 私钥 0600）。
+pub fn load_or_create(cert_path: &Path, key_path: &Path) -> Result<GatewayCa, String> {
+    if cert_path.exists() && key_path.exists() {
+        return GatewayCa::load(cert_path, key_path);
+    }
+    let (ca, cert_pem, key_pem) = GatewayCa::generate("Wist Gateway Client CA")?;
+    write_pem(cert_path, &cert_pem, 0o644)?;
+    write_pem(key_path, &key_pem, 0o600)?;
+    Ok(ca)
+}
+
+fn write_pem(path: &Path, content: &str, mode: u32) -> Result<(), String> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, content)
+        .map_err(|err| format!("failed to write {}: {err}", tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))
+            .map_err(|err| format!("failed to chmod {}: {err}", tmp.display()))?;
+    }
+    std::fs::rename(&tmp, path)
+        .map_err(|err| format!("failed to persist {}: {err}", path.display()))
+}
+
 fn random_serial_bytes() -> Result<[u8; 16], String> {
     let mut bytes = [0_u8; 16];
     SystemRandom::new()
         .fill(&mut bytes)
         .map_err(|_| "failed to read system random source".to_string())?;
+    // DER 的 INTEGER 不允许前导 0（否则会被当成非最小编码）；首位清零仍留 127 位熵。
+    bytes[0] &= 0x7f;
     Ok(bytes)
 }
 
@@ -278,7 +369,10 @@ mod tests {
             })
             .expect("uri san");
         assert_eq!(gateway_id_from_uri(uri).as_deref(), Some("gw-1"));
-        assert_eq!(common_name(&issued.certificate_der).as_deref(), Some("gw-1"));
+        assert_eq!(
+            common_name(&issued.certificate_der).as_deref(),
+            Some("gw-1")
+        );
     }
 
     #[test]
@@ -286,7 +380,10 @@ mod tests {
         let (ca, _pem, _key) = GatewayCa::generate("Wist Gateway Client CA").expect("ca");
         assert!(ca.issue_client_certificate(&csr(), "", 3600).is_err());
         assert!(ca.issue_client_certificate(&csr(), "gw-1", 0).is_err());
-        assert!(ca.issue_client_certificate("not a csr", "gw-1", 3600).is_err());
+        assert!(
+            ca.issue_client_certificate("not a csr", "gw-1", 3600)
+                .is_err()
+        );
     }
 
     #[test]
@@ -295,7 +392,31 @@ mod tests {
         let issued = ca
             .issue_client_certificate(&csr(), "gw-2", 3600)
             .expect("issue");
-        assert_eq!(common_name(&issued.certificate_der).as_deref(), Some("gw-2"));
+        assert_eq!(
+            common_name(&issued.certificate_der).as_deref(),
+            Some("gw-2")
+        );
+    }
+
+    /// 对端出示签出证书时，能从 DER 还原出与签发同口径的身份（指纹 / 序列号 / gateway_id）。
+    #[test]
+    fn verified_identity_matches_the_issued_certificate() {
+        let (ca, _pem, _key) = GatewayCa::generate("Wist Gateway Client CA").expect("ca");
+        let issued = ca
+            .issue_client_certificate(&csr(), "gw-7", 3600)
+            .expect("issue");
+        let identity = VerifiedGatewayIdentity::from_certificate_der(&issued.certificate_der)
+            .expect("identity");
+        assert_eq!(identity.gateway_id, "gw-7");
+        assert_eq!(identity.fingerprint_sha256, issued.fingerprint_sha256_hex);
+        assert_eq!(identity.serial_hex, issued.serial_hex);
+        assert!(!identity.serial_hex.is_empty());
+        assert!(identity.not_before <= identity.not_after);
+    }
+
+    #[test]
+    fn verified_identity_rejects_a_certificate_without_a_gateway_uri() {
+        assert!(VerifiedGatewayIdentity::from_certificate_der(&[0x00, 0x01]).is_err());
     }
 
     #[test]

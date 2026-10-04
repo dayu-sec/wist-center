@@ -3537,8 +3537,6 @@ dependencies = [
 [[package]]
 name = "wist-contracts"
 version = "0.1.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5df586062be54cfbb91ef50914bb16636129a0b111507718e23e98b7c78d392b"
 dependencies = [
  "jumo-derive",
  "serde",

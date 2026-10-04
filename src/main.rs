@@ -28,7 +28,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .await
         .map_err(|err| err.into_boxed_std())?;
     let addr = config.listen_addr.clone();
-    let app = wist_center::api::router(config, store);
+    let (gateway_ca_cert_path, gateway_ca_key_path) =
+        wist_center::config::resolved_gateway_client_ca_paths();
+    let gateway_ca = Arc::new(
+        wist_center::infra::gateway_ca::load_or_create(&gateway_ca_cert_path, &gateway_ca_key_path)
+            .map_err(|err| -> Box<dyn Error + Send + Sync> { err.into() })?,
+    );
+    let app = wist_center::api::router(config, store, gateway_ca);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     println!("wist-center config: {}", config_path.display());
     println!("wist-center listening on http://{addr}");
