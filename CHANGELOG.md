@@ -5,7 +5,7 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
-## [Unreleased]
+## [0.5.0-alpha] - 2026-10-05
 
 ### Changed（不兼容）
 - **接入券改名（bootstrap → link）**：网关一次性「置备引导券」统一更名为**接入券**（link token）。
@@ -27,6 +27,15 @@
 - **接入券短 TTL（可配）**：接入券带到期时刻，**默认 15 分钟**，过期即不可用
   （`consume_link_token` 拒绝）；「生成/轮换」响应新增 `link_expires_at`。
   - 配置项 `security.link_ttl_seconds` / env `WARP_INSIGHT_CENTER_LINK_TTL_SECONDS`（须为正整数）。
+- **网关状态富化**：中心视图（`gateway_runtime_status` / `GatewayStatusView`）新增
+  `uptime_seconds` / 机队（`agent_count` / `online_agents` / `offline_agents` / `last_seen_lag_seconds`）/ 存储（`store_bytes`）/
+  数据面（`ingest_accepted_total` / `ingest_rejected_total` / `last_ingest_at`）/ 主机（`memory_total_bytes` / `load_1m|5m|15m` /
+  `disk_usage_percent` / `disk_total_bytes` / `disk_available_bytes`）（对齐 `wist-control` 0.6.1；老网关缺键 → `null`）。
+- **富化指标进 VictoriaMetrics 时序**：上报时同步推送 `gateway_uptime_seconds` / `gateway_agent_count` /
+  `gateway_online_agents` / `gateway_offline_agents` / `gateway_last_seen_lag_seconds` / `gateway_store_bytes` /
+  `gateway_ingest_accepted_total` / `gateway_ingest_rejected_total` / `gateway_last_ingest_timestamp_seconds` /
+  `gateway_memory_total_bytes` / `gateway_load1|load5|load15` / `gateway_disk_usage_percent` / `gateway_disk_total_bytes` /
+  `gateway_disk_available_bytes`（除 up/info/health 外**有值才推**）；历史查询与中心 Web 趋势图同步扩展。
 
 ### 数据库
 - `gateways` 表新增 `link_token_expires_at`（含 `wist-center-stack` 同源 schema 副本需同步）。

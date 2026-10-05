@@ -624,6 +624,22 @@ pub async fn submit_gateway_status(
                 memory_bytes: input.memory_bytes,
                 cpu_percent: input.cpu_percent,
                 last_seen_at: accepted_at.clone(),
+                uptime_seconds: input.uptime_seconds,
+                agent_count: input.agent_count,
+                online_agents: input.online_agents,
+                offline_agents: input.offline_agents,
+                last_seen_lag_seconds: input.last_seen_lag_seconds,
+                store_bytes: input.store_bytes,
+                ingest_accepted_total: input.ingest_accepted_total,
+                ingest_rejected_total: input.ingest_rejected_total,
+                last_ingest_at: input.last_ingest_at,
+                memory_total_bytes: input.memory_total_bytes,
+                load_1m: input.load_1m,
+                load_5m: input.load_5m,
+                load_15m: input.load_15m,
+                disk_usage_percent: input.disk_usage_percent,
+                disk_total_bytes: input.disk_total_bytes,
+                disk_available_bytes: input.disk_available_bytes,
             };
             let update_result = state.store.upsert_gateway_status(&update).await;
             if let Err(err) = update_result {

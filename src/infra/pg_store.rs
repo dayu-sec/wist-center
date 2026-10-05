@@ -48,6 +48,22 @@ struct GatewayRow {
     health: Option<String>,
     memory_bytes: Option<i64>,
     cpu_percent: Option<f64>,
+    uptime_seconds: Option<i64>,
+    agent_count: Option<i64>,
+    online_agents: Option<i64>,
+    offline_agents: Option<i64>,
+    last_seen_lag_seconds: Option<i64>,
+    store_bytes: Option<i64>,
+    ingest_accepted_total: Option<i64>,
+    ingest_rejected_total: Option<i64>,
+    last_ingest_at: Option<chrono::DateTime<chrono::Utc>>,
+    memory_total_bytes: Option<i64>,
+    load_1m: Option<f64>,
+    load_5m: Option<f64>,
+    load_15m: Option<f64>,
+    disk_usage_percent: Option<f64>,
+    disk_total_bytes: Option<i64>,
+    disk_available_bytes: Option<i64>,
     lifecycle_state: Option<String>,
     initialized_at: Option<chrono::DateTime<chrono::Utc>>,
     created_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -107,6 +123,24 @@ impl GatewayRow {
             health: self.health,
             memory_bytes: self.memory_bytes,
             cpu_percent: self.cpu_percent,
+            uptime_seconds: self.uptime_seconds,
+            agent_count: self.agent_count,
+            online_agents: self.online_agents,
+            offline_agents: self.offline_agents,
+            last_seen_lag_seconds: self.last_seen_lag_seconds,
+            store_bytes: self.store_bytes,
+            ingest_accepted_total: self.ingest_accepted_total,
+            ingest_rejected_total: self.ingest_rejected_total,
+            last_ingest_at: self.last_ingest_at.map(|value| {
+                DateTime::from_rfc3339(&value.to_rfc3339()).unwrap_or_else(DateTime::now)
+            }),
+            memory_total_bytes: self.memory_total_bytes,
+            load_1m: self.load_1m,
+            load_5m: self.load_5m,
+            load_15m: self.load_15m,
+            disk_usage_percent: self.disk_usage_percent,
+            disk_total_bytes: self.disk_total_bytes,
+            disk_available_bytes: self.disk_available_bytes,
             lifecycle_state: self.lifecycle_state.as_deref().map(parse_lifecycle),
             initialized_at: self.initialized_at.map(|value| {
                 DateTime::from_rfc3339(&value.to_rfc3339()).unwrap_or_else(DateTime::now)
@@ -200,6 +234,10 @@ fn parse_optional_timestamptz(value: &Option<String>) -> Option<chrono::DateTime
 const GATEWAY_COLUMNS: &str = "gateway_id, instance_id, credential_token_hash, \
                                credential_status, credential_expires_at, link_token_hash, \
                                link_token_expires_at, version, status, health, memory_bytes, cpu_percent, \
+                               uptime_seconds, agent_count, online_agents, offline_agents, last_seen_lag_seconds, \
+                               store_bytes, ingest_accepted_total, ingest_rejected_total, last_ingest_at, \
+                               memory_total_bytes, load_1m, load_5m, load_15m, \
+                               disk_usage_percent, disk_total_bytes, disk_available_bytes, \
                                lifecycle_state, initialized_at, created_at, last_seen_at";
 
 #[async_trait::async_trait]
@@ -259,9 +297,15 @@ impl Store for PgStore {
             "UPDATE gateways \
              SET instance_id = $2, version = $3, status = $4, health = $5, \
                  memory_bytes = $6, cpu_percent = $7, \
+                 uptime_seconds = $8, agent_count = $9, online_agents = $10, \
+                 offline_agents = $11, last_seen_lag_seconds = $12, \
+                 store_bytes = $13, ingest_accepted_total = $14, ingest_rejected_total = $15, \
+                 last_ingest_at = $16, memory_total_bytes = $17, \
+                 load_1m = $18, load_5m = $19, load_15m = $20, \
+                 disk_usage_percent = $21, disk_total_bytes = $22, disk_available_bytes = $23, \
                  lifecycle_state = 'Running', \
                  initialized_at = COALESCE(initialized_at, NOW()), \
-                 last_seen_at = $8 \
+                 last_seen_at = $24 \
              WHERE gateway_id = $1",
         )
         .bind(&update.gateway_id)
@@ -271,6 +315,27 @@ impl Store for PgStore {
         .bind(&update.health)
         .bind(update.memory_bytes)
         .bind(update.cpu_percent)
+        .bind(update.uptime_seconds)
+        .bind(update.agent_count)
+        .bind(update.online_agents)
+        .bind(update.offline_agents)
+        .bind(update.last_seen_lag_seconds)
+        .bind(update.store_bytes)
+        .bind(update.ingest_accepted_total)
+        .bind(update.ingest_rejected_total)
+        .bind(
+            update
+                .last_ingest_at
+                .as_ref()
+                .map(|value| value.to_chrono()),
+        )
+        .bind(update.memory_total_bytes)
+        .bind(update.load_1m)
+        .bind(update.load_5m)
+        .bind(update.load_15m)
+        .bind(update.disk_usage_percent)
+        .bind(update.disk_total_bytes)
+        .bind(update.disk_available_bytes)
         .bind(last_seen_at)
         .execute(&self.pool)
         .await
@@ -896,6 +961,22 @@ mod tests {
                 memory_bytes: Some(1_073_741_824),
                 cpu_percent: Some(18.2),
                 last_seen_at: reported_at.clone(),
+                uptime_seconds: None,
+                agent_count: None,
+                online_agents: None,
+                offline_agents: None,
+                last_seen_lag_seconds: None,
+                store_bytes: None,
+                ingest_accepted_total: None,
+                ingest_rejected_total: None,
+                last_ingest_at: None,
+                memory_total_bytes: None,
+                load_1m: None,
+                load_5m: None,
+                load_15m: None,
+                disk_usage_percent: None,
+                disk_total_bytes: None,
+                disk_available_bytes: None,
             })
             .await
             .expect("upsert status");

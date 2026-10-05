@@ -911,9 +911,12 @@ pub async fn admin_view_gateway_list(
     let (online_count, offline_count, degraded_count) = gateways.iter().fold(
         (0_i64, 0_i64, 0_i64),
         |(online, offline, degraded), stored| {
-            let online = online + i64::from(stored.status.as_deref() == Some("online"));
+            // 在线 = **新鲜**（`last_seen_at` 在窗口内）**且** 上报状态为 online。
+            // 只看状态字符串会让掉线的网关永远「在线」（gwlinkd 只在活着时上报、从不发 offline）。
+            let is_online = gateway_is_online(stored);
+            let online = online + i64::from(is_online);
             // 离线 = 不在线（含已上报离线与从未上报的已接入网关），保证 online + offline = gateway_count。
-            let offline = offline + i64::from(stored.status.as_deref() != Some("online"));
+            let offline = offline + i64::from(!is_online);
             let degraded = degraded + i64::from(stored.health.as_deref() == Some("degraded"));
             (online, offline, degraded)
         },
@@ -1000,17 +1003,42 @@ pub async fn admin_show_gateway_status(
     .into_response()
 }
 
+/// 在线判定窗口（秒）：= 3×gwlinkd 上报节奏（30s），与网关侧 linkd-status 的失联阈值**同口径**。
+pub const GATEWAY_ONLINE_WINDOW_SECONDS: i64 = 90;
+
+/// 网关是否在线：上报状态为 `online` **且** 最近上报在窗口内。
+///
+/// 为什么需要「新鲜度」：gwlinkd 只在**活着时**上报（每 30s）、**从不发 `offline`**；只看存的
+/// `status` 字符串的话，它一死（崩溃 / 停服）中心就永远显示「在线」—— 与网关侧（linkd-status
+/// 90s 失联判定）口径不一致。这里按 `last_seen_at` 补上陈旧度。
+fn gateway_is_online(stored: &StoredGateway) -> bool {
+    if stored.status.as_deref() != Some("online") {
+        return false;
+    }
+    let Some(last_seen) = stored.last_seen_at.as_ref() else {
+        return false;
+    };
+    let age_seconds = DateTime::now()
+        .to_chrono()
+        .signed_duration_since(last_seen.to_chrono())
+        .num_seconds();
+    (0..=GATEWAY_ONLINE_WINDOW_SECONDS).contains(&age_seconds)
+}
+
 /// StoredGateway → GatewayRuntimeStatus。仅对已上报网关调用（列表/单查已过滤）；
 /// Option 缺省值保留为防御性兜底。
 fn gateway_runtime_status(stored: &StoredGateway) -> GatewayRuntimeStatus {
+    // 视图里的 `status` 交出**归一的在线/离线**（按新鲜度派生），徽标与计数才会一致。
     GatewayRuntimeStatus {
+        status: if gateway_is_online(stored) {
+            "online".to_string()
+        } else {
+            "offline".to_string()
+        },
         gateway_id: stored.gateway_id.clone(),
         instance_id: stored.instance_id.clone(),
         version: stored.version.clone().unwrap_or_default(),
-        status: stored
-            .status
-            .clone()
-            .unwrap_or_else(|| "offline".to_string()),
+        // 注意：`status` 已在上面按新鲜度归一，这里不再回退原始字符串。
         health: stored
             .health
             .clone()
@@ -1018,6 +1046,22 @@ fn gateway_runtime_status(stored: &StoredGateway) -> GatewayRuntimeStatus {
         memory_bytes: stored.memory_bytes,
         cpu_percent: stored.cpu_percent,
         last_seen_at: stored.last_seen_at.clone().unwrap_or_else(DateTime::now),
+        uptime_seconds: stored.uptime_seconds,
+        agent_count: stored.agent_count,
+        online_agents: stored.online_agents,
+        offline_agents: stored.offline_agents,
+        last_seen_lag_seconds: stored.last_seen_lag_seconds,
+        store_bytes: stored.store_bytes,
+        ingest_accepted_total: stored.ingest_accepted_total,
+        ingest_rejected_total: stored.ingest_rejected_total,
+        last_ingest_at: stored.last_ingest_at.clone(),
+        memory_total_bytes: stored.memory_total_bytes,
+        load_1m: stored.load_1m,
+        load_5m: stored.load_5m,
+        load_15m: stored.load_15m,
+        disk_usage_percent: stored.disk_usage_percent,
+        disk_total_bytes: stored.disk_total_bytes,
+        disk_available_bytes: stored.disk_available_bytes,
     }
 }
 
@@ -1397,6 +1441,32 @@ mod tests {
         assert_eq!(returned.list.online_count, 1);
         assert_eq!(returned.list.offline_count, 1);
         assert_eq!(returned.list.degraded_count, 1);
+    }
+
+    /// F2 回归：在线判定必须**新鲜** —— 只看状态字符串会让掉线的网关永远「在线」。
+    #[test]
+    fn gateway_is_online_requires_a_fresh_last_seen() {
+        let mut gw =
+            StoredGateway::provisioned("gw-1".into(), "inst-1".into(), String::new(), None);
+        // 从未上报 → 不在线。
+        assert!(!super::gateway_is_online(&gw));
+
+        // 上报 online + 新鲜 → 在线。
+        gw.status = Some("online".into());
+        gw.last_seen_at = Some(DateTime::now());
+        assert!(super::gateway_is_online(&gw));
+
+        // 上报 online 但**陈旧**（远超窗口）→ 掉线，不算在线。
+        gw.last_seen_at = Some(DateTime::from_rfc3339("2020-01-01T00:00:00Z").expect("ts"));
+        assert!(
+            !super::gateway_is_online(&gw),
+            "陈旧的上报不算在线（F2：gwlinkd 停报后不能永远在线）"
+        );
+
+        // 新鲜但状态非 online → 不在线。
+        gw.last_seen_at = Some(DateTime::now());
+        gw.status = Some("offline".into());
+        assert!(!super::gateway_is_online(&gw));
     }
 
     #[tokio::test]

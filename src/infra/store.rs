@@ -158,6 +158,39 @@ pub struct StoredGateway {
     pub memory_bytes: Option<i64>,
     #[serde(default)]
     pub cpu_percent: Option<f64>,
+    // 网关状态富化（机队聚合 + 进程运行时长）；见设计 edge/gateway-status-report.md。
+    #[serde(default)]
+    pub uptime_seconds: Option<i64>,
+    #[serde(default)]
+    pub agent_count: Option<i64>,
+    #[serde(default)]
+    pub online_agents: Option<i64>,
+    #[serde(default)]
+    pub offline_agents: Option<i64>,
+    #[serde(default)]
+    pub last_seen_lag_seconds: Option<i64>,
+    #[serde(default)]
+    pub store_bytes: Option<i64>,
+    #[serde(default)]
+    pub ingest_accepted_total: Option<i64>,
+    #[serde(default)]
+    pub ingest_rejected_total: Option<i64>,
+    #[serde(default)]
+    pub last_ingest_at: Option<DateTime>,
+    #[serde(default)]
+    pub memory_total_bytes: Option<i64>,
+    #[serde(default)]
+    pub load_1m: Option<f64>,
+    #[serde(default)]
+    pub load_5m: Option<f64>,
+    #[serde(default)]
+    pub load_15m: Option<f64>,
+    #[serde(default)]
+    pub disk_usage_percent: Option<f64>,
+    #[serde(default)]
+    pub disk_total_bytes: Option<i64>,
+    #[serde(default)]
+    pub disk_available_bytes: Option<i64>,
     #[serde(default)]
     pub lifecycle_state: Option<GatewayInstanceLifecycleState>,
     #[serde(default)]
@@ -188,6 +221,22 @@ impl StoredGateway {
             health: None,
             memory_bytes: None,
             cpu_percent: None,
+            uptime_seconds: None,
+            agent_count: None,
+            online_agents: None,
+            offline_agents: None,
+            last_seen_lag_seconds: None,
+            store_bytes: None,
+            ingest_accepted_total: None,
+            ingest_rejected_total: None,
+            last_ingest_at: None,
+            memory_total_bytes: None,
+            load_1m: None,
+            load_5m: None,
+            load_15m: None,
+            disk_usage_percent: None,
+            disk_total_bytes: None,
+            disk_available_bytes: None,
             lifecycle_state: None,
             initialized_at: None,
             created_at: None,
@@ -230,6 +279,23 @@ pub struct GatewayStatusUpdate {
     pub memory_bytes: Option<i64>,
     pub cpu_percent: Option<f64>,
     pub last_seen_at: DateTime,
+    // 富化（可选）。
+    pub uptime_seconds: Option<i64>,
+    pub agent_count: Option<i64>,
+    pub online_agents: Option<i64>,
+    pub offline_agents: Option<i64>,
+    pub last_seen_lag_seconds: Option<i64>,
+    pub store_bytes: Option<i64>,
+    pub ingest_accepted_total: Option<i64>,
+    pub ingest_rejected_total: Option<i64>,
+    pub last_ingest_at: Option<DateTime>,
+    pub memory_total_bytes: Option<i64>,
+    pub load_1m: Option<f64>,
+    pub load_5m: Option<f64>,
+    pub load_15m: Option<f64>,
+    pub disk_usage_percent: Option<f64>,
+    pub disk_total_bytes: Option<i64>,
+    pub disk_available_bytes: Option<i64>,
 }
 
 /// 网关凭证与状态的持久化抽象：FileStore（JSON 文件，测试/无 PG 回退）与
@@ -953,6 +1019,22 @@ impl Store for FileStore {
                     stored.health = Some(update.health.clone());
                     stored.memory_bytes = update.memory_bytes;
                     stored.cpu_percent = update.cpu_percent;
+                    stored.uptime_seconds = update.uptime_seconds;
+                    stored.agent_count = update.agent_count;
+                    stored.online_agents = update.online_agents;
+                    stored.offline_agents = update.offline_agents;
+                    stored.last_seen_lag_seconds = update.last_seen_lag_seconds;
+                    stored.store_bytes = update.store_bytes;
+                    stored.ingest_accepted_total = update.ingest_accepted_total;
+                    stored.ingest_rejected_total = update.ingest_rejected_total;
+                    stored.last_ingest_at = update.last_ingest_at.clone();
+                    stored.memory_total_bytes = update.memory_total_bytes;
+                    stored.load_1m = update.load_1m;
+                    stored.load_5m = update.load_5m;
+                    stored.load_15m = update.load_15m;
+                    stored.disk_usage_percent = update.disk_usage_percent;
+                    stored.disk_total_bytes = update.disk_total_bytes;
+                    stored.disk_available_bytes = update.disk_available_bytes;
                     stored.last_seen_at = Some(update.last_seen_at.clone());
                     // 首次上报 → Running（初始化完成，记录 initialized_at + 转变事件）。
                     if stored.lifecycle_state != Some(GatewayInstanceLifecycleState::Running) {
