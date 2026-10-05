@@ -3511,7 +3511,7 @@ checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 
 [[package]]
 name = "wist-center"
-version = "0.5.0"
+version = "0.5.2"
 dependencies = [
  "async-trait",
  "aws-sdk-s3",
@@ -3535,29 +3535,16 @@ dependencies = [
  "tokio-rustls 0.26.5",
  "toml",
  "tower",
- "wist-contracts",
  "wist-control",
  "wist-error",
  "x509-parser",
 ]
 
 [[package]]
-name = "wist-contracts"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5d20ee1c04370833ea8c655f4f338ec305fc659c523e4b9738a9e12e90522b3"
-dependencies = [
- "jumo-derive",
- "serde",
- "serde_json",
- "sha2 0.10.9",
-]
-
-[[package]]
 name = "wist-control"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90d083a54b5a8f7f70ca4fa1fc185b7c991d9a5ab90dddf68a2fa4789fc3b19a"
+checksum = "a713181b6b122395912edbc9b31fb5fe547c797b785b386fb50766229fbbc062"
 dependencies = [
  "chrono",
  "jumo-derive",

@@ -5,6 +5,16 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.5.2-alpha] - 2026-10-06
+
+### Changed
+- **网关面注册/凭据报文体改用模型生成类型**：`POST /api/v1/gateway/register`、
+  `credentials:renew`、`credentials/verify` 的请求/响应改用 `wist-control 0.8` 的
+  `RegisterGateway` / `RenewGatewayCredential` / `VerifyGatewayCredential` / `GatewayEnrollmentResult` /
+  `GatewayCredentialBundle` / `GatewayCredentialVerificationResult`（原 `wist-contracts::gateway_control`）。
+  **线上 JSON 不变**（时间戳仍为 RFC3339 串）。
+- **依赖**：`wist-control` `0.7` → `0.8`；**移除 `wist-contracts` 依赖**（本仓只用过 `gateway_control`）。
+
 ## [0.5.1-alpha] - 2026-10-06
 
 ### Changed

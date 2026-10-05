@@ -8,15 +8,13 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use wist_contracts::gateway_control::{
-    GatewayCredentialBundle, GatewayCredentialVerificationResult, GatewayEnrollmentResult,
-    RegisterGateway, RenewGatewayCredential, VerifyGatewayCredential,
-};
 use wist_control::{
-    AgentStatusAcceptedReturned, GatewayInitialConfig, GatewayInitializationStatus,
-    GatewayInstanceLifecycleState, GatewayStatusAccepted, GatewayUpgradePlan,
-    GatewayUpgradeResultAccepted, QueryGatewayInitializationStatus, ReportAgentStatus,
-    ReportGatewayStatus, ReportGatewayUpgradeResult,
+    AgentStatusAcceptedReturned, DateTime, GatewayCredentialBundle,
+    GatewayCredentialVerificationResult, GatewayEnrollmentResult, GatewayInitialConfig,
+    GatewayInitializationStatus, GatewayInstanceLifecycleState, GatewayStatusAccepted,
+    GatewayUpgradePlan, GatewayUpgradeResultAccepted, QueryGatewayInitializationStatus,
+    RegisterGateway, RenewGatewayCredential, ReportAgentStatus, ReportGatewayStatus,
+    ReportGatewayUpgradeResult, VerifyGatewayCredential,
 };
 
 use crate::infra::{
@@ -251,9 +249,9 @@ pub async fn register_gateway(
         instance_id: Some(input.instance_id.clone()),
         certificate: issued.certificate_pem.clone(),
         ca_bundle: None,
-        issued_at: issued.not_before.clone(),
-        not_before: Some(issued.not_before.clone()),
-        not_after: Some(issued.not_after.clone()),
+        issued_at: ca_time(&issued.not_before),
+        not_before: Some(ca_time(&issued.not_before)),
+        not_after: Some(ca_time(&issued.not_after)),
     };
     // 生命周期：Provisioned → Initializing（注册成功即进入初始化）。
     if let Err(err) = state
@@ -714,9 +712,9 @@ pub async fn renew_gateway_credential(
         instance_id: None,
         certificate: issued.certificate_pem.clone(),
         ca_bundle: None,
-        issued_at: issued.not_before.clone(),
-        not_before: Some(issued.not_before.clone()),
-        not_after: Some(issued.not_after.clone()),
+        issued_at: ca_time(&issued.not_before),
+        not_before: Some(ca_time(&issued.not_before)),
+        not_after: Some(ca_time(&issued.not_after)),
     };
     rate_limit::clear_auth_failures(&state, &client_key, GATEWAY_AUTH_SCOPE);
     (StatusCode::OK, Json(bundle)).into_response()
@@ -807,6 +805,13 @@ fn credential_is_expired(expires_at: &str) -> bool {
     chrono::Utc::now() >= expires_at.with_timezone(&chrono::Utc)
 }
 
+/// CA 产出的 RFC3339 串 → 模型 `DateTime`。
+///
+/// `GatewayCa` 以 `to_rfc3339` 产出（必然可解析）；万一解析失败回落到「现在」，不 panic。
+fn ca_time(value: &str) -> DateTime {
+    DateTime::from_rfc3339(value).unwrap_or_else(DateTime::now)
+}
+
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     let mut diff = left.len() ^ right.len();
     let max_len = left.len().max(right.len());
@@ -839,7 +844,7 @@ pub async fn verify_gateway_credential(
             gateway_id: input.gateway_id,
             certificate_serial: input.certificate_serial,
             status: "valid".to_string(),
-            verified_at: chrono::Utc::now().to_rfc3339(),
+            verified_at: DateTime::now(),
         })
         .into_response(),
         Err(response) => response,
