@@ -13,9 +13,10 @@ use wist_contracts::gateway_control::{
     RegisterGateway, RenewGatewayCredential, VerifyGatewayCredential,
 };
 use wist_control::{
-    GatewayInitialConfig, GatewayInitializationStatus, GatewayInstanceLifecycleState,
-    GatewayStatusAccepted, GatewayUpgradePlan, GatewayUpgradeResultAccepted,
-    QueryGatewayInitializationStatus, ReportGatewayStatus, ReportGatewayUpgradeResult,
+    AgentStatusAcceptedReturned, GatewayInitialConfig, GatewayInitializationStatus,
+    GatewayInstanceLifecycleState, GatewayStatusAccepted, GatewayUpgradePlan,
+    GatewayUpgradeResultAccepted, QueryGatewayInitializationStatus, ReportAgentStatus,
+    ReportGatewayStatus, ReportGatewayUpgradeResult,
 };
 
 use crate::infra::{
@@ -40,35 +41,13 @@ pub async fn options_gateway_initial_config() -> Response {
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// Gateway 上报其下 Agent 状态（POST /api/v1/gateway/agents/status）。
-#[derive(serde::Deserialize)]
-pub struct AgentStatusReportRequest {
-    pub gateway_id: String,
-    pub agents: Vec<AgentStatusEntry>,
-}
-
-#[derive(serde::Deserialize)]
-pub struct AgentStatusEntry {
-    pub agent_id: String,
-    pub instance_id: String,
-    pub version: String,
-    pub status: String,
-    pub health: String,
-    #[serde(default)]
-    pub memory_bytes: Option<i64>,
-    #[serde(default)]
-    pub cpu_percent: Option<f64>,
-    #[serde(default)]
-    pub admin_latency_ms: Option<i64>,
-    pub last_seen_at: wist_control::types::DateTime,
-}
-
-/// 接收 Gateway 上报的 Agent 状态：以 mTLS 客户端证书鉴权 → store upsert → VM 推送。
+/// 接收 Gateway 上报的 Agent 状态（POST /api/v1/gateway/agents/status；报文体用模型生成的
+/// `wist_control::ReportAgentStatus`，不再本地定义）：以 mTLS 客户端证书鉴权 → store upsert → VM 推送。
 pub async fn submit_agent_status(
     State(state): State<ApiState>,
     identity: Option<Extension<VerifiedGatewayIdentity>>,
     client: PeerConnectInfo,
-    Json(input): Json<AgentStatusReportRequest>,
+    Json(input): Json<ReportAgentStatus>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     match authorize_gateway_certificate(
@@ -120,10 +99,10 @@ pub async fn submit_agent_status(
             }
             (
                 StatusCode::OK,
-                Json(serde_json::json!({
-                    "gateway_id": input.gateway_id,
-                    "agents_accepted": stored.len(),
-                })),
+                Json(AgentStatusAcceptedReturned {
+                    gateway_id: input.gateway_id.clone(),
+                    agents_accepted: stored.len() as i64,
+                }),
             )
                 .into_response()
         }

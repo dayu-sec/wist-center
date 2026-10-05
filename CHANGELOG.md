@@ -5,6 +5,15 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.5.1-alpha] - 2026-10-06
+
+### Changed
+- **网关上报的 agent 状态报文体改用模型生成的类型**：`POST /api/v1/gateway/agents/status`
+  请求/响应改用 `wist-control 0.7` 的 `ReportAgentStatus` / `AgentStatusAcceptedReturned`
+  （删除本仓本地定义的 `AgentStatusReportRequest` / `AgentStatusEntry`）。**wire 不变**（字段一一对应），
+  升级本制品即可，网关侧无需同步改动。
+- 依赖升级：`wist-control` `0.6` → `0.7`。
+
 ## [0.5.0-alpha] - 2026-10-05
 
 ### Changed（不兼容）

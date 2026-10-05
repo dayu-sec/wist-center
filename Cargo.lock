@@ -3555,9 +3555,9 @@ dependencies = [
 
 [[package]]
 name = "wist-control"
-version = "0.6.1"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee2ba7598649e5cfd3aba73468df80432a74494822c55d702b0c50d8c7a1bd0c"
+checksum = "90d083a54b5a8f7f70ca4fa1fc185b7c991d9a5ab90dddf68a2fa4789fc3b19a"
 dependencies = [
  "chrono",
  "jumo-derive",
