@@ -15,7 +15,7 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 /// 客户端证书是**可选**的（`allow_unauthenticated`）：
 ///
 /// - **首次注册**的网关还没有证书，强制要求会在握手就把它挡在外面；
-/// - 「无证书」不等于「未鉴权」——注册靠一次性 bootstrap token，其余网关面路由由应用层
+/// - 「无证书」不等于「未鉴权」——注册靠一次性接入券（link token），其余网关面路由由应用层
 ///   `authorize_gateway_certificate` **只凭客户端证书**判定（bearer 双轨已删）。
 ///
 /// 出示了证书就一定会被验证（链 + 有效期 + `EKU=clientAuth`）；有证书但验不过，握手仍会失败。

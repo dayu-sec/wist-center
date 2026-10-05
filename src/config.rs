@@ -46,6 +46,7 @@ const ENV_SERVER_KEY_PATH: &str = "WARP_INSIGHT_CENTER_SERVER_KEY_PATH";
 const ENV_PROTOCOL_VERSION: &str = "WARP_INSIGHT_CENTER_PROTOCOL_VERSION";
 const ENV_HMAC_SECRET: &str = "WARP_INSIGHT_CENTER_HMAC_SECRET";
 const ENV_CREDENTIAL_TTL_SECONDS: &str = "WARP_INSIGHT_CENTER_CREDENTIAL_TTL_SECONDS";
+const ENV_LINK_TTL_SECONDS: &str = "WARP_INSIGHT_CENTER_LINK_TTL_SECONDS";
 
 /// 默认对外地址使用域名（初始化 URL / 控制中心端点需要可被 Gateway 从外网访问）。
 const DEFAULT_PUBLIC_URL: &str = "https://center.warpinsight.example";
@@ -56,6 +57,8 @@ const DEFAULT_PROTOCOL_VERSION: &str = "1.0";
 /// 仅开发态兜底：未配置 hmac_secret 时用它派生注册凭据（生产必须显式配置）。
 const DEV_HMAC_SECRET: &str = "dev-center-hmac-secret-change-me";
 const DEFAULT_CREDENTIAL_TTL_SECONDS: i64 = 30 * 24 * 3600;
+/// 一次性接入券（link）的**短 TTL** 默认值：15 分钟（带外交付 + 现场执行的短窗口）。
+const DEFAULT_LINK_TTL_SECONDS: i64 = 15 * 60;
 
 #[derive(Debug, Clone)]
 pub struct CenterConfig {
@@ -103,6 +106,10 @@ pub struct CenterConfig {
     /// 网关**客户端证书**有效期秒数（register / renew 签出证书的 TTL）。
     /// env：`WARP_INSIGHT_CENTER_CREDENTIAL_TTL_SECONDS`。
     pub credential_ttl_seconds: i64,
+    /// 一次性接入券（link）的**短 TTL**（秒）：过期即不可用，需重新「生成/轮换」。
+    /// 来源：配置文件的 `security.link_ttl_seconds` 或
+    /// env：`WARP_INSIGHT_CENTER_LINK_TTL_SECONDS`。默认 15 分钟。
+    pub link_ttl_seconds: i64,
 }
 
 /// S3 兼容对象存储配置（MinIO 等）。
@@ -171,6 +178,7 @@ struct RawTelemetryConfig {
 struct RawSecurityConfig {
     hmac_secret: Option<String>,
     credential_ttl_seconds: Option<i64>,
+    link_ttl_seconds: Option<i64>,
     ca_cert_path: Option<String>,
 }
 
@@ -337,6 +345,9 @@ impl CenterConfig {
             credential_ttl_seconds: security
                 .credential_ttl_seconds
                 .unwrap_or(DEFAULT_CREDENTIAL_TTL_SECONDS),
+            link_ttl_seconds: security
+                .link_ttl_seconds
+                .unwrap_or(DEFAULT_LINK_TTL_SECONDS),
         })
     }
 
@@ -349,6 +360,7 @@ impl CenterConfig {
             "security.credential_ttl_seconds",
             self.credential_ttl_seconds,
         )?;
+        require_positive_seconds("security.link_ttl_seconds", self.link_ttl_seconds)?;
         // 服务端 TLS：证书与私钥要么都配（起 HTTPS），要么都不配（明文 HTTP）；
         // 配了就要求文件可读（fail-fast，避免启到一半才握手失败）。
         match (&self.server_cert_path, &self.server_key_path) {
@@ -472,6 +484,7 @@ fn apply_env_overrides(raw: &mut RawCenterConfig) {
         &mut raw.security.credential_ttl_seconds,
         ENV_CREDENTIAL_TTL_SECONDS,
     );
+    override_optional_i64(&mut raw.security.link_ttl_seconds, ENV_LINK_TTL_SECONDS);
     // 种子凭据：env 非空白 → 整体替换文件里的列表。
     if let Some(raw_entries) = env_non_blank(ENV_GATEWAY_CREDENTIALS) {
         raw.enrollment.gateway_credentials = raw_entries
@@ -688,6 +701,7 @@ store_path = "state/store.json"
 [security]
 hmac_secret = "${WIST_CENTER_TEST_HMAC_SECRET}"
 credential_ttl_seconds = 60
+link_ttl_seconds = 30
 
 [artifacts]
 dir = "artifacts"
@@ -705,6 +719,7 @@ gateway_credentials = ["gw-001:tok-a", "gw-002:tok-b"]
         assert_eq!(config.protocol_version, "2.0");
         assert_eq!(config.hmac_secret, "test-hmac-secret");
         assert_eq!(config.credential_ttl_seconds, 60);
+        assert_eq!(config.link_ttl_seconds, 30);
         assert_eq!(
             config.admin_token_hash.as_deref(),
             Some(sha256_hex("test-admin-token").as_str())
@@ -731,6 +746,7 @@ gateway_credentials = ["gw-001:tok-a", "gw-002:tok-b"]
             config.credential_ttl_seconds,
             DEFAULT_CREDENTIAL_TTL_SECONDS
         );
+        assert_eq!(config.link_ttl_seconds, DEFAULT_LINK_TTL_SECONDS);
         assert!(config.store_path.ends_with(DEFAULT_STORE_PATH));
     }
 
@@ -759,6 +775,7 @@ victoriametrics_url = "http://file-vm:8428"
                 "WARP_INSIGHT_CENTER_VICTORIAMETRICS_URL",
                 "http://env-vm:8428/",
             );
+            env::set_var("WARP_INSIGHT_CENTER_LINK_TTL_SECONDS", "120");
         }
 
         let config = CenterConfig::load_from_path(&path).expect("config loads");
@@ -773,6 +790,7 @@ victoriametrics_url = "http://file-vm:8428"
             config.victoriametrics_url.as_deref(),
             Some("http://env-vm:8428")
         );
+        assert_eq!(config.link_ttl_seconds, 120);
 
         // 归还环境，别影响同进程其它测试。
         unsafe {
@@ -780,6 +798,7 @@ victoriametrics_url = "http://file-vm:8428"
             env::remove_var("WARP_INSIGHT_CENTER_ADMIN_TOKEN");
             env::remove_var("WARP_INSIGHT_CENTER_DATABASE_URL");
             env::remove_var("WARP_INSIGHT_CENTER_VICTORIAMETRICS_URL");
+            env::remove_var("WARP_INSIGHT_CENTER_LINK_TTL_SECONDS");
         }
     }
 
@@ -796,6 +815,18 @@ listen_addr = ""
 "#,
         );
         assert!(CenterConfig::load_from_path(&empty_listen).is_err());
+    }
+
+    #[test]
+    fn rejects_non_positive_link_ttl() {
+        let _guard = env_guard();
+        // 接入券 TTL 必须是正整数：0（立即过期）会让「生成/轮换」形同虚设，必须在加载期拦住。
+        let path = write_temp_config("[security]\nlink_ttl_seconds = 0\n");
+        let err = CenterConfig::load_from_path(&path).expect_err("zero link TTL must be rejected");
+        assert!(
+            format!("{err}").contains("security.link_ttl_seconds"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -830,6 +861,7 @@ listen_addr = ""
             config.credential_ttl_seconds,
             DEFAULT_CREDENTIAL_TTL_SECONDS
         );
+        assert_eq!(config.link_ttl_seconds, DEFAULT_LINK_TTL_SECONDS);
         assert_eq!(config.database_url, None);
         assert_eq!(config.victoriametrics_url, None);
         assert!(config.object_storage.is_none());

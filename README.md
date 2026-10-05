@@ -19,7 +19,7 @@ artifacts.
 
 ## Features
 
-- **Gateway onboarding** — one-time bootstrap credentials, initial `config.toml` provisioning with
+- **Gateway onboarding** — one-time **link token** (renamed from “bootstrap”), initial `config.toml` provisioning with
   a derived RegistToken, plus client-certificate (mTLS) rotation and verification.
 - **Status ingestion** — accepts gateway status reports and the per-gateway agent status lists;
   optionally pushes each report to VictoriaMetrics for history.
@@ -140,6 +140,7 @@ In the file:
 | `WARP_INSIGHT_CENTER_VICTORIAMETRICS_URL` | *(unset)* | VictoriaMetrics base URL. Unset or empty → no time-series push. |
 | `WARP_INSIGHT_CENTER_GATEWAY_CREDENTIALS` | *(unset)* | `gateway_id:token,...` seeds written into the store at boot when missing. |
 | `WARP_INSIGHT_CENTER_CREDENTIAL_TTL_SECONDS` | `2592000` (30 days) | Gateway **client-certificate** lifetime (register/renew). |
+| `WARP_INSIGHT_CENTER_LINK_TTL_SECONDS` | `900` (15 minutes) | One-shot **link** token lifetime (provision/link-token). Expired → must re-issue. |
 | `WARP_INSIGHT_CENTER_ARTIFACT_DIR` | `artifacts` | Local release-artifact directory. |
 | `WARP_INSIGHT_CENTER_OBJECT_STORAGE_ENDPOINT` | *(unset)* | S3-compatible endpoint (MinIO, AWS S3, …). |
 | `WARP_INSIGHT_CENTER_OBJECT_STORAGE_BUCKET` | *(unset)* | Bucket that holds release artifacts. |
@@ -168,7 +169,7 @@ Authenticated by the gateway's own credential:
 | Method | Path | Credential |
 | --- | --- | --- |
 | `POST` | `/api/v1/gateway/register` | one-time enrollment token carried in the request body; returns a client certificate |
-| `GET` | `/api/v1/gateway/link-upstream` | one-time bootstrap token before initialization; client certificate (mTLS) afterwards |
+| `GET` | `/api/v1/gateway/link-upstream` | one-time link token before initialization; client certificate (mTLS) afterwards |
 | `POST` | `/api/v1/gateway/status` | client certificate (mTLS) |
 | `POST` | `/api/v1/gateway/agents/status` | client certificate (mTLS) |
 | `POST` | `/api/v1/gateway/credentials:renew` | client certificate (mTLS); the old certificate is invalidated on success |

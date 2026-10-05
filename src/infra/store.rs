@@ -140,10 +140,13 @@ pub struct StoredGateway {
     pub credential_status: StoredGatewayCredentialStatus,
     #[serde(default)]
     pub credential_expires_at: Option<String>,
-    /// 一次性置备引导 Token 的 hash（BOOTSTRAP_TOKEN）。create 时签发，
-    /// init-url 置备成功后清空（消费）；初始化后不可再生成。空串 = 无/已消费。
+    /// 一次性接入券 的 hash（LINK_TOKEN）。**由「生成/轮换」动作签发**
+    /// （create 不再签发），init-url 置备成功后清空（消费）；空串 = 无/已消费。
     #[serde(default)]
-    pub bootstrap_token_hash: String,
+    pub link_token_hash: String,
+    /// 接入 token 的过期时刻（RFC3339）。**短 TTL**：过期后不可用（需重新生成/轮换）。
+    #[serde(default)]
+    pub link_token_expires_at: Option<String>,
     /// 最新上报状态（喂 GatewayRuntimeStatus，last_seen_at = reported_at）。
     #[serde(default)]
     pub version: Option<String>,
@@ -178,7 +181,8 @@ impl StoredGateway {
             credential_token_hash,
             credential_status: StoredGatewayCredentialStatus::Active,
             credential_expires_at: expires_at,
-            bootstrap_token_hash: String::new(),
+            link_token_hash: String::new(),
+            link_token_expires_at: None,
             version: None,
             status: None,
             health: None,
@@ -261,12 +265,20 @@ pub trait Store: Send + Sync + std::fmt::Debug {
         &self,
         token: &str,
     ) -> Result<StoredEnrollmentToken, StoreError>;
-    /// 校验并消费一次性置备引导 Token（BOOTSTRAP_TOKEN）：比对 hash + 未初始化，
-    /// 成功则清空 bootstrap_token_hash。返回是否消费成功。
-    async fn consume_bootstrap_token(
+    /// 校验并消费一次性接入券（LINK_TOKEN）：比对 hash + 未初始化，
+    /// 成功则清空 link_token_hash。返回是否消费成功。
+    async fn consume_link_token(
         &self,
         gateway_id: &str,
-        bootstrap_token: &str,
+        link_token: &str,
+    ) -> Result<bool, StoreError>;
+    /// 轮换/生成一次性接入券（LINK_TOKEN）：覆盖 `link_token_hash` 与
+    /// `link_token_expires_at`（旧券即失效）。仅存 hash（调用方一次性交付明文）；网关不存在 → false。
+    async fn rotate_link_token(
+        &self,
+        gateway_id: &str,
+        link_hash: &str,
+        expires_at: Option<String>,
     ) -> Result<bool, StoreError>;
     /// 落库运行期凭据（RUNTIME_TOKEN）：更新 credential_token_hash + Active + 过期时间。
     async fn update_gateway_credential(
@@ -402,7 +414,7 @@ impl FileStore {
     }
 
     /// 创建网关实例（同步，供测试与 trait 委托）：gateway_id 已存在 → Conflict。
-    /// `token` 为一次性置备引导 Token（BOOTSTRAP_TOKEN），只存 sha256；
+    /// `token` 为一次性接入券（LINK_TOKEN），只存 sha256；
     /// 运行期凭据（credential_token_hash）留空，注册后签发 RUNTIME_TOKEN 时再落库。
     pub fn create_gateway(
         &self,
@@ -415,7 +427,7 @@ impl FileStore {
                     .to_err()
                     .with_detail(gateway_id.to_string()));
             }
-            let bootstrap_hash = if token.is_empty() {
+            let link_hash = if token.is_empty() {
                 String::new()
             } else {
                 sha256_hex(token)
@@ -426,7 +438,7 @@ impl FileStore {
                 String::new(),
                 None,
             );
-            stored.bootstrap_token_hash = bootstrap_hash;
+            stored.link_token_hash = link_hash;
             stored.lifecycle_state = Some(GatewayInstanceLifecycleState::Provisioned);
             stored.created_at = Some(DateTime::now());
             snapshot
@@ -572,26 +584,58 @@ impl FileStore {
         })?
     }
 
-    /// 校验并消费一次性置备引导 Token（同步）：比对 `bootstrap_token_hash`，网关必须
-    /// 处于 Provisioned（未初始化）且 token 未消费；成功则清空 bootstrap_token_hash（消费）。
-    /// 返回是否消费成功（不匹配/已消费/已初始化 → false，由 handler 映射 401）。
-    pub fn consume_bootstrap_token(
+    /// 校验并消费一次性接入券（同步）：比对 `link_token_hash`、**未过期**，网关必须
+    /// 处于 Provisioned（未初始化）且 token 未消费；成功则清空 hash（消费）。
+    /// 返回是否消费成功（不匹配/已消费/已过期/已初始化 → false，由 handler 映射 401）。
+    pub fn consume_link_token(
         &self,
         gateway_id: &str,
-        bootstrap_token: &str,
+        link_token: &str,
     ) -> Result<bool, StoreError> {
-        let bootstrap_hash = sha256_hex(bootstrap_token);
+        let link_hash = sha256_hex(link_token);
         self.update(|snapshot| {
             let Some(gateway) = snapshot.gateways.get_mut(gateway_id) else {
                 return false;
             };
-            if gateway.bootstrap_token_hash.is_empty()
-                || gateway.bootstrap_token_hash != bootstrap_hash
+            if gateway.link_token_hash.is_empty()
+                || gateway.link_token_hash != link_hash
                 || gateway.lifecycle_state != Some(GatewayInstanceLifecycleState::Provisioned)
             {
                 return false;
             }
-            gateway.bootstrap_token_hash.clear();
+            // 短 TTL：过期即拒，并顺手清掉（旧券不可再用）。
+            if gateway
+                .link_token_expires_at
+                .as_deref()
+                .is_some_and(|expires| {
+                    chrono::DateTime::parse_from_rfc3339(expires)
+                        .map(|value| value.with_timezone(&chrono::Utc) < chrono::Utc::now())
+                        .unwrap_or(false)
+                })
+            {
+                gateway.link_token_hash.clear();
+                gateway.link_token_expires_at = None;
+                return false;
+            }
+            gateway.link_token_hash.clear();
+            gateway.link_token_expires_at = None;
+            true
+        })
+    }
+
+    /// 轮换/生成接入券（同步）：覆盖 `link_token_hash` + 有效期（旧券即失效）。网关不存在 → false。
+    pub fn rotate_link_token(
+        &self,
+        gateway_id: &str,
+        link_hash: &str,
+        expires_at: Option<String>,
+    ) -> Result<bool, StoreError> {
+        self.update(|snapshot| {
+            let Some(gateway) = snapshot.gateways.get_mut(gateway_id) else {
+                return false;
+            };
+            gateway.link_token_hash = link_hash.to_string();
+            gateway.link_token_expires_at = expires_at;
             true
         })
     }
@@ -955,12 +999,21 @@ impl Store for FileStore {
         FileStore::consume_enrollment_token(self, token)
     }
 
-    async fn consume_bootstrap_token(
+    async fn consume_link_token(
         &self,
         gateway_id: &str,
-        bootstrap_token: &str,
+        link_token: &str,
     ) -> Result<bool, StoreError> {
-        FileStore::consume_bootstrap_token(self, gateway_id, bootstrap_token)
+        FileStore::consume_link_token(self, gateway_id, link_token)
+    }
+
+    async fn rotate_link_token(
+        &self,
+        gateway_id: &str,
+        link_hash: &str,
+        expires_at: Option<String>,
+    ) -> Result<bool, StoreError> {
+        FileStore::rotate_link_token(self, gateway_id, link_hash, expires_at)
     }
 
     async fn update_gateway_credential(
@@ -1263,15 +1316,55 @@ mod tests {
     }
 
     #[test]
+    fn rotate_link_token_replaces_the_hash() {
+        let path = test_store_path();
+        let store = FileStore::new(&path);
+        store.create_gateway("gw-rot", "link-old").expect("create");
+        assert!(
+            store
+                .rotate_link_token("gw-rot", &sha256_hex("link-new"), None)
+                .expect("rotate")
+        );
+        // 旧券作废、新券可用（一次性接入券 的“再取即轮换”）。
+        assert!(!store.consume_link_token("gw-rot", "link-old").expect("old"));
+        assert!(store.consume_link_token("gw-rot", "link-new").expect("new"));
+        // 未知网关 → false。
+        assert!(
+            !store
+                .rotate_link_token("gw-absent", "x", None)
+                .expect("absent")
+        );
+    }
+
+    #[test]
+    fn expired_link_token_is_rejected() {
+        let path = test_store_path();
+        let store = FileStore::new(&path);
+        store.create_gateway("gw-exp", "").expect("create");
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(10)).to_rfc3339();
+        assert!(
+            store
+                .rotate_link_token("gw-exp", &sha256_hex("link-exp"), Some(past))
+                .expect("rotate")
+        );
+        // 短 TTL：过期券不可消费（需重新生成/轮换）。
+        assert!(
+            !store
+                .consume_link_token("gw-exp", "link-exp")
+                .expect("expired")
+        );
+    }
+
+    #[test]
     fn create_gateway_provisions_and_conflicts_on_duplicate() {
         let path = test_store_path();
         let store = FileStore::new(&path);
 
         let stored = store.create_gateway("gw-100", "tok-x").expect("create");
         assert_eq!(stored.gateway_id, "gw-100");
-        // create 的 token 是置备引导 Token（BOOTSTRAP_TOKEN）：存 bootstrap hash，
+        // create 的 token 是接入券（LINK_TOKEN）：存 link hash，
         // 运行期凭据（credential_token_hash）留空，注册后签发 RUNTIME_TOKEN 时再落库。
-        assert_eq!(stored.bootstrap_token_hash, sha256_hex("tok-x"));
+        assert_eq!(stored.link_token_hash, sha256_hex("tok-x"));
         assert_eq!(stored.credential_token_hash, "");
         assert_eq!(
             stored.credential_status,
@@ -1286,55 +1379,47 @@ mod tests {
         assert_eq!(err.reason(), &StoreReason::Conflict);
         assert_eq!(err.detail().as_deref(), Some("gw-100"));
 
-        // 空 token → bootstrap hash 也空（无引导凭据网关无法置备）。
+        // 空 token → link hash 也空（无接入凭据网关无法置备）。
         let stored = store
             .create_gateway("gw-nocred", "")
             .expect("create no credential");
-        assert_eq!(stored.bootstrap_token_hash, "");
+        assert_eq!(stored.link_token_hash, "");
         assert_eq!(stored.credential_token_hash, "");
 
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn bootstrap_token_consume_and_rotate() {
-        // 消费：匹配 bootstrap + Provisioned → true，hash 清空。
+    fn link_token_consume_and_rotate() {
+        // 消费：匹配 link + Provisioned → true，hash 清空。
         let path = test_store_path();
         let store = FileStore::new(&path);
-        store.create_gateway("gw-b", "boot-x").expect("create");
-        assert!(
-            store
-                .consume_bootstrap_token("gw-b", "boot-x")
-                .expect("consume")
-        );
+        store.create_gateway("gw-b", "link-x").expect("create");
+        assert!(store.consume_link_token("gw-b", "link-x").expect("consume"));
         assert!(
             store.load().expect("load").gateways["gw-b"]
-                .bootstrap_token_hash
+                .link_token_hash
                 .is_empty()
         );
         // 已消费 → false（防重放）。
         assert!(
             !store
-                .consume_bootstrap_token("gw-b", "boot-x")
+                .consume_link_token("gw-b", "link-x")
                 .expect("re-consume")
         );
         // 错 token → false。
         let path2 = test_store_path();
         let store2 = FileStore::new(&path2);
-        store2.create_gateway("gw-b", "boot-x").expect("create");
-        assert!(
-            !store2
-                .consume_bootstrap_token("gw-b", "wrong")
-                .expect("wrong")
-        );
+        store2.create_gateway("gw-b", "link-x").expect("create");
+        assert!(!store2.consume_link_token("gw-b", "wrong").expect("wrong"));
         // 已初始化 → false。
         let path3 = test_store_path();
         let store3 = FileStore::new(&path3);
-        store3.create_gateway("gw-b", "boot-x").expect("create");
+        store3.create_gateway("gw-b", "link-x").expect("create");
         store3.mark_gateway_initializing("gw-b").expect("init");
         assert!(
             !store3
-                .consume_bootstrap_token("gw-b", "boot-x")
+                .consume_link_token("gw-b", "link-x")
                 .expect("initialized")
         );
 
@@ -1347,7 +1432,7 @@ mod tests {
     fn update_gateway_credential_replaces_runtime_credential() {
         let path = test_store_path();
         let store = FileStore::new(&path);
-        store.create_gateway("gw-c", "boot-x").expect("create");
+        store.create_gateway("gw-c", "link-x").expect("create");
         let expires = Some("2026-09-01T00:00:00Z".to_string());
         assert!(
             store

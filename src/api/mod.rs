@@ -27,8 +27,8 @@ use admin_ops::{
     admin_get_agent_history, admin_get_gateway_history, admin_get_gateway_initial_config,
     admin_get_gateway_uptime, admin_list_gateway_agents, admin_list_gateway_instances,
     admin_list_gateway_lifecycle, admin_list_gateway_status, admin_list_releases,
-    admin_list_upgrade_plans, admin_publish_release, admin_show_gateway_status,
-    admin_view_gateway_list,
+    admin_list_upgrade_plans, admin_publish_release, admin_rotate_gateway_link_token,
+    admin_show_gateway_status, admin_view_gateway_list,
 };
 use gateway_ops::{
     download_release_artifact, get_gateway_initial_config, get_gateway_upgrade_plan,
@@ -195,6 +195,11 @@ pub fn router_for(state: ApiState) -> Router {
         .route(
             "/api/v1/admin/gateways/{gateway_id}/config",
             get(admin_get_gateway_initial_config),
+        )
+        // 管理面：生成/轮换一次性接入券（LINK_TOKEN，明文仅返回一次）
+        .route(
+            "/api/v1/admin/gateways/{gateway_id}/link-token",
+            post(admin_rotate_gateway_link_token),
         )
         // 管理面：网关列表聚合（AdminViewGatewayList，GET /api/v1/admin/gateways）
         .route("/api/v1/admin/gateways", get(admin_view_gateway_list))

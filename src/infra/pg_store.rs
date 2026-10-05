@@ -41,7 +41,8 @@ struct GatewayRow {
     credential_token_hash: String,
     credential_status: String,
     credential_expires_at: Option<chrono::DateTime<chrono::Utc>>,
-    bootstrap_token_hash: String,
+    link_token_hash: String,
+    link_token_expires_at: Option<chrono::DateTime<chrono::Utc>>,
     version: Option<String>,
     status: Option<String>,
     health: Option<String>,
@@ -99,7 +100,8 @@ impl GatewayRow {
             credential_token_hash: self.credential_token_hash,
             credential_status: parse_credential_status(&self.credential_status),
             credential_expires_at: self.credential_expires_at.map(|value| value.to_rfc3339()),
-            bootstrap_token_hash: self.bootstrap_token_hash,
+            link_token_hash: self.link_token_hash,
+            link_token_expires_at: self.link_token_expires_at.map(|value| value.to_rfc3339()),
             version: self.version,
             status: self.status,
             health: self.health,
@@ -196,8 +198,8 @@ fn parse_optional_timestamptz(value: &Option<String>) -> Option<chrono::DateTime
 }
 
 const GATEWAY_COLUMNS: &str = "gateway_id, instance_id, credential_token_hash, \
-                               credential_status, credential_expires_at, bootstrap_token_hash, \
-                               version, status, health, memory_bytes, cpu_percent, \
+                               credential_status, credential_expires_at, link_token_hash, \
+                               link_token_expires_at, version, status, health, memory_bytes, cpu_percent, \
                                lifecycle_state, initialized_at, created_at, last_seen_at";
 
 #[async_trait::async_trait]
@@ -290,18 +292,18 @@ impl Store for PgStore {
         gateway_id: &str,
         token: &str,
     ) -> Result<StoredGateway, StoreError> {
-        let bootstrap_hash = if token.is_empty() {
+        let link_hash = if token.is_empty() {
             String::new()
         } else {
             sha256_hex(token)
         };
         let result = sqlx::query(
-            "INSERT INTO gateways (gateway_id, instance_id, bootstrap_token_hash, lifecycle_state, created_at) \
+            "INSERT INTO gateways (gateway_id, instance_id, link_token_hash, lifecycle_state, created_at) \
              VALUES ($1, '', $2, 'Provisioned', NOW()) \
              ON CONFLICT (gateway_id) DO NOTHING",
         )
         .bind(gateway_id)
-        .bind(&bootstrap_hash)
+        .bind(&link_hash)
         .execute(&self.pool)
         .await
         .source_raw_err(StoreReason::Sql, "insert gateway")?;
@@ -314,26 +316,47 @@ impl Store for PgStore {
             .await?;
         let mut stored =
             StoredGateway::provisioned(gateway_id.to_string(), String::new(), String::new(), None);
-        stored.bootstrap_token_hash = bootstrap_hash;
+        stored.link_token_hash = link_hash;
         Ok(stored)
     }
 
-    async fn consume_bootstrap_token(
+    async fn consume_link_token(
         &self,
         gateway_id: &str,
-        bootstrap_token: &str,
+        link_token: &str,
     ) -> Result<bool, StoreError> {
-        let bootstrap_hash = sha256_hex(bootstrap_token);
+        let link_hash = sha256_hex(link_token);
         let result = sqlx::query(
-            "UPDATE gateways SET bootstrap_token_hash = '' \
-             WHERE gateway_id = $1 AND bootstrap_token_hash = $2 \
-               AND bootstrap_token_hash <> '' AND lifecycle_state = 'Provisioned'",
+            "UPDATE gateways SET link_token_hash = '', link_token_expires_at = NULL \
+             WHERE gateway_id = $1 AND link_token_hash = $2 \
+               AND link_token_hash <> '' AND lifecycle_state = 'Provisioned' \
+               AND (link_token_expires_at IS NULL OR link_token_expires_at > NOW())",
         )
         .bind(gateway_id)
-        .bind(bootstrap_hash)
+        .bind(link_hash)
         .execute(&self.pool)
         .await
-        .source_raw_err(StoreReason::Sql, "consume bootstrap token")?;
+        .source_raw_err(StoreReason::Sql, "consume link token")?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn rotate_link_token(
+        &self,
+        gateway_id: &str,
+        link_hash: &str,
+        expires_at: Option<String>,
+    ) -> Result<bool, StoreError> {
+        let expires = parse_optional_timestamptz(&expires_at);
+        let result = sqlx::query(
+            "UPDATE gateways SET link_token_hash = $2, link_token_expires_at = $3 \
+             WHERE gateway_id = $1",
+        )
+        .bind(gateway_id)
+        .bind(link_hash)
+        .bind(expires)
+        .execute(&self.pool)
+        .await
+        .source_raw_err(StoreReason::Sql, "rotate link token")?;
         Ok(result.rows_affected() > 0)
     }
 

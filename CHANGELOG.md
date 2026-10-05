@@ -5,6 +5,32 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [Unreleased]
+
+### Changed（不兼容）
+- **接入券改名（bootstrap → link）**：网关一次性「置备引导券」统一更名为**接入券**（link token）。
+  它只在网关**首跑接入**（`link-upstream`）时用一次 —— 容器部署/启动本身不需要它，名字不应暗示「启动引导」。
+  - 管理面路由 `POST /api/v1/admin/gateways/{id}/setup-token` → `.../link-token`；
+    响应字段 `setup_token` → `link_token`、`bootstrap_expires_at` → `link_expires_at`。
+  - 配置项 `security.bootstrap_ttl_seconds` → `security.link_ttl_seconds`；
+    env `WARP_INSIGHT_CENTER_BOOTSTRAP_TTL_SECONDS` → `WARP_INSIGHT_CENTER_LINK_TTL_SECONDS`。
+  - 库列 `bootstrap_token_hash` / `bootstrap_token_expires_at` → `link_token_hash` / `link_token_expires_at`
+    （该列本周期新增、尚未发布，直接改名，无迁移）。
+- **接入凭据不再随 create 交付**：`POST /api/v1/admin/gateways/instances` 只建实例，响应**只含实例视图**
+  （删 `install`）；一次性接入券改由 `POST /api/v1/admin/gateways/{id}/link-token`（**生成/轮换**）产出、
+  页面一次性展示（设计 `gateway-secure-registration.md` §6/§8）。请求体的 `token` 字段一并移除。
+- **安装命令不再向网关容器注入初始化 URL / 接入券**：这些 env（`WIST_GATEWAY_INIT_URL` /
+  `WIST_GATEWAY_BOOTSTRAP_TOKEN`）在本仓无任何读取方，且接入发起方已改为宿主侧 `wist-gwlinkd`
+  （设计 §6「集成发起方」）—— 容器启动本身不需要接入券。
+
+### Added
+- **接入券短 TTL（可配）**：接入券带到期时刻，**默认 15 分钟**，过期即不可用
+  （`consume_link_token` 拒绝）；「生成/轮换」响应新增 `link_expires_at`。
+  - 配置项 `security.link_ttl_seconds` / env `WARP_INSIGHT_CENTER_LINK_TTL_SECONDS`（须为正整数）。
+
+### 数据库
+- `gateways` 表新增 `link_token_expires_at`（含 `wist-center-stack` 同源 schema 副本需同步）。
+
 ## [0.4.0-alpha] - 2026-10-04
 
 ### Changed（不兼容）

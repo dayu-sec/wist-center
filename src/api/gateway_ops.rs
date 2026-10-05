@@ -1,5 +1,5 @@
 // 网关面 HTTP API：状态 / 升级 / 凭据等由 **mTLS 客户端证书**认人（authorize_gateway_certificate）；
-// 唯 link-upstream 的**首次置备**用一次性 bootstrap bearer。
+// 唯 link-upstream 的**首次置备**用一次性 link bearer。
 
 use axum::{
     Json,
@@ -409,8 +409,8 @@ pub struct InitialConfigQueryParams {
 
 /// 链接上级 / 拉取网关初始配置：GET /api/v1/gateway/link-upstream。
 /// 对齐模型 `ProvisionGatewayFlow`。两种状态：
-/// - **未初始化**（有 bootstrap、无客户端证书）：Bearer 为一次性 BootstrapToken，
-///   携带 X-Gateway-Identity-Token → 派生 RegistToken 落 enrollment → 消费 bootstrap → 出 config.toml。
+/// - **未初始化**（有 link、无客户端证书）：Bearer 为一次性 LinkToken，
+///   携带 X-Gateway-Identity-Token → 派生 RegistToken 落 enrollment → 消费 link → 出 config.toml。
 /// - **已初始化**（已有客户端证书）：由 mTLS 客户端证书鉴权 → 出同一 config.toml。
 ///
 /// 返回 `application/json`：`config` 为 GatewayInitialConfig，置备态同时返回明文 RegistToken。
@@ -449,7 +449,7 @@ pub async fn get_gateway_initial_config(
         }
     };
     // 未初始化 → 置备路径。
-    if gateway.credential_token_hash.is_empty() && !gateway.bootstrap_token_hash.is_empty() {
+    if gateway.credential_token_hash.is_empty() && !gateway.link_token_hash.is_empty() {
         return provision_gateway_initial_config(
             &state,
             &headers,
@@ -489,8 +489,8 @@ pub async fn get_gateway_initial_config(
     }
 }
 
-/// 置备路径：Bearer 一次性 BootstrapToken 鉴权 + X-Gateway-Identity-Token 派生
-/// RegistToken → 落 enrollment token（供 /register 消费）→ 成功后消费 bootstrap → 出 config.toml。
+/// 置备路径：Bearer 一次性 LinkToken 鉴权 + X-Gateway-Identity-Token 派生
+/// RegistToken → 落 enrollment token（供 /register 消费）→ 成功后消费 link → 出 config.toml。
 async fn provision_gateway_initial_config(
     state: &ApiState,
     headers: &HeaderMap,
@@ -498,12 +498,12 @@ async fn provision_gateway_initial_config(
     gateway: &StoredGateway,
     client_key: &str,
 ) -> Response {
-    let Some(bootstrap_token) = bearer_token(headers) else {
+    let Some(link_token) = bearer_token(headers) else {
         return (StatusCode::UNAUTHORIZED, "missing bearer credential").into_response();
     };
-    if sha256_hex(bootstrap_token) != gateway.bootstrap_token_hash {
+    if sha256_hex(link_token) != gateway.link_token_hash {
         rate_limit::record_auth_failure(state, client_key, GATEWAY_AUTH_SCOPE);
-        return (StatusCode::UNAUTHORIZED, "invalid bootstrap token").into_response();
+        return (StatusCode::UNAUTHORIZED, "invalid link token").into_response();
     }
     let identity_token = headers
         .get("x-gateway-identity-token")
@@ -541,24 +541,20 @@ async fn provision_gateway_initial_config(
                 .into_response();
         }
     };
-    // 成功落库 RegistToken 后才消费 bootstrap（一次性；网络抖动可重试置备）。
-    match state
-        .store
-        .consume_bootstrap_token(gateway_id, bootstrap_token)
-        .await
-    {
+    // 成功落库 RegistToken 后才消费 link（一次性；网络抖动可重试置备）。
+    match state.store.consume_link_token(gateway_id, link_token).await {
         Ok(true) => {}
         Ok(false) => {
             return (
                 StatusCode::CONFLICT,
-                "bootstrap token already consumed or gateway initialized".to_string(),
+                "link token already consumed or gateway initialized".to_string(),
             )
                 .into_response();
         }
         Err(err) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to consume bootstrap token: {err}"),
+                format!("failed to consume link token: {err}"),
             )
                 .into_response();
         }
@@ -798,7 +794,7 @@ fn unauthorized_code(code: &str) -> Response {
         .into_response()
 }
 
-/// 一次性 bootstrap 的 Bearer 解析（link-upstream 置备路径仍用引导券，非长期身份）。
+/// 一次性 link 的 Bearer 解析（link-upstream 置备路径仍用接入券，非长期身份）。
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)?
@@ -1001,6 +997,7 @@ mod tests {
                 protocol_version: "1.0".to_string(),
                 hmac_secret: "test-hmac-secret".to_string(),
                 credential_ttl_seconds: 3600,
+                link_ttl_seconds: 900,
             },
             store: std::sync::Arc::new(store),
             artifact_store: std::sync::Arc::new(crate::infra::LocalArtifactStore::new(
@@ -1057,6 +1054,7 @@ mod tests {
                 protocol_version: "1.0".to_string(),
                 hmac_secret: "test-hmac-secret".to_string(),
                 credential_ttl_seconds: 3600,
+                link_ttl_seconds: 900,
             },
             store: std::sync::Arc::new(store),
             artifact_store: std::sync::Arc::new(crate::infra::LocalArtifactStore::new(
@@ -1070,8 +1068,8 @@ mod tests {
         }
     }
 
-    /// 构造"已创建未置备"网关（create_gateway 存 bootstrap hash、无客户端证书）的完整路由。
-    fn provision_state(bootstrap_token: &str) -> ApiState {
+    /// 构造"已创建未置备"网关（create_gateway 存 link hash、无客户端证书）的完整路由。
+    fn provision_state(link_token: &str) -> ApiState {
         // 临时文件用「纳秒 + 原子计数器」命名，避免并发测试同纳秒撞同一路径导致 Conflict。
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
@@ -1081,9 +1079,7 @@ mod tests {
         let counter = COUNTER.fetch_add(1, Ordering::SeqCst);
         let path = std::env::temp_dir().join(format!("wic-provision-{nanos}-{counter}.json"));
         let store = FileStore::new(&path);
-        store
-            .create_gateway("gw-p", bootstrap_token)
-            .expect("create");
+        store.create_gateway("gw-p", link_token).expect("create");
         ApiState {
             config: crate::config::CenterConfig {
                 listen_addr: "127.0.0.1:3100".to_string(),
@@ -1102,6 +1098,7 @@ mod tests {
                 protocol_version: "1.0".to_string(),
                 hmac_secret: "test-hmac-secret".to_string(),
                 credential_ttl_seconds: 3600,
+                link_ttl_seconds: 900,
             },
             store: std::sync::Arc::new(store),
             artifact_store: std::sync::Arc::new(crate::infra::LocalArtifactStore::new(
@@ -1330,8 +1327,8 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_status_report_for_a_gateway_without_a_registered_certificate() {
-        // 网关已创建（有 bootstrap）但尚未注册（无登记指纹）→ 任何证书都不认。
-        let response = super::super::router_for(provision_state("boot-tok-x"))
+        // 网关已创建（有 link）但尚未注册（无登记指纹）→ 任何证书都不认。
+        let response = super::super::router_for(provision_state("link-tok-x"))
             .oneshot(with_identity(
                 Request::builder()
                     .method("POST")
@@ -1493,20 +1490,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provision_initial_config_derives_regist_and_consumes_bootstrap() {
+    async fn provision_initial_config_derives_regist_and_consumes_link() {
         use axum::{body::Body, http::Request};
         use http_body_util::BodyExt;
         use tower::ServiceExt;
-        let app = super::super::router_for(provision_state("boot-tok-p"));
+        let app = super::super::router_for(provision_state("link-tok-p"));
 
-        // 未置备：Bearer 一次性 bootstrap + X-Gateway-Identity-Token → 200 + config.toml（含派生 RegistToken）。
+        // 未置备：Bearer 一次性 link + X-Gateway-Identity-Token → 200 + config.toml（含派生 RegistToken）。
         let response = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("GET")
                     .uri("/api/v1/gateway/link-upstream?gateway_id=gw-p")
-                    .header("authorization", "Bearer boot-tok-p")
+                    .header("authorization", "Bearer link-tok-p")
                     .header("x-gateway-identity-token", "identity-p")
                     .body(Body::empty())
                     .expect("request"),
@@ -1545,14 +1542,14 @@ mod tests {
                 .starts_with("enroll-gw-p")
         );
 
-        // bootstrap 一次性：置备成功后复用 → 401（已消费，且无运行期凭据）。
+        // link 一次性：置备成功后复用 → 401（已消费，且无运行期凭据）。
         let response = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("GET")
                     .uri("/api/v1/gateway/link-upstream?gateway_id=gw-p")
-                    .header("authorization", "Bearer boot-tok-p")
+                    .header("authorization", "Bearer link-tok-p")
                     .header("x-gateway-identity-token", "identity-p")
                     .body(Body::empty())
                     .expect("request"),
@@ -1561,14 +1558,14 @@ mod tests {
             .expect("response");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
-        // 错 bootstrap → 401（不落 enrollment、不消费）。
-        let app2 = super::super::router_for(provision_state("boot-2"));
+        // 错 link → 401（不落 enrollment、不消费）。
+        let app2 = super::super::router_for(provision_state("link-2"));
         let response = app2
             .oneshot(
                 Request::builder()
                     .method("GET")
                     .uri("/api/v1/gateway/link-upstream?gateway_id=gw-p")
-                    .header("authorization", "Bearer wrong-boot")
+                    .header("authorization", "Bearer wrong-link")
                     .header("x-gateway-identity-token", "identity-p")
                     .body(Body::empty())
                     .expect("request"),
@@ -1576,6 +1573,98 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn provision_rejects_missing_bearer() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+        // 置备态网关 + 带身份头但**不带** Bearer → 401（缺接入凭据）。
+        let response = super::super::router_for(provision_state("link-1"))
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/gateway/link-upstream?gateway_id=gw-p")
+                    .header("x-gateway-identity-token", "identity-p")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn provision_rejects_missing_identity_token() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+        // 接入券正确但**缺** X-Gateway-Identity-Token（RegistToken 的派生输入）→ 400。
+        let response = super::super::router_for(provision_state("link-1"))
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/gateway/link-upstream?gateway_id=gw-p")
+                    .header("authorization", "Bearer link-1")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn initialized_gateway_returns_config_without_a_regist_token() {
+        use axum::{body::Body, http::Request};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+        // 已置备（有客户端证书）→ 走 mTLS 路径，只回配置、regist_token 为 None。
+        let response = router()
+            .oneshot(with_identity(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/gateway/link-upstream?gateway_id=gw-001")
+                    .body(Body::empty())
+                    .expect("request"),
+                client_identity("gw-001", TEST_FINGERPRINT),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let returned: InitialConfigReturned = serde_json::from_slice(&body).expect("json");
+        assert!(
+            returned.regist_token.is_none(),
+            "已置备不应再下发 RegistToken"
+        );
+    }
+
+    #[tokio::test]
+    async fn provision_fails_closed_when_tls_required_but_no_trust_root() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+        // public_url=https → 要求 TLS；但 ca_cert=None → 无信任根 → 拒绝服务（fail-closed）。
+        let mut state = provision_state("link-tls");
+        state.config.public_url = "https://127.0.0.1:3100".to_string();
+        state.config.ca_cert = None;
+        let response = super::super::router_for(state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/gateway/link-upstream?gateway_id=gw-p")
+                    .header("authorization", "Bearer link-tls")
+                    .header("x-gateway-identity-token", "identity-p")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
@@ -1780,6 +1869,7 @@ mod tests {
                 protocol_version: "1.0".to_string(),
                 hmac_secret: "test-hmac-secret".to_string(),
                 credential_ttl_seconds: 3600,
+                link_ttl_seconds: 900,
             },
             store: std::sync::Arc::new(file_store),
             artifact_store: std::sync::Arc::new(crate::infra::LocalArtifactStore::new(
@@ -1808,7 +1898,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_initialization_status_tracks_lifecycle() {
-        let state = provision_state("boot-tok");
+        let state = provision_state("link-tok");
         let store = state.store.clone();
         let app = super::super::router_for(state);
         // 未初始化：Provisioned → initialized = false。

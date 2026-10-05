@@ -24,36 +24,35 @@ use super::{
     control_center_tls_required, rate_limit,
 };
 
-/// 创建网关实例请求体：对齐模型 `AdminCreateGatewayInstance`（gateway_name/requested_by）。
-/// 可选 `token`：作为一次性置备引导 Token（BOOTSTRAP_TOKEN）显式提供；不传则由中心生成。
+/// 创建网关实例请求体：对齐模型 `AdminCreateGatewayInstanceRequest`（gateway_name/requested_by）。
+/// **不含接入凭据**：接入券由「生成/轮换」端点产出（设计 §8）。
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdminCreateGatewayInstanceRequest {
     pub gateway_name: String,
     pub requested_by: String,
-    pub token: Option<String>,
 }
 
-/// 网关实例安装指引（api 层交付信息，不模型化）：docker 安装命令 + 云镜像地址 + 初始化 URL + 置备引导 Token。
+/// 网关实例安装指引（api 层交付信息，不模型化）：docker 安装命令 + 云镜像地址 + 初始化 URL + 接入券。
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct GatewayInstallInfo {
     pub install_command: String,
     pub cloud_image: String,
     pub init_url: String,
-    /// 一次性置备引导 Token（BOOTSTRAP_TOKEN）明文：仅 create/rotate 响应交付一次，
-    /// 供 admin 页面展示给安装人员；中心只存 hash，初始化后不可再生成。
-    pub setup_token: String,
+    /// 一次性接入券（LINK_TOKEN）明文：**仅「生成/轮换」响应交付一次**，
+    /// 供 admin 页面展示；中心只存 hash（带短 TTL），一次性、过期即废。
+    pub link_token: String,
     /// 控制中心 CA 证书内容（control-center.pem 信任根），供安装时写入 trust_bundle 路径。
     pub trust_bundle_pem: Option<String>,
-    /// 服务端生成的 curl 验证命令：Bearer 用置备引导 token + 网关自生成身份调 init_url。
+    /// 服务端生成的 curl 验证命令：Bearer 用接入 token + 网关自生成身份调 init_url。
     pub init_curl: String,
 }
 
-/// 创建网关实例返回：实例视图 + 安装指引（Gateway 启动后基于 init_url 初始化）。
+/// 创建网关实例返回：**仅实例视图**。接入凭据不在 create 响应里交付（设计 §6/§8），
+/// 由「生成/轮换」端点产出。
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct AdminCreateGatewayInstanceReturned {
     pub instance: GatewayInstance,
-    pub install: GatewayInstallInfo,
 }
 
 /// 管理端实例列表项：在生命周期信息之外公开不含凭证的初始化入口。
@@ -88,73 +87,22 @@ pub async fn admin_create_gateway_instance(
         )
             .into_response();
     }
-    // 一次性置备引导 Token（BOOTSTRAP_TOKEN）：create 时生成、中心只存 sha256；
-    // 明文随 create 响应交付（admin 页面一次性展示给安装人员），初始化后不可再生成。
-    let bootstrap_token = match request.token.as_deref() {
-        Some(value) if !value.trim().is_empty() => value.trim().to_string(),
-        _ => match crate::infra::new_secret_token("boot") {
-            Ok(token) => token,
-            Err(reason) => return (StatusCode::INTERNAL_SERVER_ERROR, reason).into_response(),
-        },
-    };
-    match state
-        .store
-        .create_gateway(gateway_id, &bootstrap_token)
-        .await
-    {
-        Ok(stored) => {
-            let init_endpoint = format!(
-                "{}/api/v1/gateway/link-upstream?gateway_id={}",
-                state.config.public_url.trim_end_matches('/'),
-                stored.gateway_id
-            );
-            // init_url 不携带凭证：bootstrap token 不进 URL（避免泄露到历史/分享链接），
-            // 网关置备时以 Bearer bootstrap_token + X-Gateway-Identity-Token 头调用。
-            let init_url = init_endpoint.clone();
-            // 配置在网关调 init-url 置备时生成（ProvisionGatewayFlow 派生 RegistToken 出 config.toml），
-            // create 不再产出配置文件。
-            // 信任根：config.toml 引用 /etc/wist-gateway/ca/control-center.pem，需把
-            // control-center.pem（trust_bundle_pem 内容落盘为 ./control-center.pem）挂载到该路径，
-            // 网关访问 HTTPS init_url 时才能校验中心 TLS 服务器证书。未配置 CA → 不挂载（无 TLS 回退）。
-            let trust_bundle_mount = if state.config.ca_cert.is_some() {
-                " -v ./control-center.pem:/etc/wist-gateway/ca/control-center.pem:ro".to_string()
-            } else {
-                String::new()
-            };
-            // 服务端生成 curl 验证命令：Bearer 用置备引导 token + 网关自生成身份调 init_url。
-            let init_curl = format!(
-                "curl -H \"Authorization: Bearer {bootstrap_token}\" -H \"X-Gateway-Identity-Token: <gateway-identity>\" \"{init_endpoint}\""
-            );
-            let install = GatewayInstallInfo {
-                install_command: format!(
-                    "docker run -d --name wist-gateway-{gw} -e WIST_GATEWAY_INIT_URL={url} -e WIST_GATEWAY_BOOTSTRAP_TOKEN={token}{trust_mount} {image}",
-                    gw = stored.gateway_id,
-                    url = init_url,
-                    token = bootstrap_token,
-                    trust_mount = trust_bundle_mount,
-                    image = state.config.gateway_image
-                ),
-                cloud_image: state.config.gateway_image.clone(),
-                init_url,
-                setup_token: bootstrap_token,
-                trust_bundle_pem: state.config.ca_cert.clone(),
-                init_curl,
-            };
-            (
-                StatusCode::CREATED,
-                Json(AdminCreateGatewayInstanceReturned {
-                    instance: GatewayInstance {
-                        gateway_id: stored.gateway_id,
-                        instance_id: stored.instance_id,
-                        lifecycle_state: GatewayInstanceLifecycleState::Provisioned,
-                        created_at: DateTime::now(),
-                        initialized_at: None,
-                    },
-                    install,
-                }),
-            )
-                .into_response()
-        }
+    // 设计 §8：接入凭据**不在 create 响应里交付** —— create 只建实例；明文接入券由
+    // 「生成/轮换」（POST .../link-token）产出、页面一次性展示（短 TTL）。
+    match state.store.create_gateway(gateway_id, "").await {
+        Ok(stored) => (
+            StatusCode::CREATED,
+            Json(AdminCreateGatewayInstanceReturned {
+                instance: GatewayInstance {
+                    gateway_id: stored.gateway_id,
+                    instance_id: stored.instance_id,
+                    lifecycle_state: GatewayInstanceLifecycleState::Provisioned,
+                    created_at: DateTime::now(),
+                    initialized_at: None,
+                },
+            }),
+        )
+            .into_response(),
         Err(err) if err.reason() == &StoreReason::Conflict => (
             StatusCode::CONFLICT,
             format!("gateway {gateway_id} already exists"),
@@ -163,6 +111,128 @@ pub async fn admin_create_gateway_instance(
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("failed to create gateway: {err}"),
+        )
+            .into_response(),
+    }
+}
+
+/// 构造安装指引：init_url（不携带凭证）+ docker 安装命令 + 信任根挂载 + curl 验证命令。
+/// 由「生成/轮换」（link-token）端点使用；`link_token` 以明文随响应一次性交付。
+fn build_install_info(state: &ApiState, gateway_id: &str, link_token: &str) -> GatewayInstallInfo {
+    let init_endpoint = format!(
+        "{}/api/v1/gateway/link-upstream?gateway_id={}",
+        state.config.public_url.trim_end_matches('/'),
+        gateway_id
+    );
+    // init_url 不携带凭证：link token 不进 URL（避免泄露到历史/分享链接）。
+    let init_url = init_endpoint.clone();
+    // 信任根：config.toml 引用 /etc/wist-gateway/ca/control-center.pem，需把
+    // control-center.pem（trust_bundle_pem 内容落盘为 ./control-center.pem）挂载到该路径，
+    // 网关访问 HTTPS init_url 时才能校验中心 TLS 服务器证书。未配置 CA → 不挂载（无 TLS 回退）。
+    let trust_bundle_mount = if state.config.ca_cert.is_some() {
+        " -v ./control-center.pem:/etc/wist-gateway/ca/control-center.pem:ro".to_string()
+    } else {
+        String::new()
+    };
+    // 服务端生成 curl 验证命令：Bearer 用接入 token + 网关自生成身份调 init_url。
+    let init_curl = format!(
+        "curl -H \"Authorization: Bearer {link_token}\" -H \"X-Gateway-Identity-Token: <gateway-identity>\" \"{init_endpoint}\""
+    );
+    // 安装命令只负责把网关镜像拉起来（含信任根挂载）—— **不再向容器注入接入券/初始化 URL**：
+    // 首跑接入由宿主侧 `wist-gwlinkd` 承载（设计 `gateway-secure-registration.md` §6「集成发起方」），
+    // 容器启动本身不需要接入券。
+    GatewayInstallInfo {
+        install_command: format!(
+            "docker run -d --name wist-gateway-{gw}{trust_mount} {image}",
+            gw = gateway_id,
+            trust_mount = trust_bundle_mount,
+            image = state.config.gateway_image
+        ),
+        cloud_image: state.config.gateway_image.clone(),
+        init_url,
+        link_token: link_token.to_string(),
+        trust_bundle_pem: state.config.ca_cert.clone(),
+        init_curl,
+    }
+}
+
+/// 轮换接入券 请求体：`requested_by` 记录操作人（审计）。
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminRotateGatewayLinkTokenRequest {
+    pub requested_by: String,
+}
+
+/// 轮换/生成接入券 返回：新的安装指引（含一次性明文 `link_token`）+ 到期时刻。
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct AdminRotateGatewayLinkTokenReturned {
+    pub gateway_id: String,
+    pub install: GatewayInstallInfo,
+    /// 接入券到期时刻（RFC3339）——**短 TTL**，过期即不可用（需重新轮换）。
+    #[serde(default)]
+    pub link_expires_at: Option<String>,
+}
+
+/// 计算接入券到期时刻（RFC3339）：`security.link_ttl_seconds`（默认 15 分钟）。
+fn link_expires_at(ttl_seconds: i64) -> String {
+    (chrono::Utc::now() + chrono::Duration::seconds(ttl_seconds)).to_rfc3339()
+}
+
+/// 生成/轮换一次性接入券：POST /api/v1/admin/gateways/{gateway_id}/link-token。
+/// 生成新 LINK_TOKEN 并覆盖中心存的 hash + 短 TTL（旧券立即失效），明文仅随本次响应交付一次。
+pub async fn admin_rotate_gateway_link_token(
+    State(state): State<ApiState>,
+    Path(gateway_id): Path<String>,
+    headers: HeaderMap,
+    client: PeerConnectInfo,
+    Json(request): Json<AdminRotateGatewayLinkTokenRequest>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    let gateway_id = gateway_id.trim();
+    if gateway_id.is_empty() || request.requested_by.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "gateway_id and requested_by must not be empty",
+        )
+            .into_response();
+    }
+    let token = match crate::infra::new_secret_token("link") {
+        Ok(token) => token,
+        Err(reason) => return (StatusCode::INTERNAL_SERVER_ERROR, reason).into_response(),
+    };
+    let expires_at = link_expires_at(state.config.link_ttl_seconds);
+    match state
+        .store
+        .rotate_link_token(
+            gateway_id,
+            &crate::infra::sha256_hex(&token),
+            Some(expires_at.clone()),
+        )
+        .await
+    {
+        Ok(true) => {
+            let install = build_install_info(&state, gateway_id, &token);
+            (
+                StatusCode::OK,
+                Json(AdminRotateGatewayLinkTokenReturned {
+                    gateway_id: gateway_id.to_string(),
+                    install,
+                    link_expires_at: Some(expires_at),
+                }),
+            )
+                .into_response()
+        }
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            format!("gateway {gateway_id} not found"),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to rotate setup token: {err}"),
         )
             .into_response(),
     }
@@ -1076,6 +1146,7 @@ mod tests {
                 protocol_version: "1.0".to_string(),
                 hmac_secret: "test-hmac-secret".to_string(),
                 credential_ttl_seconds: 3600,
+                link_ttl_seconds: 900,
             },
             store: std::sync::Arc::new(test_store()),
             artifact_store: std::sync::Arc::new(crate::infra::LocalArtifactStore::new(
@@ -1223,6 +1294,7 @@ mod tests {
                 protocol_version: "1.0".to_string(),
                 hmac_secret: "test-hmac-secret".to_string(),
                 credential_ttl_seconds: 3600,
+                link_ttl_seconds: 900,
             },
             store: std::sync::Arc::new(store),
             artifact_store: std::sync::Arc::new(crate::infra::LocalArtifactStore::new(
@@ -1401,6 +1473,7 @@ mod tests {
                 protocol_version: "1.0".to_string(),
                 hmac_secret: "test-hmac-secret".to_string(),
                 credential_ttl_seconds: 3600,
+                link_ttl_seconds: 900,
             },
             store: std::sync::Arc::new(store),
             artifact_store: std::sync::Arc::new(crate::infra::LocalArtifactStore::new(
@@ -1415,7 +1488,38 @@ mod tests {
     }
 
     fn create_payload(gateway_name: &str) -> String {
-        format!(r#"{{"gateway_name":"{gateway_name}","requested_by":"test","token":"tok-create"}}"#)
+        format!(r#"{{"gateway_name":"{gateway_name}","requested_by":"test"}}"#)
+    }
+
+    /// POST 生成/轮换接入券，返回解析后的响应。
+    async fn rotate_link_token(
+        app: &axum::Router,
+        gateway_id: &str,
+    ) -> AdminRotateGatewayLinkTokenReturned {
+        use axum::{body::Body, http::Request};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/admin/gateways/{gateway_id}/link-token"))
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer admin-tok")
+                    .body(Body::from(r#"{"requested_by":"test"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        serde_json::from_slice(&body).expect("json")
     }
 
     #[tokio::test]
@@ -1460,16 +1564,7 @@ mod tests {
             returned.instance.lifecycle_state,
             GatewayInstanceLifecycleState::Provisioned
         );
-        assert!(returned.install.init_url.contains("link-upstream"));
-        assert!(returned.install.install_command.starts_with("docker run"));
-        assert_eq!(
-            returned.install.init_curl,
-            "curl -H \"Authorization: Bearer tok-create\" -H \"X-Gateway-Identity-Token: <gateway-identity>\" \"http://127.0.0.1:3100/api/v1/gateway/link-upstream?gateway_id=gw-create\""
-        );
-        assert_eq!(
-            returned.install.init_url,
-            "http://127.0.0.1:3100/api/v1/gateway/link-upstream?gateway_id=gw-create"
-        );
+        // 设计 §8：create 响应**不含**安装指引/接入凭据（券由「生成/轮换」产出）。
 
         // 实例列表公开可重复获取的初始化 URL，但不重复返回安装命令或凭证。
         let response = app
@@ -1548,6 +1643,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rotate_gateway_link_token_replaces_and_delivers_once() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("wic-rotate-{nanos}.json"));
+        let state = create_state_with_store(FileStore::new(&path));
+        let app = super::super::router_for(state);
+
+        // create 只建实例（**不签发/不交付券**）；接入券一律由「生成/轮换」产出。
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/admin/gateways/instances")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer admin-tok")
+                    .body(Body::from(create_payload("gw-rot")))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        // 首次「生成/轮换」→ 券1（一次性明文 + 到期时刻）。
+        let first = rotate_link_token(&app, "gw-rot").await;
+        assert_eq!(first.gateway_id, "gw-rot");
+        assert!(!first.install.link_token.is_empty());
+        assert!(first.link_expires_at.is_some(), "应带短 TTL 到期时刻");
+        assert_eq!(
+            first.install.init_url,
+            "http://127.0.0.1:3100/api/v1/gateway/link-upstream?gateway_id=gw-rot"
+        );
+
+        // 再次轮换 → 券2 ≠ 券1（旧券作废）。
+        let second = rotate_link_token(&app, "gw-rot").await;
+        assert_ne!(second.install.link_token, first.install.link_token);
+
+        // store 侧：券1 被覆盖（失效），券2 可消费（初始化置备用）。
+        let store = FileStore::new(&path);
+        assert!(
+            !store
+                .consume_link_token("gw-rot", &first.install.link_token)
+                .expect("consume old")
+        );
+        assert!(
+            store
+                .consume_link_token("gw-rot", &second.install.link_token)
+                .expect("consume new")
+        );
+
+        // 未知网关：不签发、返回 404。
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/admin/gateways/gw-missing/link-token")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer admin-tok")
+                    .body(Body::from(r#"{"requested_by":"test"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn create_gateway_instance_rejects_empty_name() {
         use axum::{body::Body, http::Request};
         use tower::ServiceExt;
@@ -1561,8 +1731,8 @@ mod tests {
         let app = super::super::router_for(state);
 
         for payload in [
-            r#"{"gateway_name":"  ","requested_by":"test","token":"tok"}"#,
-            r#"{"gateway_name":"gw-x","requested_by":"  ","token":"tok"}"#,
+            r#"{"gateway_name":"  ","requested_by":"test"}"#,
+            r#"{"gateway_name":"gw-x","requested_by":"  "}"#,
         ] {
             let response = app
                 .clone()
@@ -1615,6 +1785,7 @@ mod tests {
                 protocol_version: "1.0".to_string(),
                 hmac_secret: "test-hmac-secret".to_string(),
                 credential_ttl_seconds: 3600,
+                link_ttl_seconds: 900,
             },
             store: std::sync::Arc::new(store),
             artifact_store: std::sync::Arc::new(crate::infra::LocalArtifactStore::new(
@@ -1628,6 +1799,7 @@ mod tests {
         };
         let app = super::super::router_for(state);
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -1646,18 +1818,19 @@ mod tests {
             .await
             .expect("body")
             .to_bytes();
-        let returned: AdminCreateGatewayInstanceReturned =
+        let created: AdminCreateGatewayInstanceReturned =
             serde_json::from_slice(&body).expect("json");
-        // 证书内容随响应交付 + 安装命令挂载到 config.toml 引用的 trust_bundle 路径。
-        assert!(returned.install.trust_bundle_pem.is_some());
+        assert_eq!(created.instance.gateway_id, "gw-tb");
+        // 安装指引（含 CA 挂载 + 接入券）现在随「生成/轮换」交付，不在 create 响应里。
+        let rotated = rotate_link_token(&app, "gw-tb").await;
+        assert!(rotated.install.trust_bundle_pem.is_some());
         assert!(
-            returned
+            rotated
                 .install
                 .install_command
                 .contains("-v ./control-center.pem:/etc/wist-gateway/ca/control-center.pem:ro")
         );
-        // 置备引导 Token 随 create 响应交付一次（admin 页面展示）；config.toml 不再在 create 生成。
-        assert!(!returned.install.setup_token.is_empty());
+        assert!(!rotated.install.link_token.is_empty());
 
         let _ = std::fs::remove_file(path);
     }

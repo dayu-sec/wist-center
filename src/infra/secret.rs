@@ -52,12 +52,12 @@ mod tests {
 
     #[test]
     fn new_secret_token_has_prefix_and_is_unique() {
-        let token = new_secret_token("boot").expect("token");
-        assert!(token.starts_with("boot_"), "prefix mismatch: {token}");
-        assert_eq!(token.len(), "boot_".len() + 64, "expected 32 bytes hex");
-        assert_ne!(token, new_secret_token("boot").expect("token2"));
+        let token = new_secret_token("link").expect("token");
+        assert!(token.starts_with("link_"), "prefix mismatch: {token}");
+        assert_eq!(token.len(), "link_".len() + 64, "expected 32 bytes hex");
+        assert_ne!(token, new_secret_token("link").expect("token2"));
         assert_ne!(
-            new_secret_token("boot").expect("a"),
+            new_secret_token("link").expect("a"),
             new_secret_token("reg").expect("b")
         );
     }

@@ -41,6 +41,8 @@ victoriametrics_url = ""
 hmac_secret = "${WIST_CENTER_HMAC_SECRET}"
 # 网关客户端证书有效期秒数（register / renew 签出证书的 TTL）；2592000 = 30 天。
 credential_ttl_seconds = 2592000
+# 一次性接入券（link）的**短 TTL** 秒数：过期即不可用，需重新「生成/轮换」；900 = 15 分钟。
+link_ttl_seconds = 900
 # 控制中心 CA 证书（分发给网关作 control_center.trust_bundle）。
 # ${HOME} 由加载时展开（HOME 未设置会直接报错）；文件不存在 → 不提供信任根。
 ca_cert_path = "${HOME}/.wist-center/ca/control-center.pem"
