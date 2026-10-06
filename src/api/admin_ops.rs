@@ -505,7 +505,7 @@ pub async fn admin_list_gateway_instances(
 /// `expected_sha256`（可选）：核对读到的内容摘要，不符即拒；不给则只记录算出的摘要。
 /// `version`（可选）：**不填**就由包地址（文件名 / 包内目录名）自动解析，见 `infra/package.rs`；
 /// 填了会与解析出的版本**核对**（不一致 → 400）。
-/// 镜像后落库的文件名取内容寻址的 `pkg-<sha256[:16]>`。
+/// 镜像后落库 / 下发用**来源原名**（URL 末段）；内容寻址靠 `package_sha256` + 幂等。
 #[derive(serde::Deserialize)]
 pub struct PublishReleaseRequest {
     #[serde(default)]
@@ -516,26 +516,21 @@ pub struct PublishReleaseRequest {
     pub requested_by: String,
 }
 
-/// 从来源（路径 / URL）取归档扩展名（`.tar.gz` / `.tgz` / …）；取不到返回空串。
+/// 制品落盘 / 下发文件名：取来源（路径 / URL）的**末段原名**（去掉查询串 / fragment）。
 ///
-/// 内容寻址的文件名 = `pkg-<sha16>` + 该扩展名 —— 让 URL 末段仍是个**能用的文件名**，
-/// 否则下载下来是个无扩展名的裸文件（`pkg-955e0dc75215c3a6`）。
-fn artifact_extension(url: &str) -> &'static str {
-    let basename = url
-        .split(['?', '#'])
-        .next()
-        .unwrap_or(url)
-        .rsplit('/')
-        .next()
-        .unwrap_or("");
-    for suffix in [
-        ".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".tar", ".gz", ".zip", ".bin",
-    ] {
-        if basename.ends_with(suffix) {
-            return suffix;
-        }
+/// 用**原文件名**而非内容寻址 id：下发 URL 的末段就是原名（`galaxy-flow-…-musl.tar.gz`），
+/// 人看着清楚、下载即得可用文件。内容寻址退回 DB：`release_records.package_sha256`
+/// + `(component, version, sha)` 幂等去重。
+///
+/// 取不到 / 不安全（空、`.`、`..`、含分隔符）就回落 `{component}-{version}.bin`（防路径穿越）。
+fn artifact_filename(url: &str, component: &str, version: &str) -> String {
+    let leading = url.split(['?', '#']).next().unwrap_or(url);
+    let basename = leading.rsplit('/').next().unwrap_or("");
+    if basename.is_empty() || basename == "." || basename == ".." || basename.contains(['/', '\\'])
+    {
+        return format!("{component}-{version}.bin");
     }
-    ""
+    basename.to_string()
 }
 
 /// 发布版本：POST /api/v1/admin/releases/:component（wist-agentd / wist-gateway-stack / galaxy-ops / galaxy-flow）。
@@ -622,14 +617,9 @@ pub async fn admin_publish_release(
     {
         return Json(record.clone()).into_response();
     }
-    // 内容寻址：文件名取 `pkg-<sha256[:16]>`，**带上来源的归档扩展名**（与网关侧同式）。
-    // 带扩展名是为了让下发 URL 的末段是个能用的文件名（下载后系统/工具知道怎么解），
-    // 同时 URL 仍随内容变（同名同内容天然去重）。
-    let filename = format!(
-        "{}{}",
-        crate::infra::package_id_for_sha256(&package_sha256),
-        artifact_extension(&request.artifact_url),
-    );
+    // 落盘 / 下发文件名：**用来源原名**（URL 末段就是原名，人看着清楚）；
+    // 内容寻址不再靠文件名，而在 DB 的 `package_sha256` + `(component, version, sha)` 幂等。
+    let filename = artifact_filename(&request.artifact_url, &component, &version);
     let mirrored_url = match state
         .artifact_store
         .store(&component, &version, &filename, bytes)
@@ -1367,8 +1357,8 @@ mod tests {
         let record: serde_json::Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(record["package_sha256"], serde_json::json!(sha));
         assert_eq!(record["status"], serde_json::json!("published"));
-        // 内容寻址：文件名是 `pkg-<sha256[:16]>` + **原扩展名**（来源是 .tar.gz）。
-        let expected_leaf = format!("{}.tar.gz", crate::infra::package_id_for_sha256(&sha));
+        // 下发 URL 末段 = **来源原名**（内容寻址在 DB 的 `package_sha256`）。
+        let expected_leaf = pkg.file_name().unwrap().to_string_lossy().to_string();
         assert!(
             record["artifact_url"]
                 .as_str()
@@ -1525,8 +1515,10 @@ mod tests {
         let _ = std::fs::remove_file(pkg);
     }
 
+    /// 同一 `(component, version)` 的**同一份内容**（哪怕来源文件名不同）→ 幂等：返回同一条记录。
+    /// 内容寻址不在文件名上（文件名用来源原名），而在 `package_sha256` + `(component, version, sha)`。
     #[tokio::test]
-    async fn publish_release_is_content_addressed_across_sources() {
+    async fn publish_release_dedups_identical_content_by_digest() {
         use axum::{body::Body, http::Request};
         use http_body_util::BodyExt;
         use tower::ServiceExt;
@@ -1540,8 +1532,6 @@ mod tests {
         let second = dir.join(format!("wic-rel-b-{nanos}.bin"));
         std::fs::write(&first, b"same-content").expect("write a");
         std::fs::write(&second, b"same-content").expect("write b");
-        let sha = crate::infra::sha256_hex_bytes(b"same-content");
-        let leaf = crate::infra::package_id_for_sha256(&sha);
 
         let publish = |source: &std::path::Path, version: &str| {
             Request::builder()
@@ -1561,13 +1551,14 @@ mod tests {
         };
 
         let app = super::super::router_for(test_state());
-        let body_of = |response: axum::response::Response| async move {
-            response
+        let json_of = |response: axum::response::Response| async move {
+            let body = response
                 .into_body()
                 .collect()
                 .await
                 .expect("body")
-                .to_bytes()
+                .to_bytes();
+            serde_json::from_slice::<serde_json::Value>(&body).expect("json")
         };
 
         let response = app
@@ -1576,17 +1567,28 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
-        let first_url = String::from_utf8(body_of(response).await.to_vec()).expect("utf8");
-        assert!(first_url.contains(&leaf), "{first_url}");
+        let first_record = json_of(response).await;
+        // 文件名用来源原名。
+        let first_name = first.file_name().unwrap().to_string_lossy().to_string();
+        assert!(
+            first_record["artifact_url"]
+                .as_str()
+                .unwrap_or_default()
+                .ends_with(&first_name),
+            "{first_record}"
+        );
 
-        // 换来源、换版本号：内容寻址的文件名不变。
+        // 同一内容换一个来源文件名再发（同版本）→ 命中幂等，回同一条记录。
         let response = app
-            .oneshot(publish(&second, "0.1.33"))
+            .oneshot(publish(&second, "0.1.32"))
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
-        let second_url = String::from_utf8(body_of(response).await.to_vec()).expect("utf8");
-        assert!(second_url.contains(&leaf), "{second_url}");
+        let second_record = json_of(response).await;
+        assert_eq!(
+            first_record["artifact_url"], second_record["artifact_url"],
+            "同内容同版本 → 幂等，不落第二份"
+        );
 
         let _ = std::fs::remove_file(first);
         let _ = std::fs::remove_file(second);
@@ -1662,18 +1664,32 @@ mod tests {
         encoder.finish().expect("gzip finish")
     }
 
-    /// 取归档扩展名：URL 带查询串 / 本机路径都要认；认不出回空串。
+    /// 落盘 / 下发文件名：取来源末段原名（去查询串）；不安全 / 取不到 → 回落。
     #[test]
-    fn artifact_extension_reads_the_archive_suffix() {
+    fn artifact_filename_uses_the_source_basename_and_guards_paths() {
+        // 正常：URL / 路径的末段即原名。
         assert_eq!(
-            super::artifact_extension("https://x/gf-v0.1-aarch64-apple-darwin.tar.gz"),
-            ".tar.gz"
+            super::artifact_filename(
+                "https://github.com/galaxio-labs/galaxy-flow/releases/download/v0.16.1-alpha/galaxy-flow-v0.16.1-alpha-x86_64-unknown-linux-musl.tar.gz",
+                "galaxy-flow",
+                "v0.16.1-alpha",
+            ),
+            "galaxy-flow-v0.16.1-alpha-x86_64-unknown-linux-musl.tar.gz"
         );
-        assert_eq!(super::artifact_extension("https://x/p.tgz?sig=1"), ".tgz");
-        assert_eq!(super::artifact_extension("/opt/pkgs/thing.tar"), ".tar");
-        // 认不出（无扩展名）→ 空串，不硬拼一个。
-        assert_eq!(super::artifact_extension("https://x/pkg-abc"), "");
-        assert_eq!(super::artifact_extension("/opt/pkgs/thing"), "");
+        // 带查询串 / fragment 要剥掉。
+        assert_eq!(
+            super::artifact_filename("https://x/pkg.tar.gz?sig=1#frag", "c", "1.0"),
+            "pkg.tar.gz"
+        );
+        // 取不到 / 空 / 危险名（`.` `..`）→ 回落 `{component}-{version}.bin`，防路径穿越。
+        assert_eq!(
+            super::artifact_filename("https://x/dir/", "galaxy-ops", "1.2.3"),
+            "galaxy-ops-1.2.3.bin"
+        );
+        assert_eq!(
+            super::artifact_filename("/opt/pkgs/..", "galaxy-ops", "1.2.3"),
+            "galaxy-ops-1.2.3.bin"
+        );
     }
 
     #[tokio::test]

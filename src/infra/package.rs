@@ -35,12 +35,6 @@ impl std::fmt::Display for PackageError {
 
 impl std::error::Error for PackageError {}
 
-/// 内容寻址 id：`pkg-<sha256 前 16 位>`（裸 hex）。与网关侧同式。
-pub fn package_id_for_sha256(sha256_hex: &str) -> String {
-    let prefix: String = sha256_hex.chars().take(16).collect();
-    format!("pkg-{prefix}")
-}
-
 /// 读来源（**本机绝对路径** 或 https URL）→ 字节。
 ///
 /// 「本机路径」是允许且常见的：包可能就在中心机上、外网访问不到，或还在开发
@@ -262,13 +256,6 @@ mod tests {
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         std::io::Write::write_all(&mut encoder, &tar_bytes).expect("gzip write");
         encoder.finish().expect("gzip finish")
-    }
-
-    #[test]
-    fn package_id_is_stable_prefixed_and_digest_sized() {
-        let id = package_id_for_sha256("0123456789abcdef0123");
-        assert_eq!(id, "pkg-0123456789abcdef");
-        assert_eq!(id, package_id_for_sha256("0123456789abcdef0123"));
     }
 
     #[tokio::test]

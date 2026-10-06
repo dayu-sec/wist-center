@@ -5,6 +5,16 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.5.5-alpha] - 2026-10-06
+
+### 变更
+
+- **制品下发 URL 改用来源原名**（取代 0.5.4 的 `pkg-<sha16>.扩展名`）：落盘 / 下发文件名取来源末段
+  （`galaxy-flow-v0.16.1-alpha-x86_64-unknown-linux-musl.tar.gz`）—— URL 末段就是原名，人看着清楚、
+  下载即得可用文件。**内容寻址退回 DB**：`release_records.package_sha256` + `(component, version, sha)`
+  幂等去重（不再是文件名）。名字取不到 / 危险（`.`,`..`）→ 回落 `{component}-{version}.bin`（防路径穿越）。
+  相应地删掉不再用的 `infra::package_id_for_sha256`。
+
 ## [0.5.4-alpha] - 2026-10-06
 
 ### 修复
