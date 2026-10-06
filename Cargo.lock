@@ -3593,6 +3593,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 
 [[package]]
+name = "wist-artifact"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ea05a606b916e6b042975c8e4e4ad910ddbf0a05fe4c49afb50c5ce2b342f18b"
+dependencies = [
+ "reqwest",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "wist-center"
 version = "0.5.7"
 dependencies = [
@@ -3649,14 +3659,13 @@ dependencies = [
 
 [[package]]
 name = "wist-release"
-version = "0.2.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "581ada8fee4753d5124fc5cc4c592b1694fc96501efd7e036125fb629bce143b"
+checksum = "5f9ef3978bba8a8312d52c4aa56fd2915257cba09a15b836d6b32f7253ba49fd"
 dependencies = [
  "flate2",
- "reqwest",
- "ring",
  "tar",
+ "wist-artifact",
 ]
 
 [[package]]
