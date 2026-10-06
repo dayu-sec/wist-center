@@ -3,7 +3,12 @@
 use ring::{digest, hmac, rand as ring_rand};
 
 pub fn sha256_hex(value: &str) -> String {
-    hex_lower(digest::digest(&digest::SHA256, value.as_bytes()).as_ref())
+    sha256_hex_bytes(value.as_bytes())
+}
+
+/// 字节 sha256（裸 hex）。
+pub fn sha256_hex_bytes(bytes: &[u8]) -> String {
+    hex_lower(digest::digest(&digest::SHA256, bytes).as_ref())
 }
 
 /// 生成 32 字节随机 secret token：`"{prefix}_{hex}"`（镜像 wist-gateway）。

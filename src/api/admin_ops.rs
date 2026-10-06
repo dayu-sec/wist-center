@@ -498,42 +498,25 @@ pub async fn admin_list_gateway_instances(
     Json(instances).into_response()
 }
 
-/// 版本发布请求体：version + 外部 artifact_url（可能 GitHub/制品库，中心会下载镜像到本地/对象存储）。
+/// 版本发布请求体：**来源**（本机绝对路径 或 https URL；中心读进本地/对象存储镜像）。
+///
+/// `artifact_url` 沿用原名以兼容既有调用方，但其语义是**来源**（与 gateway 的 agent 包来源同口径）：
+/// 可以是 `/abs/path`，也可以是外部 URL。
+/// `expected_sha256`（可选）：核对读到的内容摘要，不符即拒；不给则只记录算出的摘要。
+/// `version`（可选）：**不填**就由包地址（文件名 / 包内目录名）自动解析，见 `infra/package.rs`；
+/// 填了会与解析出的版本**核对**（不一致 → 400）。
+/// 镜像后落库的文件名取内容寻址的 `pkg-<sha256[:16]>`。
 #[derive(serde::Deserialize)]
 pub struct PublishReleaseRequest {
-    pub version: String,
+    #[serde(default)]
+    pub version: Option<String>,
     pub artifact_url: String,
+    #[serde(default)]
+    pub expected_sha256: Option<String>,
     pub requested_by: String,
 }
 
-fn artifact_filename(url: &str, component: &str, version: &str) -> String {
-    url.split('/')
-        .next_back()
-        .filter(|segment| !segment.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("{component}-{version}.bin"))
-}
-
-async fn download_artifact(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|err| format!("download artifact failed: {err}"))?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "download artifact rejected: HTTP {}",
-            response.status()
-        ));
-    }
-    response
-        .bytes()
-        .await
-        .map(|bytes| bytes.to_vec())
-        .map_err(|err| format!("read artifact body failed: {err}"))
-}
-
-/// 发布版本：POST /api/v1/admin/releases/:component（wist-agentd / wist-gateway）。
+/// 发布版本：POST /api/v1/admin/releases/:component（wist-agentd / wist-gateway-stack / galaxy-ops / galaxy-flow）。
 /// 从外部 artifact_url 下载制品 → 镜像到本地文件/对象存储 → 返回快的下载地址。
 pub async fn admin_publish_release(
     State(state): State<ApiState>,
@@ -546,32 +529,82 @@ pub async fn admin_publish_release(
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
         return response;
     }
-    if request.version.trim().is_empty()
-        || request.artifact_url.trim().is_empty()
-        || request.requested_by.trim().is_empty()
-    {
+    if request.artifact_url.trim().is_empty() || request.requested_by.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            "version, artifact_url and requested_by must not be empty",
+            "artifact_url and requested_by must not be empty",
         )
             .into_response();
     }
-    let bytes = match download_artifact(crate::infra::vm::shared_vm_client(), &request.artifact_url)
-        .await
-    {
-        Ok(bytes) => bytes,
-        Err(err) => {
+    // 读来源（本机绝对路径 / https URL）+ 校验期望摘要（空串视同未给）。
+    let expected_sha256 = request
+        .expected_sha256
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let (bytes, package_sha256) =
+        match crate::infra::read_verified_package(&request.artifact_url, expected_sha256).await {
+            Ok(verified) => verified,
+            Err(err) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    format!("failed to fetch artifact: {err}"),
+                )
+                    .into_response();
+            }
+        };
+    // 从包里读身份：包内目录名，读不出再回落来源文件名。
+    // 覆盖 agentd 包（目录名带身份）与 gateway-stack / galaxy-ops / galaxy-flow 包（文件名带版本）。
+    let (package_version, _arch) =
+        crate::infra::read_package_identity(&request.artifact_url, &bytes);
+    // 版本以**包自报为准**，不让运维手输：
+    // - 请求带了 version → 与自报版本**核对**（不一致 → 400）；
+    // - 请求没带 version → 直接用自报版本；
+    // - 两边都没有 → 400（包名里没版本号，请用带版本的文件名）。
+    let declared_version = request
+        .version
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let version = match declared_version {
+        Some(declared) => {
+            if !package_version.is_empty()
+                && crate::infra::normalize_version(declared)
+                    != crate::infra::normalize_version(&package_version)
+            {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "version mismatch: request declares {declared} but the package self-reports {package_version}"
+                    ),
+                )
+                    .into_response();
+            }
+            declared.to_string()
+        }
+        None if !package_version.is_empty() => package_version,
+        None => {
             return (
-                StatusCode::BAD_GATEWAY,
-                format!("failed to fetch artifact: {err}"),
+                StatusCode::BAD_REQUEST,
+                "cannot derive version from the package: use an artifact whose name carries a version, or pass `version` explicitly",
             )
                 .into_response();
         }
     };
-    let filename = artifact_filename(&request.artifact_url, &component, &request.version);
+    // 同一 (component, version) 已镜像过**同一份内容** → 幂等返回，不重复下副本。
+    if let Ok(existing) = state.store.list_releases(&component).await
+        && let Some(record) = existing.iter().find(|record| {
+            record.version == version
+                && record.package_sha256.as_deref() == Some(package_sha256.as_str())
+        })
+    {
+        return Json(record.clone()).into_response();
+    }
+    // 内容寻址：文件名取 `pkg-<sha256[:16]>`（与网关侧同式），同名同内容天然去重。
+    let filename = crate::infra::package_id_for_sha256(&package_sha256);
     let mirrored_url = match state
         .artifact_store
-        .store(&component, &request.version, &filename, bytes)
+        .store(&component, &version, &filename, bytes)
         .await
     {
         Ok(url) => url,
@@ -585,7 +618,7 @@ pub async fn admin_publish_release(
     };
     let record = match state
         .store
-        .publish_release(&component, &request.version, &mirrored_url)
+        .publish_release(&component, &version, &mirrored_url, Some(&package_sha256))
         .await
     {
         Ok(record) => record,
@@ -1045,6 +1078,7 @@ fn gateway_runtime_status(stored: &StoredGateway) -> GatewayRuntimeStatus {
             .unwrap_or_else(|| "unknown".to_string()),
         memory_bytes: stored.memory_bytes,
         cpu_percent: stored.cpu_percent,
+        public_base_url: stored.public_base_url.clone(),
         last_seen_at: stored.last_seen_at.clone().unwrap_or_else(DateTime::now),
         uptime_seconds: stored.uptime_seconds,
         agent_count: stored.agent_count,
@@ -1252,6 +1286,352 @@ mod tests {
         assert_eq!(returned["window"], "1h");
         assert_eq!(returned["step_seconds"], 60);
         assert_eq!(returned["samples"], serde_json::json!([]));
+    }
+
+    /// 发布可以拿**本机绝对路径**当来源（与 gateway 的 agent 包同口径）；期望摘要一致则落记录，
+    /// 不符则 502 且不落记录。
+    #[tokio::test]
+    async fn publish_release_accepts_a_local_path_and_verifies_the_expected_digest() {
+        use axum::{body::Body, http::Request};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let pkg = std::env::temp_dir().join(format!("wic-rel-{nanos}.tar.gz"));
+        std::fs::write(&pkg, b"artifact-bytes").expect("write");
+        let source = pkg.to_string_lossy().to_string();
+        let sha = crate::infra::sha256_hex_bytes(b"artifact-bytes");
+
+        let publish = |version: &str, expected: &str| {
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/admin/releases/wist-gateway-stack")
+                .header("authorization", "Bearer admin-tok")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "version": version,
+                        "artifact_url": source,
+                        "expected_sha256": expected,
+                        "requested_by": "tester",
+                    })
+                    .to_string(),
+                ))
+                .expect("request")
+        };
+
+        let app = super::super::router_for(test_state());
+        let response = app
+            .clone()
+            .oneshot(publish("0.1.27", &sha))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let record: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(record["package_sha256"], serde_json::json!(sha));
+        assert_eq!(record["status"], serde_json::json!("published"));
+        // 内容寻址：镜像后的文件名是 `pkg-<sha256[:16]>`（与网关侧同式）。
+        let expected_leaf = crate::infra::package_id_for_sha256(&sha);
+        assert!(
+            record["artifact_url"]
+                .as_str()
+                .unwrap_or_default()
+                .ends_with(&format!(
+                    "/api/v1/releases/artifact/wist-gateway-stack/0.1.27/{expected_leaf}"
+                )),
+            "{record}"
+        );
+
+        // 期望摘要不符 → 502，且**不落**记录。
+        let bad = app
+            .oneshot(publish("0.1.28", "deadbeef"))
+            .await
+            .expect("response");
+        assert_eq!(bad.status(), StatusCode::BAD_GATEWAY);
+
+        let _ = std::fs::remove_file(pkg);
+    }
+
+    /// gateway-stack 包（顶层 `sys/…`，无包装目录）：身份来自**文件名**，版本核对同样生效。
+    #[tokio::test]
+    async fn publish_release_reads_gateway_stack_identity_from_the_filename() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("wic-stack-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let pkg = dir.join("wist-gateway-stack-v0.1.17.tar.gz");
+        let bytes = tar_gz_with_entry("sys/sys_model.yml", b"model");
+        std::fs::write(&pkg, &bytes).expect("write");
+        let source = pkg.to_string_lossy().to_string();
+
+        let publish = |version: &str| {
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/admin/releases/wist-gateway-stack")
+                .header("authorization", "Bearer admin-tok")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "version": version,
+                        "artifact_url": source,
+                        "requested_by": "tester",
+                    })
+                    .to_string(),
+                ))
+                .expect("request")
+        };
+
+        let app = super::super::router_for(test_state());
+        // 声明 0.1.18，文件名说 v0.1.17 → 400。
+        let mismatched = app
+            .clone()
+            .oneshot(publish("0.1.18"))
+            .await
+            .expect("response");
+        assert_eq!(mismatched.status(), StatusCode::BAD_REQUEST);
+
+        // 声明 0.1.17（与文件名归一化后一致）→ 放行。
+        let ok = app.oneshot(publish("0.1.17")).await.expect("response");
+        assert_eq!(ok.status(), StatusCode::OK);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 不传 `version`：从**文件名**自动解析（例：galaxy-flow 的发布包）。
+    #[tokio::test]
+    async fn publish_release_derives_version_from_the_artifact_name() {
+        use axum::{body::Body, http::Request};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("wic-derive-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let pkg = dir.join("galaxy-flow-v0.16.1-alpha-x86_64-unknown-linux-musl.tar.gz");
+        std::fs::write(&pkg, b"flow-bytes").expect("write");
+        let source = pkg.to_string_lossy().to_string();
+
+        let app = super::super::router_for(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/admin/releases/galaxy-flow")
+                    .header("authorization", "Bearer admin-tok")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "artifact_url": source,
+                            "requested_by": "tester",
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let record: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(record["version"], serde_json::json!("v0.16.1-alpha"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 既不传 `version`、文件名又没有版本号 → 400（不静默落一个空版本）。
+    #[tokio::test]
+    async fn publish_release_rejects_when_version_cannot_be_derived() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let pkg = std::env::temp_dir().join(format!("wic-novers-{nanos}.tar.gz"));
+        std::fs::write(&pkg, b"payload").expect("write");
+
+        let app = super::super::router_for(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/admin/releases/galaxy-flow")
+                    .header("authorization", "Bearer admin-tok")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "artifact_url": pkg.to_string_lossy(),
+                            "requested_by": "tester",
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let _ = std::fs::remove_file(pkg);
+    }
+
+    #[tokio::test]
+    async fn publish_release_is_content_addressed_across_sources() {
+        use axum::{body::Body, http::Request};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir = std::env::temp_dir();
+        let first = dir.join(format!("wic-rel-a-{nanos}.bin"));
+        let second = dir.join(format!("wic-rel-b-{nanos}.bin"));
+        std::fs::write(&first, b"same-content").expect("write a");
+        std::fs::write(&second, b"same-content").expect("write b");
+        let sha = crate::infra::sha256_hex_bytes(b"same-content");
+        let leaf = crate::infra::package_id_for_sha256(&sha);
+
+        let publish = |source: &std::path::Path, version: &str| {
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/admin/releases/wist-agentd")
+                .header("authorization", "Bearer admin-tok")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "version": version,
+                        "artifact_url": source.to_string_lossy(),
+                        "requested_by": "tester",
+                    })
+                    .to_string(),
+                ))
+                .expect("request")
+        };
+
+        let app = super::super::router_for(test_state());
+        let body_of = |response: axum::response::Response| async move {
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes()
+        };
+
+        let response = app
+            .clone()
+            .oneshot(publish(&first, "0.1.32"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let first_url = String::from_utf8(body_of(response).await.to_vec()).expect("utf8");
+        assert!(first_url.contains(&leaf), "{first_url}");
+
+        // 换来源、换版本号：内容寻址的文件名不变。
+        let response = app
+            .oneshot(publish(&second, "0.1.33"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let second_url = String::from_utf8(body_of(response).await.to_vec()).expect("utf8");
+        assert!(second_url.contains(&leaf), "{second_url}");
+
+        let _ = std::fs::remove_file(first);
+        let _ = std::fs::remove_file(second);
+    }
+
+    /// 包内自报版本与声明版本不符 → 400 拒录；归一化后一致（带 `v`）→ 放行。
+    #[tokio::test]
+    async fn publish_release_cross_checks_the_declared_version_against_the_package() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let pkg = std::env::temp_dir().join(format!("wic-rel-id-{nanos}.tar.gz"));
+        let bytes = tar_gz_with_entry(
+            "wist-agentd-0.1.32-x86_64-unknown-linux-gnu/wist-agentd",
+            b"agentd-0.1.32",
+        );
+        std::fs::write(&pkg, &bytes).expect("write");
+        let source = pkg.to_string_lossy().to_string();
+
+        let publish = |version: &str| {
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/admin/releases/wist-agentd")
+                .header("authorization", "Bearer admin-tok")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "version": version,
+                        "artifact_url": source,
+                        "requested_by": "tester",
+                    })
+                    .to_string(),
+                ))
+                .expect("request")
+        };
+
+        let app = super::super::router_for(test_state());
+        // 声明 0.1.99，包内自报 0.1.32 → 400，且不落记录。
+        let mismatched = app
+            .clone()
+            .oneshot(publish("0.1.99"))
+            .await
+            .expect("response");
+        assert_eq!(mismatched.status(), StatusCode::BAD_REQUEST);
+
+        // 带 `v` 前缀、与包内自报归一化后一致 → 放行。
+        let ok = app.oneshot(publish("v0.1.32")).await.expect("response");
+        assert_eq!(ok.status(), StatusCode::OK);
+
+        let _ = std::fs::remove_file(pkg);
+    }
+
+    /// 造一个只含单条目的 gzip+tar（顶层目录名 + 一个文件），用于验包身份解析。
+    fn tar_gz_with_entry(entry: &str, payload: &[u8]) -> Vec<u8> {
+        let mut tar_bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_bytes);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(payload.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, entry, payload)
+                .expect("append tar entry");
+            builder.finish().expect("finish tar");
+        }
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, &tar_bytes).expect("gzip write");
+        encoder.finish().expect("gzip finish")
     }
 
     #[tokio::test]

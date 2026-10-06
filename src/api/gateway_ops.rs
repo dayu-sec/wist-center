@@ -261,6 +261,15 @@ pub async fn register_gateway(
     {
         eprintln!("warn mark gateway initializing failed: {err}");
     }
+    // 注册即带上网关对外域名 → 中心第一时间记下（早于第一拍状态上报）；不带则跳过。
+    if let Some(public_base_url) = input.public_base_url.as_deref()
+        && let Err(err) = state
+            .store
+            .set_gateway_public_base_url(&consumed.gateway_id, public_base_url)
+            .await
+    {
+        eprintln!("warn set gateway public_base_url failed: {err}");
+    }
     rate_limit::clear_auth_failures(&state, &client_key, GATEWAY_REGISTER_SCOPE);
     Json(GatewayEnrollmentResult {
         status: "accepted".to_string(),
@@ -324,12 +333,20 @@ async fn upgrade_plan_for(
         // 现模型的 `GatewayUpgradePlan` 只承载**单组件**目标；多组件计划这里取第一个
         // （要精确到组件，需把 `GatewayUpgradePlan` 扩成列表，届时同步发 `wist-control`）。
         let target = plan.targets.first();
+        // 地址由中心**派生**（反查已发布的 release 记录），不让运维手输。
+        let artifact_url = match target {
+            Some(target) => {
+                resolve_release_artifact_url(state, &target.component, &target.target_version).await
+            }
+            None => None,
+        };
         return Ok(GatewayUpgradePlan {
             gateway_id: gateway_id.to_string(),
             has_plan: true,
             plan_id: Some(plan.plan_id.clone()),
             component: target.map(|target| target.component.clone()),
             to_version: target.map(|target| target.target_version.clone()),
+            artifact_url,
         });
     }
     Ok(GatewayUpgradePlan {
@@ -338,7 +355,25 @@ async fn upgrade_plan_for(
         plan_id: None,
         component: None,
         to_version: None,
+        artifact_url: None,
     })
+}
+
+/// 反查该组件该版本**已发布的制品下发地址**（镜像后的绝对 URL）；无对应 release 记录则 `None`
+/// （执行器会回落用 `to_version`）。
+///
+/// 地址由中心派生，不让运维手输 —— 与 agent 包同款教训（手输的路径会漂到别的机器上）。
+/// 见设计 `wist-design/doc/design/edge/gateway-upgrade-and-releases.md`。
+async fn resolve_release_artifact_url(
+    state: &ApiState,
+    component: &str,
+    version: &str,
+) -> Option<String> {
+    let releases = state.store.list_releases(component).await.ok()?;
+    releases
+        .into_iter()
+        .find(|release| release.version == version)
+        .map(|release| release.artifact_url)
 }
 
 /// 升级结果回执：`POST /api/v1/gateway/upgrade-result`（mTLS 客户端证书）。见 CR-002 C2。
@@ -600,6 +635,7 @@ pub async fn submit_gateway_status(
                 health: input.health.clone(),
                 memory_bytes: input.memory_bytes,
                 cpu_percent: input.cpu_percent,
+                public_base_url: input.public_base_url.clone(),
                 last_seen_at: accepted_at.clone(),
                 uptime_seconds: input.uptime_seconds,
                 agent_count: input.agent_count,
@@ -1381,6 +1417,39 @@ mod tests {
         let plan: GatewayUpgradePlan = serde_json::from_slice(&body).expect("json");
         assert_eq!(plan.gateway_id, "gw-001");
         assert!(!plan.has_plan);
+    }
+
+    /// 升级目标里的 `artifact_url` 由中心**反查已发布的 release** 派生；无对应记录那么为 `None`
+    /// （执行器回落用 `to_version`）。
+    #[tokio::test]
+    async fn release_artifact_url_is_derived_from_the_published_release() {
+        let state = provision_state("link-tok-release");
+        let url = "https://center.example/api/v1/releases/artifact/wist-gateway-stack/0.1.27/wist-gateway-stack-0.1.27.tar.gz";
+
+        assert!(
+            super::resolve_release_artifact_url(&state, "wist-gateway-stack", "0.1.27")
+                .await
+                .is_none(),
+            "没发布过 → None"
+        );
+
+        state
+            .store
+            .publish_release("wist-gateway-stack", "0.1.27", url, None)
+            .await
+            .expect("publish release");
+        assert_eq!(
+            super::resolve_release_artifact_url(&state, "wist-gateway-stack", "0.1.27")
+                .await
+                .as_deref(),
+            Some(url)
+        );
+        assert!(
+            super::resolve_release_artifact_url(&state, "wist-gateway-stack", "9.9.9")
+                .await
+                .is_none(),
+            "版本不符 → None"
+        );
     }
 
     fn register_payload(token: &str) -> String {

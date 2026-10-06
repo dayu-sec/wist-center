@@ -641,6 +641,7 @@ mod tests {
             health: health.to_string(),
             memory_bytes: Some(536_870_912),
             cpu_percent: Some(21.5),
+            public_base_url: None,
             last_seen_at: DateTime::from_rfc3339("2026-08-08T12:00:00Z").expect("ts"),
             uptime_seconds: Some(3_600),
             agent_count: Some(4),

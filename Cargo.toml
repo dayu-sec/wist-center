@@ -3,7 +3,7 @@
 
 [package]
 name = "wist-center"
-version = "0.5.2" #@gxl:set(version)
+version = "0.5.3" #@gxl:set(version)
 edition = "2024"
 
 [dependencies]
@@ -19,7 +19,8 @@ async-trait = "0.1"
 aws-sdk-s3 = "1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
 sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "tls-none", "chrono"] }
-wist-control =  "0.8"
+wist-control =  "0.9"
+#wist-control = { version = "0.9", path = "../wist-control" }
 wist-error =  "0.1"
 
 # 网关客户端证书（mTLS）签发：中心当 CA-G，按网关 CSR 签「每网关一张」客户端证书。
@@ -27,6 +28,11 @@ wist-error =  "0.1"
 rcgen = { version = "0.13", features = ["x509-parser"] }
 x509-parser = "0.16"
 time = { version = "0.3", features = ["std"] }
+
+# 读安装包顶层目录名，取 version/arch 自述（与网关侧 install_package.rs 同口径）。
+# flate2 默认走纯 Rust 后端（miniz_oxide），不引入 C 依赖。
+flate2 = "1"
+tar = "0.4"
 
 # 中心服务端 TLS/mTLS：服务器证书（CA-S）+ 校网关客户端证书（CA-G）。
 # 与网关侧 infra/tls.rs 同构（WebPkiClientVerifier + allow_unauthenticated、握手后取客户端叶证书）。

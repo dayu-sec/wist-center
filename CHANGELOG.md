@@ -5,6 +5,31 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.5.3-alpha] - 2026-10-06
+
+### Added
+- **记下网关对外域名**：注册（`POST /api/v1/gateway/register`）与周期状态上报
+  （`POST /api/v1/gateway/status`）带来的 `public_base_url` 落库；`GatewayRuntimeStatus` 视图回带，
+  网关列表据此展示「域名」。状态上报不带（老网关 `None`）时**保留**已落值，不抹掉。
+- **升级计划带中心派生的制品地址**：网关拉取升级目标（`GET /api/v1/gateway/upgrade-plan`）时，
+  中心按 `(component, target_version)` **反查已发布的 release**，把镜像后的绝对地址放进
+  `GatewayUpgradePlan.artifact_url`；执行器据此取件。无对应 release（未发布过）则不带 → 网关回落用版本。
+- **升级包管理向 gateway 的 agent 包对齐**：发布（`POST /api/v1/admin/releases/:component`）的来源
+  现在既接 **https URL** 也接**本机绝对路径**；读到的内容算 **sha256** 并落库
+  （`release_records.package_sha256`），可带可选 `expected_sha256` **核对**（不符 502、不落记录）；
+  同一 `(component, version)` 的同一份内容重复发布按**幂等**返回（不重复下副本）。
+  内核在 `src/infra/package.rs`（**刻意与 gateway 重复**，见文件头 NOTE 与设计 §7）。
+- **版本号不再手输，由包地址自动解析**：发布（`POST /api/v1/admin/releases/:component`）的 `version`
+  改为**可选** —— 不传就从包内目录名 / 来源文件名解析（`read_package_identity`），传了才与解析值**核对**
+  （归一化 `v` 后不符 → 400）；两边都解析不出 → 400（不静默落空版本）。身份解析**不写死组件名**，
+  先看包内首条目目录名、读不出再回落来源文件名 —— 覆盖 **agentd 包**（目录名带 version+triple）、
+  **gateway-stack 包**（顶层 `sys/…`，只能从文件名读）、**galaxy-ops / galaxy-flow 包**。
+  镜像后落库的文件名取内容寻址的 **`pkg-<sha256[:16]>`**（与网关侧同式）。依赖新增 `flate2` / `tar`。
+
+### Changed
+- **依赖**：`wist-control` `0.8` → `0.9`。`gateways` 表加列 `public_base_url`
+  （`docker/initdb/01_schema.sql` 幂等补列）。
+
 ## [0.5.2-alpha] - 2026-10-06
 
 ### Changed

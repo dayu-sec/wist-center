@@ -48,6 +48,7 @@ struct GatewayRow {
     health: Option<String>,
     memory_bytes: Option<i64>,
     cpu_percent: Option<f64>,
+    public_base_url: Option<String>,
     uptime_seconds: Option<i64>,
     agent_count: Option<i64>,
     online_agents: Option<i64>,
@@ -123,6 +124,7 @@ impl GatewayRow {
             health: self.health,
             memory_bytes: self.memory_bytes,
             cpu_percent: self.cpu_percent,
+            public_base_url: self.public_base_url,
             uptime_seconds: self.uptime_seconds,
             agent_count: self.agent_count,
             online_agents: self.online_agents,
@@ -234,6 +236,7 @@ fn parse_optional_timestamptz(value: &Option<String>) -> Option<chrono::DateTime
 const GATEWAY_COLUMNS: &str = "gateway_id, instance_id, credential_token_hash, \
                                credential_status, credential_expires_at, link_token_hash, \
                                link_token_expires_at, version, status, health, memory_bytes, cpu_percent, \
+                               public_base_url, \
                                uptime_seconds, agent_count, online_agents, offline_agents, last_seen_lag_seconds, \
                                store_bytes, ingest_accepted_total, ingest_rejected_total, last_ingest_at, \
                                memory_total_bytes, load_1m, load_5m, load_15m, \
@@ -297,6 +300,7 @@ impl Store for PgStore {
             "UPDATE gateways \
              SET instance_id = $2, version = $3, status = $4, health = $5, \
                  memory_bytes = $6, cpu_percent = $7, \
+                 public_base_url = COALESCE($25, public_base_url), \
                  uptime_seconds = $8, agent_count = $9, online_agents = $10, \
                  offline_agents = $11, last_seen_lag_seconds = $12, \
                  store_bytes = $13, ingest_accepted_total = $14, ingest_rejected_total = $15, \
@@ -337,6 +341,7 @@ impl Store for PgStore {
         .bind(update.disk_total_bytes)
         .bind(update.disk_available_bytes)
         .bind(last_seen_at)
+        .bind(update.public_base_url.as_deref())
         .execute(&self.pool)
         .await
         .source_raw_err(StoreReason::Sql, "upsert gateway status")?;
@@ -349,6 +354,20 @@ impl Store for PgStore {
             )
             .await?;
         }
+        Ok(())
+    }
+
+    async fn set_gateway_public_base_url(
+        &self,
+        gateway_id: &str,
+        public_base_url: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query("UPDATE gateways SET public_base_url = $2 WHERE gateway_id = $1")
+            .bind(gateway_id)
+            .bind(public_base_url)
+            .execute(&self.pool)
+            .await
+            .source_raw_err(StoreReason::Sql, "set gateway public_base_url")?;
         Ok(())
     }
 
@@ -700,15 +719,17 @@ impl Store for PgStore {
         component: &str,
         version: &str,
         artifact_url: &str,
+        package_sha256: Option<&str>,
     ) -> Result<ReleaseRecord, StoreError> {
         let published_at = chrono::Utc::now();
         sqlx::query(
-            "INSERT INTO release_records (component, version, artifact_url, status, published_at) \
-             VALUES ($1, $2, $3, 'published', $4)",
+            "INSERT INTO release_records (component, version, artifact_url, package_sha256, status, published_at) \
+             VALUES ($1, $2, $3, $4, 'published', $5)",
         )
         .bind(component)
         .bind(version)
         .bind(artifact_url)
+        .bind(package_sha256)
         .bind(published_at)
         .execute(&self.pool)
         .await
@@ -716,6 +737,7 @@ impl Store for PgStore {
         Ok(ReleaseRecord {
             version: version.to_string(),
             artifact_url: artifact_url.to_string(),
+            package_sha256: package_sha256.map(str::to_string),
             status: "published".to_string(),
             published_at: DateTime::from_rfc3339(&published_at.to_rfc3339())
                 .unwrap_or_else(DateTime::now),
@@ -724,7 +746,7 @@ impl Store for PgStore {
 
     async fn list_releases(&self, component: &str) -> Result<Vec<ReleaseRecord>, StoreError> {
         let rows: Vec<ReleaseRow> = sqlx::query_as(
-            "SELECT version, artifact_url, status, published_at FROM release_records \
+            "SELECT version, artifact_url, package_sha256, status, published_at FROM release_records \
              WHERE component = $1 ORDER BY published_at DESC",
         )
         .bind(component)
@@ -856,6 +878,7 @@ impl Store for PgStore {
 struct ReleaseRow {
     version: String,
     artifact_url: String,
+    package_sha256: Option<String>,
     status: String,
     published_at: chrono::DateTime<chrono::Utc>,
 }
@@ -865,6 +888,7 @@ impl ReleaseRow {
         ReleaseRecord {
             version: self.version,
             artifact_url: self.artifact_url,
+            package_sha256: self.package_sha256,
             status: self.status,
             published_at: DateTime::from_rfc3339(&self.published_at.to_rfc3339())
                 .unwrap_or_else(DateTime::now),
@@ -960,6 +984,7 @@ mod tests {
                 health: "healthy".to_string(),
                 memory_bytes: Some(1_073_741_824),
                 cpu_percent: Some(18.2),
+                public_base_url: None,
                 last_seen_at: reported_at.clone(),
                 uptime_seconds: None,
                 agent_count: None,

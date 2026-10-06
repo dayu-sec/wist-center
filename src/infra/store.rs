@@ -39,7 +39,7 @@ pub struct CenterStoreSnapshot {
     pub agents: HashMap<String, StoredAgent>,
     /// 网关生命周期转变历史（key = gateway_id，有界保留最近 ~100 条）。
     pub lifecycle_events: HashMap<String, Vec<LifecycleEvent>>,
-    /// 版本发布记录（key = component，如 wist-agentd / wist-gateway）。
+    /// 版本发布记录（key = component，如 wist-agentd / wist-gateway-stack）。
     pub releases: HashMap<String, Vec<ReleaseRecord>>,
     /// 升级计划（按创建顺序，新→旧）。
     pub upgrade_plans: Vec<UpgradePlanRecord>,
@@ -119,6 +119,9 @@ pub struct UpgradePlanRecord {
 pub struct ReleaseRecord {
     pub version: String,
     pub artifact_url: String,
+    /// 制品内容的 sha256（裸 hex）。录入时算出 / 校验；老记录为 `None`。
+    #[serde(default)]
+    pub package_sha256: Option<String>,
     pub status: String,
     pub published_at: DateTime,
 }
@@ -158,6 +161,10 @@ pub struct StoredGateway {
     pub memory_bytes: Option<i64>,
     #[serde(default)]
     pub cpu_percent: Option<f64>,
+    /// 网关**对外基址**（对外域名，管理面「对外地址」‖`[server] public_base_url`）。
+    /// 来自注册 / 状态上报，留最新一份；中心据此知道该网关对外域名。
+    #[serde(default)]
+    pub public_base_url: Option<String>,
     // 网关状态富化（机队聚合 + 进程运行时长）；见设计 edge/gateway-status-report.md。
     #[serde(default)]
     pub uptime_seconds: Option<i64>,
@@ -221,6 +228,7 @@ impl StoredGateway {
             health: None,
             memory_bytes: None,
             cpu_percent: None,
+            public_base_url: None,
             uptime_seconds: None,
             agent_count: None,
             online_agents: None,
@@ -278,6 +286,7 @@ pub struct GatewayStatusUpdate {
     pub health: String,
     pub memory_bytes: Option<i64>,
     pub cpu_percent: Option<f64>,
+    pub public_base_url: Option<String>,
     pub last_seen_at: DateTime,
     // 富化（可选）。
     pub uptime_seconds: Option<i64>,
@@ -311,6 +320,13 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     async fn get_gateway(&self, gateway_id: &str) -> Result<Option<StoredGateway>, StoreError>;
     /// 落库最新上报状态（仅更新已接入网关，与 FileStore 的 update 语义一致）。
     async fn upsert_gateway_status(&self, update: &GatewayStatusUpdate) -> Result<(), StoreError>;
+
+    /// 记下/刷新网关的**对外域名**（注册时即落，早于第一拍状态上报）。
+    async fn set_gateway_public_base_url(
+        &self,
+        gateway_id: &str,
+        public_base_url: &str,
+    ) -> Result<(), StoreError>;
     /// 创建网关实例：gateway_id 已存在 → `Err(Conflict)`；否则以空 instance_id 接入。
     /// token 非空则存 `sha256(token)`，空 token → 空 hash（无凭证网关无法上报）。
     async fn create_gateway(
@@ -385,12 +401,13 @@ pub trait Store: Send + Sync + std::fmt::Debug {
         &self,
         gateway_id: &str,
     ) -> Result<Vec<LifecycleEvent>, StoreError>;
-    /// 记录一次版本发布（component = wist-agentd / wist-gateway），返回记录。
+    /// 记录一次版本发布（component = wist-agentd / wist-gateway-stack），返回记录。
     async fn publish_release(
         &self,
         component: &str,
         version: &str,
         artifact_url: &str,
+        package_sha256: Option<&str>,
     ) -> Result<ReleaseRecord, StoreError>;
     /// 查询某组件的历史发布记录（新→旧）。
     async fn list_releases(&self, component: &str) -> Result<Vec<ReleaseRecord>, StoreError>;
@@ -805,10 +822,12 @@ impl FileStore {
         component: &str,
         version: &str,
         artifact_url: &str,
+        package_sha256: Option<&str>,
     ) -> Result<ReleaseRecord, StoreError> {
         let record = ReleaseRecord {
             version: version.to_string(),
             artifact_url: artifact_url.to_string(),
+            package_sha256: package_sha256.map(str::to_string),
             status: "published".to_string(),
             published_at: DateTime::now(),
         };
@@ -1019,6 +1038,10 @@ impl Store for FileStore {
                     stored.health = Some(update.health.clone());
                     stored.memory_bytes = update.memory_bytes;
                     stored.cpu_percent = update.cpu_percent;
+                    // 只在新值非空时覆盖：老网关的状态上报不带域名，不该把注册时落下的抹掉。
+                    if let Some(url) = update.public_base_url.clone() {
+                        stored.public_base_url = Some(url);
+                    }
                     stored.uptime_seconds = update.uptime_seconds;
                     stored.agent_count = update.agent_count;
                     stored.online_agents = update.online_agents;
@@ -1062,8 +1085,21 @@ impl Store for FileStore {
         gateway_id: &str,
         token: &str,
     ) -> Result<StoredGateway, StoreError> {
-        // 显式调用同步固有方法，避免与 trait 方法同名递归。
+        // 显式调用同步固有方法，避兔与 trait 方法同名递归。
         FileStore::create_gateway(self, gateway_id, token)
+    }
+
+    async fn set_gateway_public_base_url(
+        &self,
+        gateway_id: &str,
+        public_base_url: &str,
+    ) -> Result<(), StoreError> {
+        self.update(|snapshot| {
+            if let Some(stored) = snapshot.gateways.get_mut(gateway_id) {
+                stored.public_base_url = Some(public_base_url.to_string());
+            }
+        })?;
+        Ok(())
     }
 
     async fn create_enrollment_token(
@@ -1162,8 +1198,9 @@ impl Store for FileStore {
         component: &str,
         version: &str,
         artifact_url: &str,
+        package_sha256: Option<&str>,
     ) -> Result<ReleaseRecord, StoreError> {
-        FileStore::publish_release(self, component, version, artifact_url)
+        FileStore::publish_release(self, component, version, artifact_url, package_sha256)
     }
 
     async fn list_releases(&self, component: &str) -> Result<Vec<ReleaseRecord>, StoreError> {
@@ -1467,6 +1504,92 @@ mod tests {
             .expect("create no credential");
         assert_eq!(stored.link_token_hash, "");
         assert_eq!(stored.credential_token_hash, "");
+
+        let _ = fs::remove_file(path);
+    }
+
+    /// 网关对外域名：注册时落下；状态上报带 `None`（老网关）时**保留**已落值，带值时覆盖。
+    #[tokio::test]
+    async fn gateway_public_base_url_set_then_preserved_and_overwritten() {
+        fn update(gateway_id: &str, public_base_url: Option<&str>) -> GatewayStatusUpdate {
+            GatewayStatusUpdate {
+                gateway_id: gateway_id.to_string(),
+                instance_id: "i".to_string(),
+                version: "0.1.26".to_string(),
+                status: "online".to_string(),
+                health: "ok".to_string(),
+                memory_bytes: None,
+                cpu_percent: None,
+                public_base_url: public_base_url.map(str::to_string),
+                last_seen_at: DateTime::now(),
+                uptime_seconds: None,
+                agent_count: None,
+                online_agents: None,
+                offline_agents: None,
+                last_seen_lag_seconds: None,
+                store_bytes: None,
+                ingest_accepted_total: None,
+                ingest_rejected_total: None,
+                last_ingest_at: None,
+                memory_total_bytes: None,
+                load_1m: None,
+                load_5m: None,
+                load_15m: None,
+                disk_usage_percent: None,
+                disk_total_bytes: None,
+                disk_available_bytes: None,
+            }
+        }
+
+        let path = test_store_path();
+        let store = FileStore::new(&path);
+        store.create_gateway("gw-url", "link-x").expect("create");
+
+        // 注册（早于第一拍状态上报）即落下域名。
+        store
+            .set_gateway_public_base_url("gw-url", "https://gw.example.com")
+            .await
+            .expect("set");
+        let stored = store
+            .get_gateway("gw-url")
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(
+            stored.public_base_url.as_deref(),
+            Some("https://gw.example.com")
+        );
+
+        // 老网关的状态上报不带域名（None）→ 保留已落值，不抹掉。
+        store
+            .upsert_gateway_status(&update("gw-url", None))
+            .await
+            .expect("upsert without url");
+        let stored = store
+            .get_gateway("gw-url")
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(
+            stored.public_base_url.as_deref(),
+            Some("https://gw.example.com"),
+            "None 不该抹掉注册时落的值"
+        );
+
+        // 带域名上报 → 覆盖为新值。
+        store
+            .upsert_gateway_status(&update("gw-url", Some("https://new.example.com")))
+            .await
+            .expect("upsert with url");
+        let stored = store
+            .get_gateway("gw-url")
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(
+            stored.public_base_url.as_deref(),
+            Some("https://new.example.com")
+        );
 
         let _ = fs::remove_file(path);
     }
