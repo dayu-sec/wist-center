@@ -780,12 +780,18 @@ pub async fn admin_get_gateway_initial_config(
     .into_response()
 }
 
-/// 创建升级计划请求体：多组件目标版本 + 网关范围 + 多步执行。
+/// 创建升级计划请求体：多组件目标版本 + 网关范围 + **阶段数**。
+///
+/// 灰度阶段由**中心服务端**按阶梯（1 个金丝雀 → 10% → 30% → 70% → 全量）自动切出，
+/// 不再由前端传 `steps` —— 阶梯口径只有一份（共享 crate `wist-release::rollout`），
+/// 且落在服务端才能保证「阶段互不重叠、一把铺满」不是只在界面上成立。
 #[derive(serde::Deserialize)]
 pub struct CreateUpgradePlanRequest {
     pub targets: Vec<UpgradeTarget>,
     pub gateway_ids: Vec<String>,
-    pub steps: Vec<UpgradeStep>,
+    /// 分几段灰度（1 = 不分批，一把到位）。可用段数受台数限制，见
+    /// `wist_release::rollout::available_phase_counts`。
+    pub phase_count: usize,
     pub requested_by: String,
 }
 
@@ -816,6 +822,19 @@ pub async fn admin_create_upgrade_plan(
         )
             .into_response();
     }
+    // 阶段切分：服务端权威。目标为空 / 阶段数为 0 / 阶段数大于台数都在这里被拒。
+    let steps = match wist_release::rollout::plan_phases(&request.gateway_ids, request.phase_count)
+    {
+        Ok(phases) => phases
+            .into_iter()
+            .map(|phase| UpgradeStep {
+                step_index: phase.index as i64,
+                gateway_ids: phase.target_ids,
+                status: "pending".to_string(),
+            })
+            .collect(),
+        Err(reason) => return (StatusCode::BAD_REQUEST, reason).into_response(),
+    };
     let plan_id = format!(
         "plan-{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -826,7 +845,7 @@ pub async fn admin_create_upgrade_plan(
         target_count: request.gateway_ids.len() as i64,
         status: "pending".to_string(),
         created_at: DateTime::now(),
-        steps: request.steps,
+        steps,
         approved_by: None,
         approved_at: None,
     };
@@ -1265,6 +1284,113 @@ mod tests {
             rate_limits: std::sync::Arc::new(std::sync::Mutex::new(
                 super::super::rate_limit::RateLimitState::default(),
             )),
+        }
+    }
+
+    /// 灰度阶段由**服务端**按阶梯切：客户端只给网关范围与阶段数，不再传 `steps`。
+    #[tokio::test]
+    async fn create_upgrade_plan_splits_phases_on_the_server() {
+        use axum::{body::Body, http::Request};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let gateway_ids: Vec<String> = (1..=10).map(|i| format!("gw-{i:03}")).collect();
+        let app = super::super::router_for(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/admin/upgrade-plans")
+                    .header("authorization", "Bearer admin-tok")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "targets": [{
+                                "component": "wist-gateway-stack",
+                                "target_version": "0.1.28",
+                            }],
+                            "gateway_ids": gateway_ids,
+                            "phase_count": 3,
+                            "requested_by": "tester",
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let plan: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let steps = plan["steps"].as_array().expect("steps");
+        let sizes: Vec<usize> = steps
+            .iter()
+            .map(|step| step["gateway_ids"].as_array().expect("ids").len())
+            .collect();
+        // 10 台 × 3 阶段：金丝雀 1 → 到 10% 再 1 → 余 8。
+        assert_eq!(sizes, vec![1, 1, 8]);
+        assert_eq!(steps[0]["step_index"], 1);
+        assert_eq!(steps[0]["status"], "pending");
+        // 阶段之间互不重叠，且一把铺满。
+        let mut all: Vec<String> = steps
+            .iter()
+            .flat_map(|step| {
+                step["gateway_ids"]
+                    .as_array()
+                    .expect("ids")
+                    .iter()
+                    .map(|id| id.as_str().expect("id").to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), 10);
+    }
+
+    /// 阶段数不可用（0 / 大于台数）→ **400**，而不是给一个空阶段。
+    #[tokio::test]
+    async fn create_upgrade_plan_rejects_impossible_phase_counts() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        for phase_count in [0, 11] {
+            let app = super::super::router_for(test_state());
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/admin/upgrade-plans")
+                        .header("authorization", "Bearer admin-tok")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "targets": [{
+                                    "component": "wist-gateway-stack",
+                                    "target_version": "0.1.28",
+                                }],
+                                "gateway_ids": (1..=10)
+                                    .map(|i| format!("gw-{i:03}"))
+                                    .collect::<Vec<_>>(),
+                                "phase_count": phase_count,
+                                "requested_by": "tester",
+                            })
+                            .to_string(),
+                        ))
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "phase_count {phase_count}"
+            );
         }
     }
 

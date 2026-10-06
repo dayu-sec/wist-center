@@ -3,7 +3,7 @@
 
 [package]
 name = "wist-center"
-version = "0.5.6" #@gxl:set(version)
+version = "0.5.7" #@gxl:set(version)
 edition = "2024"
 
 [dependencies]
