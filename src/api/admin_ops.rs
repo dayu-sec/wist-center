@@ -516,6 +516,28 @@ pub struct PublishReleaseRequest {
     pub requested_by: String,
 }
 
+/// 从来源（路径 / URL）取归档扩展名（`.tar.gz` / `.tgz` / …）；取不到返回空串。
+///
+/// 内容寻址的文件名 = `pkg-<sha16>` + 该扩展名 —— 让 URL 末段仍是个**能用的文件名**，
+/// 否则下载下来是个无扩展名的裸文件（`pkg-955e0dc75215c3a6`）。
+fn artifact_extension(url: &str) -> &'static str {
+    let basename = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .rsplit('/')
+        .next()
+        .unwrap_or("");
+    for suffix in [
+        ".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".tar", ".gz", ".zip", ".bin",
+    ] {
+        if basename.ends_with(suffix) {
+            return suffix;
+        }
+    }
+    ""
+}
+
 /// 发布版本：POST /api/v1/admin/releases/:component（wist-agentd / wist-gateway-stack / galaxy-ops / galaxy-flow）。
 /// 从外部 artifact_url 下载制品 → 镜像到本地文件/对象存储 → 返回快的下载地址。
 pub async fn admin_publish_release(
@@ -600,8 +622,14 @@ pub async fn admin_publish_release(
     {
         return Json(record.clone()).into_response();
     }
-    // 内容寻址：文件名取 `pkg-<sha256[:16]>`（与网关侧同式），同名同内容天然去重。
-    let filename = crate::infra::package_id_for_sha256(&package_sha256);
+    // 内容寻址：文件名取 `pkg-<sha256[:16]>`，**带上来源的归档扩展名**（与网关侧同式）。
+    // 带扩展名是为了让下发 URL 的末段是个能用的文件名（下载后系统/工具知道怎么解），
+    // 同时 URL 仍随内容变（同名同内容天然去重）。
+    let filename = format!(
+        "{}{}",
+        crate::infra::package_id_for_sha256(&package_sha256),
+        artifact_extension(&request.artifact_url),
+    );
     let mirrored_url = match state
         .artifact_store
         .store(&component, &version, &filename, bytes)
@@ -1339,8 +1367,8 @@ mod tests {
         let record: serde_json::Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(record["package_sha256"], serde_json::json!(sha));
         assert_eq!(record["status"], serde_json::json!("published"));
-        // 内容寻址：镜像后的文件名是 `pkg-<sha256[:16]>`（与网关侧同式）。
-        let expected_leaf = crate::infra::package_id_for_sha256(&sha);
+        // 内容寻址：文件名是 `pkg-<sha256[:16]>` + **原扩展名**（来源是 .tar.gz）。
+        let expected_leaf = format!("{}.tar.gz", crate::infra::package_id_for_sha256(&sha));
         assert!(
             record["artifact_url"]
                 .as_str()
@@ -1632,6 +1660,20 @@ mod tests {
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         std::io::Write::write_all(&mut encoder, &tar_bytes).expect("gzip write");
         encoder.finish().expect("gzip finish")
+    }
+
+    /// 取归档扩展名：URL 带查询串 / 本机路径都要认；认不出回空串。
+    #[test]
+    fn artifact_extension_reads_the_archive_suffix() {
+        assert_eq!(
+            super::artifact_extension("https://x/gf-v0.1-aarch64-apple-darwin.tar.gz"),
+            ".tar.gz"
+        );
+        assert_eq!(super::artifact_extension("https://x/p.tgz?sig=1"), ".tgz");
+        assert_eq!(super::artifact_extension("/opt/pkgs/thing.tar"), ".tar");
+        // 认不出（无扩展名）→ 空串，不硬拼一个。
+        assert_eq!(super::artifact_extension("https://x/pkg-abc"), "");
+        assert_eq!(super::artifact_extension("/opt/pkgs/thing"), "");
     }
 
     #[tokio::test]
