@@ -1,14 +1,14 @@
 // 密钥工具：sha256 / 随机 token / RegistToken 派生（与 wist-gateway 一致的实现）。
 
-use ring::{digest, hmac, rand as ring_rand};
+use ring::{hmac, rand as ring_rand};
 
 pub fn sha256_hex(value: &str) -> String {
     sha256_hex_bytes(value.as_bytes())
 }
 
-/// 字节 sha256（裸 hex）。
+/// 字节 sha256（裸 hex）—— 直接委托共享 crate（口径与网关侧同一份）。
 pub fn sha256_hex_bytes(bytes: &[u8]) -> String {
-    hex_lower(digest::digest(&digest::SHA256, bytes).as_ref())
+    wist_release::package::sha256_hex_bytes(bytes)
 }
 
 /// 生成 32 字节随机 secret token：`"{prefix}_{hex}"`（镜像 wist-gateway）。

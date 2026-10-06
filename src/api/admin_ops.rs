@@ -516,22 +516,9 @@ pub struct PublishReleaseRequest {
     pub requested_by: String,
 }
 
-/// 制品落盘 / 下发文件名：取来源（路径 / URL）的**末段原名**（去掉查询串 / fragment）。
-///
-/// 用**原文件名**而非内容寻址 id：下发 URL 的末段就是原名（`galaxy-flow-…-musl.tar.gz`），
-/// 人看着清楚、下载即得可用文件。内容寻址退回 DB：`release_records.package_sha256`
-/// + `(component, version, sha)` 幂等去重。
-///
-/// 取不到 / 不安全（空、`.`、`..`、含分隔符）就回落 `{component}-{version}.bin`（防路径穿越）。
-fn artifact_filename(url: &str, component: &str, version: &str) -> String {
-    let leading = url.split(['?', '#']).next().unwrap_or(url);
-    let basename = leading.rsplit('/').next().unwrap_or("");
-    if basename.is_empty() || basename == "." || basename == ".." || basename.contains(['/', '\\'])
-    {
-        return format!("{component}-{version}.bin");
-    }
-    basename.to_string()
-}
+// 制品落盘 / 下发文件名（取来源末段原名，危险名 / 取不到就回落 `{component}-{version}.bin`）
+// 已收进共享 crate `wist-release`，经 `crate::infra::artifact_filename` 转出 —— 本文件直接调它，
+// 不再自留一份（原先这里的副本是抽取时漏删的）。
 
 /// 发布版本：POST /api/v1/admin/releases/:component（wist-agentd / wist-gateway-stack / galaxy-ops / galaxy-flow）。
 /// 从外部 artifact_url 下载制品 → 镜像到本地文件/对象存储 → 返回快的下载地址。
@@ -545,6 +532,15 @@ pub async fn admin_publish_release(
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
         return response;
+    }
+    // 组件名要拼进制品目录（`{artifact_dir}/{component}/{version}/{filename}`）与下发 URL：
+    // 必须是**真的只有一段**，否则 `..` / 绝对路径会逃出制品目录。
+    if !crate::infra::is_safe_path_segment(&component) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "component must be a single safe path segment",
+        )
+            .into_response();
     }
     if request.artifact_url.trim().is_empty() || request.requested_by.trim().is_empty() {
         return (
@@ -619,7 +615,15 @@ pub async fn admin_publish_release(
     }
     // 落盘 / 下发文件名：**用来源原名**（URL 末段就是原名，人看着清楚）；
     // 内容寻址不再靠文件名，而在 DB 的 `package_sha256` + `(component, version, sha)` 幂等。
-    let filename = artifact_filename(&request.artifact_url, &component, &version);
+    // 版本号同样会拼进目录 —— 手输的那份也要过同一道关。
+    if !crate::infra::is_safe_path_segment(&version) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "version must be a single safe path segment",
+        )
+            .into_response();
+    }
+    let filename = crate::infra::artifact_filename(&request.artifact_url, &component, &version);
     let mirrored_url = match state
         .artifact_store
         .store(&component, &version, &filename, bytes)
@@ -661,6 +665,14 @@ pub async fn admin_list_releases(
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
         return response;
+    }
+    // 与发布侧同一套口径：写不进去的组件名（不是单一段），也不该能被查到。
+    if !crate::infra::is_safe_path_segment(&component) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "component must be a single safe path segment",
+        )
+            .into_response();
     }
     let releases = match state.store.list_releases(&component).await {
         Ok(releases) => releases,
@@ -1306,6 +1318,56 @@ mod tests {
         assert_eq!(returned["samples"], serde_json::json!([]));
     }
 
+    /// 组件名 / 版本号会拼进制品目录（`{artifact_dir}/{component}/{version}/{filename}`）：
+    /// 不是「安全路径段」就 400，不许把 `..` 写到目录外。
+    #[tokio::test]
+    async fn publish_release_rejects_escaping_component_and_version() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let pkg = std::env::temp_dir().join(format!("wic-escape-{nanos}.tar.gz"));
+        std::fs::write(&pkg, b"escape-bytes").expect("write");
+        let source = pkg.to_string_lossy().to_string();
+
+        let publish = |component: &str, version: serde_json::Value| {
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/admin/releases/{component}"))
+                .header("authorization", "Bearer admin-tok")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "artifact_url": source,
+                        "version": version,
+                        "requested_by": "tester",
+                    })
+                    .to_string(),
+                ))
+                .expect("request")
+        };
+
+        let app = super::super::router_for(test_state());
+        // 版本号带路径分隔符（body 里不会被路径解析吃掉，这条是硬的）→ 400。
+        let bad_version = app
+            .clone()
+            .oneshot(publish("wist-gateway-stack", serde_json::json!("../../0")))
+            .await
+            .expect("response");
+        assert_eq!(bad_version.status(), StatusCode::BAD_REQUEST);
+
+        // 组件名就是 `..`（路由段，不经解码）→ 400。
+        let bad_component = app
+            .oneshot(publish("..", serde_json::json!(null)))
+            .await
+            .expect("response");
+        assert_eq!(bad_component.status(), StatusCode::BAD_REQUEST);
+        let _ = std::fs::remove_file(&pkg);
+    }
+
     /// 发布可以拿**本机绝对路径**当来源（与 gateway 的 agent 包同口径）；期望摘要一致则落记录，
     /// 不符则 502 且不落记录。
     #[tokio::test]
@@ -1662,34 +1724,6 @@ mod tests {
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         std::io::Write::write_all(&mut encoder, &tar_bytes).expect("gzip write");
         encoder.finish().expect("gzip finish")
-    }
-
-    /// 落盘 / 下发文件名：取来源末段原名（去查询串）；不安全 / 取不到 → 回落。
-    #[test]
-    fn artifact_filename_uses_the_source_basename_and_guards_paths() {
-        // 正常：URL / 路径的末段即原名。
-        assert_eq!(
-            super::artifact_filename(
-                "https://github.com/galaxio-labs/galaxy-flow/releases/download/v0.16.1-alpha/galaxy-flow-v0.16.1-alpha-x86_64-unknown-linux-musl.tar.gz",
-                "galaxy-flow",
-                "v0.16.1-alpha",
-            ),
-            "galaxy-flow-v0.16.1-alpha-x86_64-unknown-linux-musl.tar.gz"
-        );
-        // 带查询串 / fragment 要剥掉。
-        assert_eq!(
-            super::artifact_filename("https://x/pkg.tar.gz?sig=1#frag", "c", "1.0"),
-            "pkg.tar.gz"
-        );
-        // 取不到 / 空 / 危险名（`.` `..`）→ 回落 `{component}-{version}.bin`，防路径穿越。
-        assert_eq!(
-            super::artifact_filename("https://x/dir/", "galaxy-ops", "1.2.3"),
-            "galaxy-ops-1.2.3.bin"
-        );
-        assert_eq!(
-            super::artifact_filename("/opt/pkgs/..", "galaxy-ops", "1.2.3"),
-            "galaxy-ops-1.2.3.bin"
-        );
     }
 
     #[tokio::test]

@@ -19,6 +19,24 @@ pub trait ArtifactStore: Send + Sync + std::fmt::Debug {
     ) -> Result<String, String>;
 }
 
+/// 三段都必须是真的「一段」（非空、非 `.` / `..`、无分隔符与控制字符），否则 `Path::join`
+/// 与对象存储 key 会逃出目标目录。调用方（管理面 / 下载路由）已各自校验过，这里是存储层的**兜底**：
+/// 存储层不该依赖调用方记得校验。
+fn validate_segments(component: &str, version: &str, filename: &str) -> Result<(), String> {
+    for (label, value) in [
+        ("component", component),
+        ("version", version),
+        ("filename", filename),
+    ] {
+        if !wist_release::package::is_safe_path_segment(value) {
+            return Err(format!(
+                "{label} must be a single safe path segment, got {value:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// 本地文件存储：写 `{artifact_dir}/{component}/{version}/{filename}`，
 /// 下载地址由 center 的制品下载服务提供。
 #[derive(Debug)]
@@ -45,6 +63,7 @@ impl ArtifactStore for LocalArtifactStore {
         filename: &str,
         bytes: Vec<u8>,
     ) -> Result<String, String> {
+        validate_segments(component, version, filename)?;
         let dir = self.dir.join(component).join(version);
         fs::create_dir_all(&dir).map_err(|err| format!("create artifact dir failed: {err}"))?;
         fs::write(dir.join(filename), &bytes)
@@ -102,6 +121,7 @@ impl ArtifactStore for ObjectStorageArtifactStore {
     ) -> Result<String, String> {
         use aws_sdk_s3::primitives::ByteStream;
 
+        validate_segments(component, version, filename)?;
         let key = format!("{component}/{version}/{filename}");
         self.client
             .put_object()
@@ -131,4 +151,68 @@ pub fn build_artifact_store(config: &CenterConfig) -> Arc<dyn ArtifactStore> {
         config.artifact_dir.clone(),
         &config.public_url,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn local_store() -> (LocalArtifactStore, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "wist-center-artifacts-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        (
+            LocalArtifactStore::new(dir.clone(), "https://127.0.0.1:3100"),
+            dir,
+        )
+    }
+
+    #[tokio::test]
+    async fn store_writes_the_expected_layout_and_returns_the_download_url() {
+        let (store, dir) = local_store();
+        let url = store
+            .store(
+                "wist-gateway-stack",
+                "0.1.17",
+                "gw.tar.gz",
+                b"bytes".to_vec(),
+            )
+            .await
+            .expect("store");
+        assert_eq!(
+            url,
+            "https://127.0.0.1:3100/api/v1/releases/artifact/wist-gateway-stack/0.1.17/gw.tar.gz"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("wist-gateway-stack/0.1.17/gw.tar.gz")).expect("read back"),
+            b"bytes"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn store_refuses_escaping_segments() {
+        // 存储层的兜底：即便调用方忘了校验，后端也不接受能逃出制品目录的段。
+        let (store, dir) = local_store();
+        for (component, version, filename) in [
+            ("../etc", "0.1.0", "x.bin"),
+            ("wist-gateway-stack", "../..", "x.bin"),
+            ("wist-gateway-stack", "0.1.0", "../../x.bin"),
+            ("", "0.1.0", "x.bin"),
+            (".", "0.1.0", "x.bin"),
+            ("wist-gateway-stack", "0.1.0", "a\\b"),
+        ] {
+            let err = store
+                .store(component, version, filename, b"bytes".to_vec())
+                .await
+                .expect_err("unsafe segments must be refused");
+            assert!(err.contains("must be a single safe path segment"), "{err}");
+        }
+        // 一个文件都不该落盘（连目录都不该建）。
+        assert!(!dir.exists(), "{} should not exist", dir.display());
+    }
 }

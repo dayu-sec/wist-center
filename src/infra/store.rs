@@ -1372,6 +1372,7 @@ fn sync_directory(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -1769,10 +1770,13 @@ mod tests {
     }
 
     fn test_store_path() -> PathBuf {
+        // 纳秒 + 进程内原子序号：光靠纳秒在并行跑测试时会撞同一路径（撞上就变成随机失败）。
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time")
             .as_nanos();
-        std::env::temp_dir().join(format!("wist-center-store-test-{nanos}.json"))
+        let sequence = COUNTER.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!("wist-center-store-test-{nanos}-{sequence}.json"))
     }
 }

@@ -114,10 +114,20 @@ fn vm_client() -> &'static reqwest::Client {
 }
 
 /// 下载本地镜像的制品：GET /api/v1/releases/artifact/:component/:version/:filename。
+///
+/// ⚠️ 本条路由**未鉴权**（设计文档已记），而三段都直接拼进本机路径 —— 所以这里必须把
+/// 不是「安全路径段」的段（`..`、`%2F` 解出来的分隔符…）当作**找不到**：不给 400/404 的
+/// 区别，免得给探测者一个 oracle。
 pub async fn download_release_artifact(
     State(state): State<ApiState>,
     Path((component, version, filename)): Path<(String, String, String)>,
 ) -> Response {
+    if !crate::infra::is_safe_path_segment(&component)
+        || !crate::infra::is_safe_path_segment(&version)
+        || !crate::infra::is_safe_path_segment(&filename)
+    {
+        return (StatusCode::NOT_FOUND, "artifact not found").into_response();
+    }
     let path = state
         .config
         .artifact_dir
@@ -2024,5 +2034,64 @@ mod tests {
             GatewayInstanceLifecycleState::Initializing
         );
         assert!(status.initialized);
+    }
+
+    /// 制品下载路由**未鉴权**（设计文档已记），三段直接拼本机路径 —— 必须堵住 `..`：
+    /// 能下到制品目录里的真制品，但下不到目录之外的文件。
+    #[tokio::test]
+    async fn download_release_artifact_refuses_to_escape_the_artifact_dir() {
+        let artifact_dir = std::env::temp_dir().join("wic-artifacts");
+        let inside = artifact_dir.join("wist-gateway-stack/0.1.17");
+        std::fs::create_dir_all(&inside).expect("create artifact dir");
+        std::fs::write(inside.join("pkg.tar.gz"), b"pkg-bytes").expect("write artifact");
+
+        // 制品目录**外**的文件：放在 `artifact_dir/../wic-secret/x.txt`（一层 `..` 就出去）。
+        let outside = std::env::temp_dir().join("wic-secret");
+        std::fs::create_dir_all(&outside).expect("create outside dir");
+        std::fs::write(outside.join("x.txt"), b"SECRET").expect("write secret");
+
+        let app = super::super::router_for(test_state());
+
+        // 对照组：同形状的合法三段能正常下载（证明 404 是拦截，不是路由不匹配）。
+        let ok = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/releases/artifact/wist-gateway-stack/0.1.17/pkg.tar.gz")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(
+            &ok.into_body().collect().await.expect("body").to_bytes()[..],
+            b"pkg-bytes"
+        );
+
+        // `component = ..` → 必须 404，且正文不能是那个文件的内容。
+        let escaped = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/releases/artifact/../wic-secret/x.txt")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(escaped.status(), StatusCode::NOT_FOUND);
+        let body = escaped
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        assert!(
+            !body.windows(6).any(|window| window == b"SECRET"),
+            "artifact download must not leak files outside the artifact dir"
+        );
+
+        let _ = std::fs::remove_dir_all(&inside);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }
