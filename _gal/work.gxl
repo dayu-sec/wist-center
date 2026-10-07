@@ -3,8 +3,8 @@ extern mod rust,ver { path = "@{PATH}"; }
 mod envs  {
    env _common  : rust_env.init   {
     root      = ".";
-    prj_key   = "wist-gateway" ;
-    target_name = "wist-gateway";
+    prj_key   = "wist-center" ;
+    target_name = "wist-center";
 
   }
 
@@ -45,7 +45,6 @@ mod main  {
   #[task(name="pub to local")]
   flow _pub_local   {
     gx.cmd (  "mkdir -p ${MAIN_HOME_BIN}" );
-    gx.cmd (  "cp ${MAIN_BLD_BINS}/jumo ${MAIN_HOME_BIN}/"  );
-    gx.cmd (  "cp ${MAIN_BLD_BINS}/jumo-studio ${MAIN_HOME_BIN}/"  );
+    gx.cmd (  "cp ${MAIN_BLD_BINS}/wist-center ${MAIN_HOME_BIN}/"  );
   }
 }
