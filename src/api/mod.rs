@@ -20,15 +20,17 @@ mod admin_auth;
 mod admin_ops;
 mod gateway_ops;
 mod rate_limit;
+mod rollout;
 
 use admin_ops::{
-    admin_approve_upgrade_plan, admin_bind_gateway_customer, admin_create_gateway_instance,
-    admin_create_upgrade_plan, admin_dispatch_agent_fleet_command, admin_dispatch_global_policy,
-    admin_get_agent_history, admin_get_gateway_history, admin_get_gateway_initial_config,
-    admin_get_gateway_uptime, admin_list_gateway_agents, admin_list_gateway_instances,
-    admin_list_gateway_lifecycle, admin_list_gateway_status, admin_list_releases,
-    admin_list_upgrade_plans, admin_publish_release, admin_rotate_gateway_link_token,
-    admin_show_gateway_status, admin_view_gateway_list,
+    admin_advance_upgrade_plan, admin_approve_upgrade_plan, admin_bind_gateway_customer,
+    admin_create_gateway_instance, admin_create_upgrade_plan, admin_dispatch_agent_fleet_command,
+    admin_dispatch_global_policy, admin_get_agent_history, admin_get_gateway_history,
+    admin_get_gateway_initial_config, admin_get_gateway_uptime, admin_list_gateway_agents,
+    admin_list_gateway_instances, admin_list_gateway_lifecycle, admin_list_gateway_status,
+    admin_list_releases, admin_list_upgrade_plans, admin_publish_release,
+    admin_rotate_gateway_link_token, admin_show_gateway_status, admin_view_gateway_list,
+    admin_view_upgrade_plan,
 };
 use gateway_ops::{
     download_release_artifact, get_gateway_initial_config, get_gateway_upgrade_plan,
@@ -248,14 +250,23 @@ pub fn router_for(state: ApiState) -> Router {
             "/api/v1/releases/artifact/{component}/{version}/{filename}",
             get(download_release_artifact),
         )
-        // 管理面：升级计划（创建/列表/批准，多目标+范围+多步执行）
+        // 管理面：灰度发布计划（模型 `Control.Rollout`；创建/列表/批准/推进/查看，阶段由服务端切，
+        // 路径与网关同一套）
         .route(
-            "/api/v1/admin/upgrade-plans",
+            "/api/v1/admin/rollout-plans",
             post(admin_create_upgrade_plan).get(admin_list_upgrade_plans),
         )
         .route(
-            "/api/v1/admin/upgrade-plans/approve",
+            "/api/v1/admin/rollout-plans/approve",
             post(admin_approve_upgrade_plan),
+        )
+        .route(
+            "/api/v1/admin/rollout-plans/advance",
+            post(admin_advance_upgrade_plan),
+        )
+        .route(
+            "/api/v1/admin/rollout-plans/{plan_id}",
+            get(admin_view_upgrade_plan),
         )
         .with_state(state)
 }

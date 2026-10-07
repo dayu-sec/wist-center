@@ -195,8 +195,10 @@ All require the admin Bearer token:
 | `POST` | `/api/v1/admin/policies/global` |
 | `POST` | `/api/v1/gateway/agents/dispatch` |
 | `POST` / `GET` | `/api/v1/admin/releases/:component` |
-| `POST` / `GET` | `/api/v1/admin/upgrade-plans` |
-| `POST` | `/api/v1/admin/upgrade-plans/approve` |
+| `POST` / `GET` | `/api/v1/admin/rollout-plans` |
+| `POST` | `/api/v1/admin/rollout-plans/approve` |
+| `POST` | `/api/v1/admin/rollout-plans/advance` |
+| `GET` | `/api/v1/admin/rollout-plans/:plan_id` |
 
 > `POST /api/v1/gateway/agents/dispatch` sits under the `/gateway/` prefix but is an admin-side
 > command (dispatching an agent-fleet command), so it takes the admin token.

@@ -5,6 +5,19 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.6.0-alpha] - 2026-10-07
+
+### 变更
+
+- **灰度发布计划在中心落地（`Control.Rollout`）**：管理面入口统一为 `/api/v1/admin/rollout-plans`
+  （创建/列出/批准/推进/查看；阶段仍由服务端按阶梯切）。计划只存「动作 + 参数（`spec`）+ 阶段 +
+  逐目标条目」；网关拉取（`GET /api/v1/gateway/upgrade-plan`）时把本阶段条目标 `dispatched`，
+  结果回执回填条目并按闸门推进；末阶段有失败落 `failed`、否则 `completed`。
+- **回执状态归一化**：网关上报的 `done` / `rolled_back` / `unverified` 归一为 `succeeded` / `failed`。
+  此前只认 `succeeded`/`failed`，导致升级**成功后**计划卡在 `rolling`（口径在共享 crate
+  `wist-release::rollout::entry_status_for`）。
+- 旧记录（`pending/approved` + `steps` + `targets`）读取时自动折算成新形状（幂等）。
+
 ## [0.5.7-alpha] - 2026-10-06
 
 ### 变更

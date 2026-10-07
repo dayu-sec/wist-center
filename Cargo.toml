@@ -3,7 +3,7 @@
 
 [package]
 name = "wist-center"
-version = "0.5.7" #@gxl:set(version)
+version = "0.6.0" #@gxl:set(version)
 edition = "2024"
 
 [dependencies]
@@ -31,7 +31,8 @@ time = { version = "0.3", features = ["std"] }
 
 # 读安装包顶层目录名，取 version/arch 自述（与网关侧 install_package.rs 同口径）。
 # 来源读取 / 摘要校验 / 身份解析 / 命名已收进共享 crate `wist-release`，本仓只做薄适配。
-wist-release = { version = "0.3" }
+wist-release = "0.3.2"
+#wist-release = { version = "0.3", path = "../wist-release" }
 
 # 中心服务端 TLS/mTLS：服务器证书（CA-S）+ 校网关客户端证书（CA-G）。
 # 与网关侧 infra/tls.rs 同构（WebPkiClientVerifier + allow_unauthenticated、握手后取客户端叶证书）。

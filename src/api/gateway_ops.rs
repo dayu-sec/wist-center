@@ -25,7 +25,7 @@ use crate::infra::{
 
 use super::{
     ApiState, PeerConnectInfo, build_control_center_trust_bundle, control_center_tls_required,
-    rate_limit,
+    rate_limit, rollout,
 };
 
 const GATEWAY_AUTH_SCOPE: &str = "gateway";
@@ -323,49 +323,41 @@ async fn upgrade_plan_for(
     state: &ApiState,
     gateway_id: &str,
 ) -> Result<GatewayUpgradePlan, String> {
-    let plans = state
-        .store
-        .list_upgrade_plans()
-        .await
-        .map_err(|err| format!("failed to load upgrade plans: {err}"))?;
-    // `list_upgrade_plans` 已按 created_at DESC：第一份覆盖本网关的 approved 即为目标。
-    for plan in &plans {
-        if plan.status != "approved" {
-            continue;
-        }
-        let covered = plan
-            .steps
-            .iter()
-            .any(|step| step.gateway_ids.iter().any(|id| id == gateway_id));
-        if !covered {
-            continue;
-        }
-        // 现模型的 `GatewayUpgradePlan` 只承载**单组件**目标；多组件计划这里取第一个
-        // （要精确到组件，需把 `GatewayUpgradePlan` 扩成列表，届时同步发 `wist-control`）。
-        let target = plan.targets.first();
-        // 地址由中心**派生**（反查已发布的 release 记录），不让运维手输。
-        let artifact_url = match target {
-            Some(target) => {
-                resolve_release_artifact_url(state, &target.component, &target.target_version).await
-            }
-            None => None,
-        };
+    // 该网关此刻该执行的计划：`rolling` 且它落在 `current_phase` 阶段内（阶段由服务端切，
+    // 中心与网关同一套口径，见 `super::rollout`）。
+    let Some((plan, _phase)) = rollout::active_plan_for_gateway(state, gateway_id).await? else {
         return Ok(GatewayUpgradePlan {
             gateway_id: gateway_id.to_string(),
-            has_plan: true,
-            plan_id: Some(plan.plan_id.clone()),
-            component: target.map(|target| target.component.clone()),
-            to_version: target.map(|target| target.target_version.clone()),
-            artifact_url,
+            has_plan: false,
+            plan_id: None,
+            component: None,
+            to_version: None,
+            artifact_url: None,
         });
+    };
+    // 现模型的 `GatewayUpgradePlan` 只承载**单组件**目标；多组件计划这里取第一个
+    // （要精确到组件，需把 `GatewayUpgradePlan` 扩成列表，届时同步发 `wist-control`）。
+    let target = rollout::first_upgrade_target(&plan.spec);
+    // 地址由中心**派生**（反查已发布的 release 记录），不让运维手输。
+    let artifact_url = match &target {
+        Some((component, version)) => resolve_release_artifact_url(state, component, version).await,
+        None => None,
+    };
+    // 网关已取走这份计划：把本阶段条目标 `dispatched`（幂等；失败只记日志，不影响下发）。
+    if let Err(err) = rollout::mark_gateway_entry_dispatched(state, &plan.plan_id, gateway_id).await
+    {
+        eprintln!(
+            "event=GatewayUpgradeDispatchMarkFailed gateway_id={gateway_id} plan_id={} err={err}",
+            plan.plan_id
+        );
     }
     Ok(GatewayUpgradePlan {
         gateway_id: gateway_id.to_string(),
-        has_plan: false,
-        plan_id: None,
-        component: None,
-        to_version: None,
-        artifact_url: None,
+        has_plan: true,
+        plan_id: Some(plan.plan_id),
+        component: target.as_ref().map(|(component, _)| component.clone()),
+        to_version: target.map(|(_, version)| version),
+        artifact_url,
     })
 }
 
@@ -388,7 +380,8 @@ async fn resolve_release_artifact_url(
 
 /// 升级结果回执：`POST /api/v1/gateway/upgrade-result`（mTLS 客户端证书）。见 CR-002 C2。
 ///
-/// 现在只落结构化事件日志 + 回 ack；持久化视图待补（CR-002 C2 follow-up）。
+/// 落结构化事件日志 + 回 ack，并**回填灰度发布计划的条目**（按 `gateway_id` 找到它此刻所在
+/// `rolling` 计划的当前阶段，写状态/明细、按闸门推进）。
 pub async fn report_gateway_upgrade_result(
     State(state): State<ApiState>,
     identity: Option<Extension<VerifiedGatewayIdentity>>,
@@ -416,6 +409,21 @@ pub async fn report_gateway_upgrade_result(
         input.status,
         input.detail
     );
+    // 回填计划的逐网关条目：状态折算 + 终态按闸门推进。回执已收到，回填失败只记日志，
+    // 不影响回 ack（条目会留在原状，等下次同网关结果或人工推进对账）。
+    if let Err(err) = rollout::reconcile_gateway_upgrade_result(
+        &state,
+        &input.gateway_id,
+        &input.status,
+        &input.detail,
+    )
+    .await
+    {
+        eprintln!(
+            "event=GatewayUpgradeResultReconcileFailed gateway_id={} work_id={} err={err}",
+            input.gateway_id, input.work_id
+        );
+    }
     Json(GatewayUpgradeResultAccepted {
         gateway_id: input.gateway_id,
         work_id: input.work_id,
@@ -1427,6 +1435,184 @@ mod tests {
         let plan: GatewayUpgradePlan = serde_json::from_slice(&body).expect("json");
         assert_eq!(plan.gateway_id, "gw-001");
         assert!(!plan.has_plan);
+    }
+
+    /// 端到端：建计划 →（未批准不下发）→ 批准 → 网关拉取（条目变 `dispatched`）→ 回执成功
+    /// （条目 `succeeded`，单阶段即末阶段 → 计划自动 `completed`）。
+    #[tokio::test]
+    async fn upgrade_plan_is_served_for_the_active_phase_then_result_backfills() {
+        let app = router();
+        let pull_uri = "/api/v1/gateway/upgrade-plan?gateway_id=gw-001";
+        let view_uri = |plan_id: &str| format!("/api/v1/admin/rollout-plans/{plan_id}");
+
+        // 1) 建一份铺到 gw-001 的单阶段计划（dev 模式无 admin token，管理面无鉴权）。
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/admin/rollout-plans")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "action": "upgrade",
+                            "spec": "{\"targets\":[{\"component\":\"wist-gateway-stack\",\"target_version\":\"0.1.28\"}]}",
+                            "target_ids": ["gw-001"],
+                            "phase_count": 1,
+                            "deadline_at": "2027-01-01T00:00:00Z",
+                            "timeout_seconds": 600,
+                            "batch_size": 0,
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        let plan_id = created["plan_id"].as_str().expect("plan id").to_string();
+
+        // 未批准（draft）：网关拉取 → 无计划。
+        let response = app
+            .clone()
+            .oneshot(with_identity(
+                Request::builder()
+                    .method("GET")
+                    .uri(pull_uri)
+                    .body(Body::empty())
+                    .expect("request"),
+                client_identity("gw-001", TEST_FINGERPRINT),
+            ))
+            .await
+            .expect("response");
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let plan_view: GatewayUpgradePlan = serde_json::from_slice(&bytes).expect("json");
+        assert!(!plan_view.has_plan, "draft 计划不下发");
+
+        // 2) 批准 → rolling，进入第一阶段。
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/admin/rollout-plans/approve")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "plan_id": plan_id }).to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // 3) 网关拉取：有计划，组件/版本来自 spec。
+        let response = app
+            .clone()
+            .oneshot(with_identity(
+                Request::builder()
+                    .method("GET")
+                    .uri(pull_uri)
+                    .body(Body::empty())
+                    .expect("request"),
+                client_identity("gw-001", TEST_FINGERPRINT),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let plan_view: GatewayUpgradePlan = serde_json::from_slice(&bytes).expect("json");
+        assert!(plan_view.has_plan);
+        assert_eq!(plan_view.plan_id.as_deref(), Some(plan_id.as_str()));
+        assert_eq!(plan_view.component.as_deref(), Some("wist-gateway-stack"));
+        assert_eq!(plan_view.to_version.as_deref(), Some("0.1.28"));
+
+        // 拉走后条目应变 `dispatched`：视图里能区分「待派」与「已下发」。
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(view_uri(&plan_id))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let detail: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(detail["entries"][0]["status"], "dispatched");
+
+        // 4) 网关回执成功 → 条目 succeeded；单阶段（末阶段）不看闸门，自动收敛 completed。
+        let response = app
+            .clone()
+            .oneshot(with_identity(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/gateway/upgrade-result")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "gateway_id": "gw-001",
+                            "work_id": "work-1",
+                            "from_version": "0.1.27",
+                            "to_version": "0.1.28",
+                            "step": "apply",
+                            "status": "done",
+                            "detail": "ok",
+                            "reported_at": "2026-10-07T00:00:00Z",
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+                client_identity("gw-001", TEST_FINGERPRINT),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(view_uri(&plan_id))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let detail: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(detail["plan"]["status"], "completed");
+        assert_eq!(detail["entries"][0]["status"], "succeeded");
     }
 
     /// 升级目标里的 `artifact_url` 由中心**反查已发布的 release** 派生；无对应记录那么为 `None`

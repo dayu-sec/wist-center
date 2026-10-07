@@ -13,7 +13,7 @@ use crate::config::GatewayCredentialSeed;
 use super::{
     EnrollmentTokenIssue, GatewayCustomerBindingRecord, GatewayStatusUpdate, LifecycleEvent,
     ReleaseRecord, Store, StoredAgent, StoredEnrollmentToken, StoredGateway,
-    StoredGatewayCredentialStatus, UpgradePlanRecord, sha256_hex,
+    StoredGatewayCredentialStatus, UpgradePlanRecord, normalize_upgrade_plan, sha256_hex,
 };
 
 #[derive(Debug, Clone)]
@@ -763,7 +763,7 @@ impl Store for PgStore {
         let payload =
             serde_json::to_value(plan).source_err(StoreReason::Json, "serialize upgrade plan")?;
         sqlx::query(
-            "INSERT INTO upgrade_plans (plan_id, payload, status) VALUES ($1, $2, 'pending')",
+            "INSERT INTO upgrade_plans (plan_id, payload, status) VALUES ($1, $2, 'draft')",
         )
         .bind(&plan.plan_id)
         .bind(payload)
@@ -783,18 +783,19 @@ impl Store for PgStore {
             let value: serde_json::Value = row
                 .try_get("payload")
                 .source_raw_err(StoreReason::Sql, "read upgrade plan payload")?;
-            let plan = serde_json::from_value(value)
+            let mut plan: UpgradePlanRecord = serde_json::from_value(value)
                 .source_err(StoreReason::Json, "deserialize upgrade plan")?;
+            // 迁移：把模型升级前的旧记录（pending/approved + steps）折算成新形状。
+            normalize_upgrade_plan(&mut plan);
             plans.push(plan);
         }
         Ok(plans)
     }
 
-    async fn approve_upgrade_plan(
+    async fn get_upgrade_plan(
         &self,
         plan_id: &str,
-        approved_by: &str,
-    ) -> Result<UpgradePlanRecord, StoreError> {
+    ) -> Result<Option<UpgradePlanRecord>, StoreError> {
         let row: Option<(serde_json::Value,)> =
             sqlx::query_as("SELECT payload FROM upgrade_plans WHERE plan_id = $1")
                 .bind(plan_id)
@@ -802,26 +803,31 @@ impl Store for PgStore {
                 .await
                 .source_raw_err(StoreReason::Sql, "select upgrade plan")?;
         let Some((payload,)) = row else {
-            return Err(StoreReason::Conflict
-                .to_err()
-                .with_detail(plan_id.to_string()));
+            return Ok(None);
         };
         let mut plan: UpgradePlanRecord = serde_json::from_value(payload)
             .source_err(StoreReason::Json, "deserialize upgrade plan")?;
-        plan.status = "approved".to_string();
-        plan.approved_by = Some(approved_by.to_string());
-        plan.approved_at = Some(DateTime::now());
+        normalize_upgrade_plan(&mut plan);
+        Ok(Some(plan))
+    }
+
+    async fn save_upgrade_plan(&self, plan: &UpgradePlanRecord) -> Result<(), StoreError> {
         let payload =
-            serde_json::to_value(&plan).source_err(StoreReason::Json, "serialize upgrade plan")?;
-        sqlx::query(
-            "UPDATE upgrade_plans SET payload = $2, status = 'approved' WHERE plan_id = $1",
-        )
-        .bind(plan_id)
-        .bind(payload)
-        .execute(&self.pool)
-        .await
-        .source_raw_err(StoreReason::Sql, "update upgrade plan")?;
-        Ok(plan)
+            serde_json::to_value(plan).source_err(StoreReason::Json, "serialize upgrade plan")?;
+        let affected =
+            sqlx::query("UPDATE upgrade_plans SET payload = $2, status = $3 WHERE plan_id = $1")
+                .bind(&plan.plan_id)
+                .bind(payload)
+                .bind(&plan.status)
+                .execute(&self.pool)
+                .await
+                .source_raw_err(StoreReason::Sql, "update upgrade plan")?;
+        if affected.rows_affected() == 0 {
+            return Err(StoreReason::Conflict
+                .to_err()
+                .with_detail(plan.plan_id.clone()));
+        }
+        Ok(())
     }
 
     async fn bind_gateway_customer(

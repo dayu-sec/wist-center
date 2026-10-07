@@ -16,8 +16,8 @@ use std::{
 
 use orion_error::{conversion::ToStructError, prelude::*};
 use serde::{Deserialize, Serialize};
+use wist_control::GatewayInstanceLifecycleState;
 use wist_control::types::DateTime;
-use wist_control::{GatewayInstanceLifecycleState, UpgradeStep, UpgradeTarget};
 
 use super::sha256_hex;
 use crate::config::GatewayCredentialSeed;
@@ -101,17 +101,164 @@ pub struct GatewayCustomerBindingRecord {
     pub bound_at: DateTime,
 }
 
-/// 一次升级计划记录（映射模型 UpgradePlan）。
+/// 升级计划里的一个阶段（映射模型 `Control.Rollout.RolloutPhase`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpgradePhaseRecord {
+    pub phase_index: i64,
+    pub gateway_ids: Vec<String>,
+    /// 推进闸门：manual | all_succeeded | success_rate:<NN>。
+    #[serde(default)]
+    pub advance_rule: String,
+    /// pending | rolling | completed
+    #[serde(default)]
+    pub status: String,
+}
+
+/// 升级计划里逐网关的一行（映射模型 `Control.Rollout.RolloutPlanEntry`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpgradePlanEntryRecord {
+    pub gateway_id: String,
+    /// pending | dispatched | succeeded | failed
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub detail: String,
+    pub updated_at: DateTime,
+}
+
+/// 一次升级计划记录（映射模型 `Control.Rollout.RolloutPlan`：中心铺的是**网关**，target = gateway_id）。
+///
+/// 条目（`entries`）在存储上与计划同放一份：模型里 `RolloutPlanView = plan + entries` ，中心这边
+/// 计划很小、又不分页，合放省掉一张表；对外的读投影仍按 `plan + entries` 出。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpgradePlanRecord {
     pub plan_id: String,
-    pub targets: Vec<UpgradeTarget>,
-    pub target_count: i64,
+    /// 动作：今天只有 `upgrade`。
+    #[serde(default = "default_upgrade_action")]
+    pub action: String,
+    /// 动作参数（JSON）：`{"targets":[{"component","target_version"}]}`。
+    #[serde(default)]
+    pub spec: String,
+    /// 截止时间；中心不物化一次性工作，只做记录（可空）。
+    #[serde(default)]
+    pub deadline_at: Option<DateTime>,
+    #[serde(default)]
+    pub timeout_seconds: i64,
+    #[serde(default)]
+    pub phases: Vec<UpgradePhaseRecord>,
+    #[serde(default)]
+    pub batch_size: i64,
+    /// 当前进行到第几阶段（0 = 尚未开始）。
+    #[serde(default)]
+    pub current_phase: i64,
+    /// draft | rolling | completed | failed | canceled
     pub status: String,
+    #[serde(default)]
+    pub created_by: String,
     pub created_at: DateTime,
-    pub steps: Vec<UpgradeStep>,
+    #[serde(default)]
     pub approved_by: Option<String>,
+    #[serde(default)]
     pub approved_at: Option<DateTime>,
+    /// 逐目标条目（存储上与计划同放，见类型注释）。
+    #[serde(default)]
+    pub entries: Vec<UpgradePlanEntryRecord>,
+
+    // ─— 迁移用：模型升级之前的旧字段（`steps` / `targets`），读取后由 `normalize_legacy` 折算并清空 ─—
+    #[serde(rename = "steps", default, skip_serializing_if = "Vec::is_empty")]
+    pub legacy_steps: Vec<LegacyUpgradeStep>,
+    #[serde(rename = "targets", default, skip_serializing_if = "Vec::is_empty")]
+    pub legacy_targets: Vec<LegacyUpgradeTarget>,
+}
+
+fn default_upgrade_action() -> String {
+    "upgrade".to_string()
+}
+
+/// **迁移用**：旧记录的执行步骤（`step_index` / `gateway_ids` / `status`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LegacyUpgradeStep {
+    #[serde(default)]
+    pub step_index: i64,
+    #[serde(default)]
+    pub gateway_ids: Vec<String>,
+    #[serde(default)]
+    pub status: String,
+}
+
+/// **迁移用**：旧记录的升级目标（`component` / `target_version`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LegacyUpgradeTarget {
+    #[serde(default)]
+    pub component: String,
+    #[serde(default)]
+    pub target_version: String,
+}
+
+/// 把模型升级前落下的旧记录折算成新形状（幂等，可重复跑）：
+///
+/// - status：`pending` → `draft`、`approved` → `rolling`；
+/// - `steps`（旧：batch + 无闸门）→ `phases`（补闸门：首段 manual、其余 all_succeeded）；
+/// - `targets` → `spec` 的 JSON（`{"targets":[...]}`）；
+/// - 旧记录没有逐目标条目 → 按全量目标补成 `pending`（否则视图里看不到范围、结果也无处回填）。
+pub fn normalize_upgrade_plan(plan: &mut UpgradePlanRecord) {
+    if plan.status == "pending" {
+        plan.status = "draft".to_string();
+    } else if plan.status == "approved" {
+        plan.status = "rolling".to_string();
+    }
+    if plan.spec.is_empty() && !plan.legacy_targets.is_empty() {
+        let targets: Vec<serde_json::Value> = plan
+            .legacy_targets
+            .iter()
+            .map(|target| {
+                serde_json::json!({
+                    "component": target.component,
+                    "target_version": target.target_version,
+                })
+            })
+            .collect();
+        plan.spec = serde_json::json!({ "targets": targets }).to_string();
+    }
+    if plan.phases.is_empty() && !plan.legacy_steps.is_empty() {
+        plan.phases = plan
+            .legacy_steps
+            .iter()
+            .enumerate()
+            .map(|(index, step)| UpgradePhaseRecord {
+                phase_index: step.step_index.max(index as i64 + 1),
+                gateway_ids: step.gateway_ids.clone(),
+                // 旧记录没有闸门：按现行固定策略补（末段不看闸门，值不重要）。
+                advance_rule: if index == 0 {
+                    "manual".to_string()
+                } else {
+                    "all_succeeded".to_string()
+                },
+                status: step.status.clone(),
+            })
+            .collect();
+        if plan.current_phase == 0 && plan.status == "rolling" {
+            plan.current_phase = 1;
+        }
+    }
+    // 补齐全量条目：新建的计划在 create 时已铺好，只有旧记录会走到这里。
+    if plan.entries.is_empty() && !plan.phases.is_empty() {
+        let updated_at = plan.created_at.clone();
+        let entries: Vec<UpgradePlanEntryRecord> = plan
+            .phases
+            .iter()
+            .flat_map(|phase| phase.gateway_ids.iter())
+            .map(|gateway_id| UpgradePlanEntryRecord {
+                gateway_id: gateway_id.clone(),
+                status: "pending".to_string(),
+                detail: String::new(),
+                updated_at: updated_at.clone(),
+            })
+            .collect();
+        plan.entries = entries;
+    }
+    plan.legacy_steps.clear();
+    plan.legacy_targets.clear();
 }
 
 /// 一次版本发布记录（映射模型 WistAgentdRelease / WarpGatewayRelease）。
@@ -411,19 +558,20 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     ) -> Result<ReleaseRecord, StoreError>;
     /// 查询某组件的历史发布记录（新→旧）。
     async fn list_releases(&self, component: &str) -> Result<Vec<ReleaseRecord>, StoreError>;
-    /// 创建升级计划（多目标 + 网关范围 + 多步执行），status=pending。
+    /// 创建升级计划（多目标 + 网关范围 + 灰度阶段），status=draft。
     async fn create_upgrade_plan(
         &self,
         plan: &UpgradePlanRecord,
     ) -> Result<UpgradePlanRecord, StoreError>;
     /// 查询全部升级计划（新→旧）。
     async fn list_upgrade_plans(&self) -> Result<Vec<UpgradePlanRecord>, StoreError>;
-    /// 批准升级计划：status → approved，记录批准人/时间。
-    async fn approve_upgrade_plan(
+    /// 取一份升级计划（含逐目标条目）；无则 `None`。
+    async fn get_upgrade_plan(
         &self,
         plan_id: &str,
-        approved_by: &str,
-    ) -> Result<UpgradePlanRecord, StoreError>;
+    ) -> Result<Option<UpgradePlanRecord>, StoreError>;
+    /// 覆盖保存一份升级计划（批准 / 推进 / 结果回填都走它）。
+    async fn save_upgrade_plan(&self, plan: &UpgradePlanRecord) -> Result<(), StoreError>;
     /// 绑定网关到客户（幂等：同网关重复绑定更新客户）。
     async fn bind_gateway_customer(
         &self,
@@ -857,7 +1005,7 @@ impl FileStore {
         Ok(records)
     }
 
-    /// 创建升级计划（同步，供测试与 trait 委托）：status=pending，插入最前（新→旧）。
+    /// 创建升级计划（同步，供测试与 trait 委托）：status=draft，插入最前（新→旧）。
     pub fn create_upgrade_plan(
         &self,
         plan: &UpgradePlanRecord,
@@ -868,32 +1016,46 @@ impl FileStore {
         Ok(plan.clone())
     }
 
+    /// 列表（新→旧）；顺手把模型升级前的旧记录折算成新形状（迁移，幂等）。
     pub fn list_upgrade_plans(&self) -> Result<Vec<UpgradePlanRecord>, StoreError> {
         let snapshot = self.load()?;
-        Ok(snapshot.upgrade_plans)
+        Ok(snapshot
+            .upgrade_plans
+            .into_iter()
+            .map(|mut plan| {
+                normalize_upgrade_plan(&mut plan);
+                plan
+            })
+            .collect())
     }
 
-    pub fn approve_upgrade_plan(
-        &self,
-        plan_id: &str,
-        approved_by: &str,
-    ) -> Result<UpgradePlanRecord, StoreError> {
-        let plan = self.update(|snapshot| {
-            let Some(plan) = snapshot
+    pub fn get_upgrade_plan(&self, plan_id: &str) -> Result<Option<UpgradePlanRecord>, StoreError> {
+        let snapshot = self.load()?;
+        Ok(snapshot
+            .upgrade_plans
+            .into_iter()
+            .find(|plan| plan.plan_id == plan_id)
+            .map(|mut plan| {
+                normalize_upgrade_plan(&mut plan);
+                plan
+            }))
+    }
+
+    pub fn save_upgrade_plan(&self, plan: &UpgradePlanRecord) -> Result<(), StoreError> {
+        self.update(|snapshot| {
+            let Some(slot) = snapshot
                 .upgrade_plans
                 .iter_mut()
-                .find(|plan| plan.plan_id == plan_id)
+                .find(|existing| existing.plan_id == plan.plan_id)
             else {
                 return Err(StoreReason::Conflict
                     .to_err()
-                    .with_detail(plan_id.to_string()));
+                    .with_detail(plan.plan_id.clone()));
             };
-            plan.status = "approved".to_string();
-            plan.approved_by = Some(approved_by.to_string());
-            plan.approved_at = Some(DateTime::now());
-            Ok(plan.clone())
+            *slot = plan.clone();
+            Ok(())
         })??;
-        Ok(plan)
+        Ok(())
     }
 
     /// 绑定网关到客户（同步，供测试与 trait 委托）：同网关重复绑定更新客户。
@@ -1218,12 +1380,15 @@ impl Store for FileStore {
         FileStore::list_upgrade_plans(self)
     }
 
-    async fn approve_upgrade_plan(
+    async fn get_upgrade_plan(
         &self,
         plan_id: &str,
-        approved_by: &str,
-    ) -> Result<UpgradePlanRecord, StoreError> {
-        FileStore::approve_upgrade_plan(self, plan_id, approved_by)
+    ) -> Result<Option<UpgradePlanRecord>, StoreError> {
+        FileStore::get_upgrade_plan(self, plan_id)
+    }
+
+    async fn save_upgrade_plan(&self, plan: &UpgradePlanRecord) -> Result<(), StoreError> {
+        FileStore::save_upgrade_plan(self, plan)
     }
 
     async fn bind_gateway_customer(
@@ -1767,6 +1932,54 @@ mod tests {
         );
 
         let _ = fs::remove_file(path);
+    }
+
+    /// 模型升级前的旧记录（`pending/approved` + `steps` + `targets`）在读取时折算成新形状：
+    /// 状态映射、`steps`→`phases`（补闸门）、`targets`→`spec`，并补齐逐目标条目。幂等。
+    #[test]
+    fn normalize_upgrade_plan_migrates_legacy_records() {
+        let legacy = serde_json::json!({
+            "plan_id": "plan-old",
+            "targets": [{"component": "wist-gateway-stack", "target_version": "0.1.27"}],
+            "target_count": 2,
+            "status": "approved",
+            "created_at": "2026-09-01T00:00:00Z",
+            "steps": [
+                {"step_index": 1, "gateway_ids": ["gw-001"], "status": "completed"},
+                {"step_index": 2, "gateway_ids": ["gw-002"], "status": "pending"}
+            ]
+        });
+        let mut plan: UpgradePlanRecord =
+            serde_json::from_value(legacy).expect("legacy record deserializes");
+        assert!(plan.phases.is_empty(), "旧记录没有 phases");
+        assert!(plan.entries.is_empty(), "旧记录没有 entries");
+
+        normalize_upgrade_plan(&mut plan);
+
+        // status：approved → rolling；current_phase 起在第一阶段。
+        assert_eq!(plan.status, "rolling");
+        assert_eq!(plan.current_phase, 1);
+        // steps → phases（补闸门：首段 manual、其后 all_succeeded）。
+        assert_eq!(plan.phases.len(), 2);
+        assert_eq!(plan.phases[0].advance_rule, "manual");
+        assert_eq!(plan.phases[1].advance_rule, "all_succeeded");
+        assert_eq!(plan.phases[0].gateway_ids, vec!["gw-001".to_string()]);
+        assert_eq!(plan.phases[1].gateway_ids, vec!["gw-002".to_string()]);
+        // targets → spec 的 JSON。
+        let spec: serde_json::Value = serde_json::from_str(&plan.spec).expect("spec json");
+        assert_eq!(spec["targets"][0]["component"], "wist-gateway-stack");
+        assert_eq!(spec["targets"][0]["target_version"], "0.1.27");
+        // 旧记录没有条目 → 按全量目标补 pending（结果才有处回填）。
+        assert_eq!(plan.entries.len(), 2);
+        assert!(plan.entries.iter().all(|item| item.status == "pending"));
+        // 旧字段已清空。
+        assert!(plan.legacy_steps.is_empty());
+        assert!(plan.legacy_targets.is_empty());
+
+        // 幂等：再跑一次不会重复补条目。
+        normalize_upgrade_plan(&mut plan);
+        assert_eq!(plan.entries.len(), 2);
+        assert_eq!(plan.phases.len(), 2);
     }
 
     fn test_store_path() -> PathBuf {

@@ -14,14 +14,13 @@ use wist_control::{
     AdminGatewayStatusReturned, AgentFleetDispatchReceipt, AgentRuntimeStatus,
     DispatchAgentFleetCommand, GatewayCustomerBinding, GatewayInitialConfig, GatewayInstance,
     GatewayInstanceLifecycleState, GatewayListView, GatewayRuntimeStatus, GlobalPolicyDispatch,
-    UpgradeStep, UpgradeTarget,
 };
 
-use crate::infra::{StoreReason, StoredGateway, UpgradePlanRecord};
+use crate::infra::{StoreReason, StoredGateway};
 
 use super::{
     ApiState, PeerConnectInfo, admin_auth::require_admin_bearer, build_control_center_trust_bundle,
-    control_center_tls_required, rate_limit,
+    control_center_tls_required, rate_limit, rollout,
 };
 
 /// 创建网关实例请求体：对齐模型 `AdminCreateGatewayInstanceRequest`（gateway_name/requested_by）。
@@ -780,86 +779,63 @@ pub async fn admin_get_gateway_initial_config(
     .into_response()
 }
 
-/// 创建升级计划请求体：多组件目标版本 + 网关范围 + **阶段数**。
+/// 创建灰度发布计划：`POST /api/v1/admin/rollout-plans`（模型 `AdminCreateUpgradePlan`）。
 ///
-/// 灰度阶段由**中心服务端**按阶梯（1 个金丝雀 → 10% → 30% → 70% → 全量）自动切出，
-/// 不再由前端传 `steps` —— 阶梯口径只有一份（共享 crate `wist-release::rollout`），
-/// 且落在服务端才能保证「阶段互不重叠、一把铺满」不是只在界面上成立。
-#[derive(serde::Deserialize)]
-pub struct CreateUpgradePlanRequest {
-    pub targets: Vec<UpgradeTarget>,
-    pub gateway_ids: Vec<String>,
-    /// 分几段灰度（1 = 不分批，一把到位）。可用段数受台数限制，见
-    /// `wist_release::rollout::available_phase_counts`。
-    pub phase_count: usize,
-    pub requested_by: String,
-}
-
-#[derive(serde::Deserialize)]
-pub struct ApproveUpgradePlanRequest {
-    pub plan_id: String,
-    pub approved_by: String,
-}
-
-/// 创建升级计划：POST /api/v1/admin/upgrade-plans。
+/// 阶段由**服务端**按阶梯切（共享 crate `wist-release::rollout`），闸门固定：首段人工、其后全成功。
+/// 入参形状的单一真源是模型 `Control.RolloutApp.AdminInterface`（与网关**同形**）。
 pub async fn admin_create_upgrade_plan(
     State(state): State<ApiState>,
     headers: HeaderMap,
     client: PeerConnectInfo,
-    Json(request): Json<CreateUpgradePlanRequest>,
+    Json(request): Json<rollout::CreateRolloutPlanRequest>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
         return response;
     }
-    if request.targets.is_empty()
-        || request.gateway_ids.is_empty()
-        || request.requested_by.trim().is_empty()
-    {
+    // 阶段切分：服务端权威。目标为空 / 阶段数为 0 / 阶段数大于台数都在这里被拒。
+    let record = match rollout::build_plan(&request) {
+        Ok(record) => record,
+        Err(reason) => return (StatusCode::BAD_REQUEST, reason).into_response(),
+    };
+    // 目标存在性校验：与网关同款 —— 物化到不存在的网关只会静默落库、永不命中。
+    let known = match state.store.list_gateways().await {
+        Ok(gateways) => gateways
+            .into_iter()
+            .map(|gateway| gateway.gateway_id)
+            .collect::<std::collections::HashSet<_>>(),
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to list gateways: {err}"),
+            )
+                .into_response();
+        }
+    };
+    let unknown: Vec<&str> = record
+        .entries
+        .iter()
+        .map(|entry| entry.gateway_id.as_str())
+        .filter(|gateway_id| !known.contains(*gateway_id))
+        .collect();
+    if !unknown.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
-            "targets, gateway_ids and requested_by must not be empty",
+            format!("unknown target(s): {}", unknown.join(", ")),
         )
             .into_response();
     }
-    // 阶段切分：服务端权威。目标为空 / 阶段数为 0 / 阶段数大于台数都在这里被拒。
-    let steps = match wist_release::rollout::plan_phases(&request.gateway_ids, request.phase_count)
-    {
-        Ok(phases) => phases
-            .into_iter()
-            .map(|phase| UpgradeStep {
-                step_index: phase.index as i64,
-                gateway_ids: phase.target_ids,
-                status: "pending".to_string(),
-            })
-            .collect(),
-        Err(reason) => return (StatusCode::BAD_REQUEST, reason).into_response(),
-    };
-    let plan_id = format!(
-        "plan-{}",
-        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-    );
-    let record = UpgradePlanRecord {
-        plan_id,
-        targets: request.targets,
-        target_count: request.gateway_ids.len() as i64,
-        status: "pending".to_string(),
-        created_at: DateTime::now(),
-        steps,
-        approved_by: None,
-        approved_at: None,
-    };
     match state.store.create_upgrade_plan(&record).await {
-        Ok(plan) => (StatusCode::CREATED, Json(plan)).into_response(),
+        Ok(plan) => (StatusCode::CREATED, Json(rollout::plan_view(&plan))).into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to create upgrade plan: {err}"),
+            format!("failed to create rollout plan: {err}"),
         )
             .into_response(),
     }
 }
 
-/// 查询升级计划列表：GET /api/v1/admin/upgrade-plans。
+/// 列出灰度发布计划：`GET /api/v1/admin/rollout-plans`（模型 `AdminListUpgradePlans`）。
 pub async fn admin_list_upgrade_plans(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -870,40 +846,145 @@ pub async fn admin_list_upgrade_plans(
         return response;
     }
     match state.store.list_upgrade_plans().await {
-        Ok(plans) => Json(plans).into_response(),
+        Ok(plans) => Json(plans.iter().map(rollout::plan_view).collect::<Vec<_>>()).into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to load upgrade plans: {err}"),
+            format!("failed to load rollout plans: {err}"),
         )
             .into_response(),
     }
 }
 
-/// 批准升级计划：POST /api/v1/admin/upgrade-plans/approve。
+/// 批准灰度发布计划：`POST /api/v1/admin/rollout-plans/approve`（模型 `AdminApproveUpgradePlan`）。
+/// `draft → rolling` 进入第一阶段（中心不物化工作，只开阶段闸门）。
 pub async fn admin_approve_upgrade_plan(
     State(state): State<ApiState>,
     headers: HeaderMap,
     client: PeerConnectInfo,
-    Json(request): Json<ApproveUpgradePlanRequest>,
+    Json(request): Json<rollout::PlanRefRequest>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
         return response;
     }
-    match state
-        .store
-        .approve_upgrade_plan(&request.plan_id, &request.approved_by)
-        .await
-    {
-        Ok(plan) => Json(plan).into_response(),
-        Err(err) if err.reason() == &StoreReason::Conflict => (
+    let plan_id = request.plan_id.trim().to_string();
+    let Some(mut plan) = (match state.store.get_upgrade_plan(&plan_id).await {
+        Ok(value) => value,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to load rollout plan: {err}"),
+            )
+                .into_response();
+        }
+    }) else {
+        return (
             StatusCode::NOT_FOUND,
-            format!("upgrade plan {} not found", request.plan_id),
+            format!("unknown rollout plan {plan_id}"),
+        )
+            .into_response();
+    };
+    if plan.status != "draft" {
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "rollout plan {plan_id} is {}, only draft can be approved",
+                plan.status
+            ),
+        )
+            .into_response();
+    }
+    if plan.phases.is_empty() {
+        return (
+            StatusCode::CONFLICT,
+            format!("rollout plan {plan_id} has no phase"),
+        )
+            .into_response();
+    }
+    plan.status = "rolling".to_string();
+    plan.current_phase = 1;
+    plan.phases[0].status = "rolling".to_string();
+    plan.approved_by = Some("admin".to_string());
+    plan.approved_at = Some(DateTime::now());
+    if let Err(err) = state.store.save_upgrade_plan(&plan).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to store rollout plan: {err}"),
+        )
+            .into_response();
+    }
+    Json(rollout::plan_view(&plan)).into_response()
+}
+
+/// 人工推进到下一阶段：`POST /api/v1/admin/rollout-plans/advance`（模型 `AdminAdvanceUpgradePlan`）。
+pub async fn admin_advance_upgrade_plan(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    client: PeerConnectInfo,
+    Json(request): Json<rollout::PlanRefRequest>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    let plan_id = request.plan_id.trim().to_string();
+    let Some(mut plan) = (match state.store.get_upgrade_plan(&plan_id).await {
+        Ok(value) => value,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to load rollout plan: {err}"),
+            )
+                .into_response();
+        }
+    }) else {
+        return (
+            StatusCode::NOT_FOUND,
+            format!("unknown rollout plan {plan_id}"),
+        )
+            .into_response();
+    };
+    // 人工闸门：当前阶段须**已全部了结**（金丝雀确认无问题再推下一批）；与网关同一口径。
+    if let Some(reason) = rollout::advance_gate_blocker(&plan) {
+        return (
+            StatusCode::CONFLICT,
+            format!("cannot advance rollout plan {plan_id}: {reason}"),
+        )
+            .into_response();
+    }
+    rollout::advance_plan(&mut plan);
+    if let Err(err) = state.store.save_upgrade_plan(&plan).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to store rollout plan: {err}"),
+        )
+            .into_response();
+    }
+    Json(rollout::plan_view(&plan)).into_response()
+}
+
+/// 查看某份计划及其逐目标进度：`GET /api/v1/admin/rollout-plans/{plan_id}`（模型 `AdminViewUpgradePlan`）。
+pub async fn admin_view_upgrade_plan(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    client: PeerConnectInfo,
+    Path(plan_id): Path<String>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    let plan_id = plan_id.trim().to_string();
+    match state.store.get_upgrade_plan(&plan_id).await {
+        Ok(Some(plan)) => Json(rollout::detail_view(&plan)).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            format!("unknown rollout plan {plan_id}"),
         )
             .into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to approve upgrade plan: {err}"),
+            format!("failed to load rollout plan: {err}"),
         )
             .into_response(),
     }
@@ -1254,7 +1335,8 @@ mod tests {
         store
     }
 
-    fn test_state() -> ApiState {
+    /// 以给定 store 拼一个 ApiState（其余配置与 `test_state` 相同）。
+    fn state_with_store(store: FileStore) -> ApiState {
         ApiState {
             config: CenterConfig {
                 listen_addr: "127.0.0.1:3100".to_string(),
@@ -1275,7 +1357,7 @@ mod tests {
                 credential_ttl_seconds: 3600,
                 link_ttl_seconds: 900,
             },
-            store: std::sync::Arc::new(test_store()),
+            store: std::sync::Arc::new(store),
             artifact_store: std::sync::Arc::new(crate::infra::LocalArtifactStore::new(
                 std::env::temp_dir().join("wic-artifacts"),
                 "http://127.0.0.1:3100",
@@ -1287,60 +1369,184 @@ mod tests {
         }
     }
 
-    /// 灰度阶段由**服务端**按阶梯切：客户端只给网关范围与阶段数，不再传 `steps`。
-    #[tokio::test]
-    async fn create_upgrade_plan_splits_phases_on_the_server() {
+    fn test_state() -> ApiState {
+        state_with_store(test_store())
+    }
+
+    /// 建 N 个**已登记**网关（`gw-001..gw-00N`）的 store —— 建计划的目标存在性校验要用。
+    fn gateway_store(count: usize) -> FileStore {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("wic-rollout-test-{nanos}.json"));
+        let store = FileStore::new(&path);
+        let seeds: Vec<GatewayCredentialSeed> = (1..=count)
+            .map(|i| GatewayCredentialSeed {
+                gateway_id: format!("gw-{i:03}"),
+                token: format!("tok-{i:03}"),
+                expires_at: None,
+            })
+            .collect();
+        store.seed(&seeds).expect("seed");
+        store
+    }
+
+    /// 目标都存在的管理面 state（`gw-001..gw-00N`）。
+    fn rollout_state(count: usize) -> ApiState {
+        state_with_store(gateway_store(count))
+    }
+
+    /// 建计划请求体（与网关**同形**：action/spec/target_ids/phase_count/deadline_at/timeout/batch）。
+    fn create_body(targets: &[&str], phase_count: i64) -> serde_json::Value {
+        serde_json::json!({
+            "action": "upgrade",
+            "spec": "{\"targets\":[{\"component\":\"wist-gateway-stack\",\"target_version\":\"0.1.28\"}]}",
+            "target_ids": targets,
+            "phase_count": phase_count,
+            "deadline_at": "2027-01-01T00:00:00Z",
+            "timeout_seconds": 600,
+            "batch_size": 0,
+        })
+    }
+
+    fn gateway_refs(count: usize) -> Vec<String> {
+        (1..=count).map(|i| format!("gw-{i:03}")).collect()
+    }
+
+    async fn post_json(
+        app: &axum::Router,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
         use axum::{body::Body, http::Request};
         use http_body_util::BodyExt;
         use tower::ServiceExt;
 
-        let gateway_ids: Vec<String> = (1..=10).map(|i| format!("gw-{i:03}")).collect();
-        let app = super::super::router_for(test_state());
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/v1/admin/upgrade-plans")
+                    .uri(uri)
                     .header("authorization", "Bearer admin-tok")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "targets": [{
-                                "component": "wist-gateway-stack",
-                                "target_version": "0.1.28",
-                            }],
-                            "gateway_ids": gateway_ids,
-                            "phase_count": 3,
-                            "requested_by": "tester",
-                        })
-                        .to_string(),
-                    ))
+                    .body(Body::from(body.to_string()))
                     .expect("request"),
             )
             .await
             .expect("response");
-        assert_eq!(response.status(), StatusCode::CREATED);
-        let body = response
+        let status = response.status();
+        let bytes = response
             .into_body()
             .collect()
             .await
             .expect("body")
             .to_bytes();
-        let plan: serde_json::Value = serde_json::from_slice(&body).expect("json");
-        let steps = plan["steps"].as_array().expect("steps");
-        let sizes: Vec<usize> = steps
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    async fn get_json(app: &axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+        use axum::{body::Body, http::Request};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .header("authorization", "Bearer admin-tok")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let status = response.status();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// 建一份计划（目标都已在册），返回 (state, app, plan_id)。
+    async fn create_plan(count: usize, phase_count: i64) -> (ApiState, axum::Router, String) {
+        let state = rollout_state(count);
+        let app = super::super::router_for(state.clone());
+        let ids = gateway_refs(count);
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let (status, plan) = post_json(
+            &app,
+            "/api/v1/admin/rollout-plans",
+            create_body(&refs, phase_count),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "create plan");
+        let plan_id = plan["plan_id"].as_str().expect("plan id").to_string();
+        (state, app, plan_id)
+    }
+
+    /// 把计划里**全部**条目改成 `succeeded`（绕过网关回执，直接造出「本段已了结」）。
+    async fn settle_all(state: &ApiState, plan_id: &str) {
+        let mut plan = state
+            .store
+            .get_upgrade_plan(plan_id)
+            .await
+            .expect("load plan")
+            .expect("plan exists");
+        for entry in plan.entries.iter_mut() {
+            entry.status = "succeeded".to_string();
+        }
+        state
+            .store
+            .save_upgrade_plan(&plan)
+            .await
+            .expect("save plan");
+    }
+
+    /// 阶段由**服务端**按阶梯切：客户端只给目标与阶段数，不自己切。
+    #[tokio::test]
+    async fn create_upgrade_plan_splits_phases_on_the_server() {
+        let ids = gateway_refs(10);
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let (status, plan) = post_json(
+            &super::super::router_for(rollout_state(10)),
+            "/api/v1/admin/rollout-plans",
+            create_body(&refs, 3),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        // 计划本体：`draft` + 尚未开始（current_phase 0）。
+        assert_eq!(plan["status"], "draft");
+        assert_eq!(plan["current_phase"], 0);
+        assert_eq!(plan["action"], "upgrade");
+        let phases = plan["phases"].as_array().expect("phases");
+        let sizes: Vec<usize> = phases
             .iter()
-            .map(|step| step["gateway_ids"].as_array().expect("ids").len())
+            .map(|phase| phase["target_ids"].as_array().expect("ids").len())
             .collect();
         // 10 台 × 3 阶段：金丝雀 1 → 到 10% 再 1 → 余 8。
         assert_eq!(sizes, vec![1, 1, 8]);
-        assert_eq!(steps[0]["step_index"], 1);
-        assert_eq!(steps[0]["status"], "pending");
+        assert_eq!(phases[0]["phase_index"], 1);
+        assert_eq!(phases[0]["status"], "pending");
+        // 固定闸门：首段人工、其后全成功。
+        assert_eq!(phases[0]["advance_rule"], "manual");
+        assert_eq!(phases[1]["advance_rule"], "all_succeeded");
         // 阶段之间互不重叠，且一把铺满。
-        let mut all: Vec<String> = steps
+        let mut all: Vec<String> = phases
             .iter()
-            .flat_map(|step| {
-                step["gateway_ids"]
+            .flat_map(|phase| {
+                phase["target_ids"]
                     .as_array()
                     .expect("ids")
                     .iter()
@@ -1356,42 +1562,179 @@ mod tests {
     /// 阶段数不可用（0 / 大于台数）→ **400**，而不是给一个空阶段。
     #[tokio::test]
     async fn create_upgrade_plan_rejects_impossible_phase_counts() {
-        use axum::{body::Body, http::Request};
-        use tower::ServiceExt;
-
-        for phase_count in [0, 11] {
-            let app = super::super::router_for(test_state());
-            let response = app
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/api/v1/admin/upgrade-plans")
-                        .header("authorization", "Bearer admin-tok")
-                        .header("content-type", "application/json")
-                        .body(Body::from(
-                            serde_json::json!({
-                                "targets": [{
-                                    "component": "wist-gateway-stack",
-                                    "target_version": "0.1.28",
-                                }],
-                                "gateway_ids": (1..=10)
-                                    .map(|i| format!("gw-{i:03}"))
-                                    .collect::<Vec<_>>(),
-                                "phase_count": phase_count,
-                                "requested_by": "tester",
-                            })
-                            .to_string(),
-                        ))
-                        .expect("request"),
-                )
-                .await
-                .expect("response");
-            assert_eq!(
-                response.status(),
-                StatusCode::BAD_REQUEST,
-                "phase_count {phase_count}"
-            );
+        let app = super::super::router_for(test_state());
+        let ids = gateway_refs(10);
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        for phase_count in [0_i64, 11] {
+            let (status, _) = post_json(
+                &app,
+                "/api/v1/admin/rollout-plans",
+                create_body(&refs, phase_count),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "phase_count {phase_count}");
         }
+    }
+
+    /// 截止时间非 RFC3339 / 预算为负 → **400**（缺省 / 0 则允许：中心不物化）。
+    #[tokio::test]
+    async fn create_upgrade_plan_rejects_bad_deadline_and_timeout() {
+        let app = super::super::router_for(rollout_state(1));
+        let mut body = create_body(&["gw-001"], 1);
+        body["deadline_at"] = serde_json::json!("2027-01-01 00:00:00");
+        let (status, _) = post_json(&app, "/api/v1/admin/rollout-plans", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "bad deadline");
+
+        let mut body = create_body(&["gw-001"], 1);
+        body["timeout_seconds"] = serde_json::json!(-1);
+        let (status, _) = post_json(&app, "/api/v1/admin/rollout-plans", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "negative timeout");
+
+        // 未知目标 → 400（与网关同款：不存在就拒，不静默落库）。
+        let (status, _) = post_json(
+            &app,
+            "/api/v1/admin/rollout-plans",
+            create_body(&["gw-001", "gw-ghost"], 1),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "unknown target");
+    }
+
+    /// 批准：`draft → rolling` 进入第一阶段；重复批准 → **409**。
+    #[tokio::test]
+    async fn approve_opens_the_first_phase_then_conflicts() {
+        let (_state, app, plan_id) = create_plan(10, 3).await;
+        let (status, plan) = post_json(
+            &app,
+            "/api/v1/admin/rollout-plans/approve",
+            serde_json::json!({ "plan_id": plan_id }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(plan["status"], "rolling");
+        assert_eq!(plan["current_phase"], 1);
+        assert_eq!(plan["phases"][0]["status"], "rolling");
+        assert!(plan["approved_at"].is_string());
+
+        // 二次批准：不是 draft 了 → 409。
+        let (status, _) = post_json(
+            &app,
+            "/api/v1/admin/rollout-plans/approve",
+            serde_json::json!({ "plan_id": plan_id }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    /// 未知计划：批准/推进/查看 → **404**。
+    #[tokio::test]
+    async fn rollout_actions_on_unknown_plan_are_404() {
+        let app = super::super::router_for(test_state());
+        for uri in [
+            "/api/v1/admin/rollout-plans/approve",
+            "/api/v1/admin/rollout-plans/advance",
+        ] {
+            let (status, _) =
+                post_json(&app, uri, serde_json::json!({ "plan_id": "plan-nope" })).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+        }
+        let (status, _) = get_json(&app, "/api/v1/admin/rollout-plans/plan-nope").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// 推进：逐阶段 `rolling`，末阶段推进后收敛 `completed`。
+    #[tokio::test]
+    async fn advance_walks_to_the_last_phase_then_completes() {
+        let (state, app, plan_id) = create_plan(4, 2).await;
+        let (status, _) = post_json(
+            &app,
+            "/api/v1/admin/rollout-plans/approve",
+            serde_json::json!({ "plan_id": plan_id }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // 两段的条目都了结（
+        settle_all(&state, &plan_id).await;
+
+        // 第一次推进：进第二阶段（尚在 rolling）。
+        let (status, plan) = post_json(
+            &app,
+            "/api/v1/admin/rollout-plans/advance",
+            serde_json::json!({ "plan_id": plan_id }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(plan["current_phase"], 2);
+        assert_eq!(plan["status"], "rolling");
+        assert_eq!(plan["phases"][0]["status"], "completed");
+        assert_eq!(plan["phases"][1]["status"], "rolling");
+
+        // 第二次推进：已是末阶段 → 收敛 completed。
+        let (status, plan) = post_json(
+            &app,
+            "/api/v1/admin/rollout-plans/advance",
+            serde_json::json!({ "plan_id": plan_id }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(plan["status"], "completed");
+        assert_eq!(plan["phases"][1]["status"], "completed");
+
+        // 已完成再推进 → 409。
+        let (status, _) = post_json(
+            &app,
+            "/api/v1/admin/rollout-plans/advance",
+            serde_json::json!({ "plan_id": plan_id }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    /// 推进闸门：当前阶段未全部了结 → **409**（金丝雀确认无问题再推下一批）。
+    #[tokio::test]
+    async fn advance_is_blocked_until_the_phase_is_settled() {
+        let (_state, app, plan_id) = create_plan(4, 2).await;
+        let (status, _) = post_json(
+            &app,
+            "/api/v1/admin/rollout-plans/approve",
+            serde_json::json!({ "plan_id": plan_id }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // 第一阶段条目还是 pending/dispatched → 不可推进。
+        let (status, _) = post_json(
+            &app,
+            "/api/v1/admin/rollout-plans/advance",
+            serde_json::json!({ "plan_id": plan_id }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        // 本段了结后可推进。
+        settle_all(&_state, &plan_id).await;
+        let (status, plan) = post_json(
+            &app,
+            "/api/v1/admin/rollout-plans/advance",
+            serde_json::json!({ "plan_id": plan_id }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(plan["current_phase"], 2);
+    }
+
+    /// 查看：返回计划 + 逐目标条目（建计划时按全量目标落 `pending`）。
+    #[tokio::test]
+    async fn view_returns_plan_with_entries() {
+        let (_state, app, plan_id) = create_plan(3, 1).await;
+        let (status, detail) =
+            get_json(&app, &format!("/api/v1/admin/rollout-plans/{plan_id}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(detail["plan"]["plan_id"], plan_id.as_str());
+        let entries = detail["entries"].as_array().expect("entries");
+        assert_eq!(entries.len(), 3);
+        assert!(entries.iter().all(|entry| entry["status"] == "pending"));
+        assert_eq!(entries[0]["work_id"], serde_json::Value::Null);
     }
 
     #[test]
