@@ -501,7 +501,7 @@ pub async fn admin_list_gateway_instances(
 ///
 /// `artifact_url` 沿用原名以兼容既有调用方，但其语义是**来源**（与 gateway 的 agent 包来源同口径）：
 /// 可以是 `/abs/path`，也可以是外部 URL。
-/// `expected_sha256`（可选）：核对读到的内容摘要，不符即拒；不给则只记录算出的摘要。
+/// `expected_sha256`（**必填**）：核对读到的内容摘要，不符即拒 —— 包没有可校验的摘要就不收。
 /// `version`（可选）：**不填**就由包地址（文件名 / 包内目录名）自动解析，见 `infra/package.rs`；
 /// 填了会与解析出的版本**核对**（不一致 → 400）。
 /// 镜像后落库 / 下发用**来源原名**（URL 末段）；内容寻址靠 `package_sha256` + 幂等。
@@ -510,8 +510,7 @@ pub struct PublishReleaseRequest {
     #[serde(default)]
     pub version: Option<String>,
     pub artifact_url: String,
-    #[serde(default)]
-    pub expected_sha256: Option<String>,
+    pub expected_sha256: String,
     pub requested_by: String,
 }
 
@@ -541,21 +540,22 @@ pub async fn admin_publish_release(
         )
             .into_response();
     }
-    if request.artifact_url.trim().is_empty() || request.requested_by.trim().is_empty() {
+    let expected_sha256 = request.expected_sha256.trim();
+    if request.artifact_url.trim().is_empty()
+        || request.requested_by.trim().is_empty()
+        || expected_sha256.is_empty()
+    {
         return (
             StatusCode::BAD_REQUEST,
-            "artifact_url and requested_by must not be empty",
+            "artifact_url, expected_sha256 and requested_by must not be empty",
         )
             .into_response();
     }
-    // 读来源（本机绝对路径 / https URL）+ 校验期望摘要（空串视同未给）。
-    let expected_sha256 = request
-        .expected_sha256
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
+    // 读来源（本机绝对路径 / https URL）+ **必须**核对期望摘要（不符即 502，不落记录）。
     let (bytes, package_sha256) =
-        match crate::infra::read_verified_package(&request.artifact_url, expected_sha256).await {
+        match crate::infra::read_verified_package(&request.artifact_url, Some(expected_sha256))
+            .await
+        {
             Ok(verified) => verified,
             Err(err) => {
                 return (
@@ -1801,6 +1801,7 @@ mod tests {
         let pkg = std::env::temp_dir().join(format!("wic-escape-{nanos}.tar.gz"));
         std::fs::write(&pkg, b"escape-bytes").expect("write");
         let source = pkg.to_string_lossy().to_string();
+        let sha = crate::infra::sha256_hex_bytes(b"escape-bytes");
 
         let publish = |component: &str, version: serde_json::Value| {
             Request::builder()
@@ -1811,6 +1812,7 @@ mod tests {
                 .body(Body::from(
                     serde_json::json!({
                         "artifact_url": source,
+                        "expected_sha256": sha,
                         "version": version,
                         "requested_by": "tester",
                     })
@@ -1924,6 +1926,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("mkdir");
         let pkg = dir.join("wist-gateway-stack-v0.1.17.tar.gz");
         let bytes = tar_gz_with_entry("sys/sys_model.yml", b"model");
+        let sha = crate::infra::sha256_hex_bytes(&bytes);
         std::fs::write(&pkg, &bytes).expect("write");
         let source = pkg.to_string_lossy().to_string();
 
@@ -1937,6 +1940,7 @@ mod tests {
                     serde_json::json!({
                         "version": version,
                         "artifact_url": source,
+                        "expected_sha256": sha,
                         "requested_by": "tester",
                     })
                     .to_string(),
@@ -1988,6 +1992,7 @@ mod tests {
                     .body(Body::from(
                         serde_json::json!({
                             "artifact_url": source,
+                            "expected_sha256": crate::infra::sha256_hex_bytes(b"flow-bytes"),
                             "requested_by": "tester",
                         })
                         .to_string(),
@@ -2033,6 +2038,7 @@ mod tests {
                     .body(Body::from(
                         serde_json::json!({
                             "artifact_url": pkg.to_string_lossy(),
+                            "expected_sha256": crate::infra::sha256_hex_bytes(b"payload"),
                             "requested_by": "tester",
                         })
                         .to_string(),
@@ -2074,6 +2080,7 @@ mod tests {
                     serde_json::json!({
                         "version": version,
                         "artifact_url": source.to_string_lossy(),
+                        "expected_sha256": crate::infra::sha256_hex_bytes(b"same-content"),
                         "requested_by": "tester",
                     })
                     .to_string(),
@@ -2140,6 +2147,7 @@ mod tests {
             "wist-agentd-0.1.32-x86_64-unknown-linux-gnu/wist-agentd",
             b"agentd-0.1.32",
         );
+        let sha = crate::infra::sha256_hex_bytes(&bytes);
         std::fs::write(&pkg, &bytes).expect("write");
         let source = pkg.to_string_lossy().to_string();
 
@@ -2153,6 +2161,7 @@ mod tests {
                     serde_json::json!({
                         "version": version,
                         "artifact_url": source,
+                        "expected_sha256": sha,
                         "requested_by": "tester",
                     })
                     .to_string(),

@@ -173,10 +173,9 @@ pub(super) fn first_upgrade_target(spec: &str) -> Option<(String, String)> {
 
 // ── 建计划（服务端切阶段 + 全量条目落 `pending`） ──
 
-fn rollout_plan_id(now: &DateTime) -> String {
-    // 与网关同款：`plan-<sha256(时间戳) 前 12 位>`。
-    let digest = crate::infra::sha256_hex(&now.to_chrono().to_rfc3339());
-    format!("plan-{}", &digest[..12])
+fn rollout_plan_id(action: &str, now: &DateTime) -> String {
+    // 语义化：`plan-<action>-<yyyyMMdd-HHmmss>-<short>`（口径在共享 crate `wist-release::rollout`）。
+    wist_release::rollout::plan_id(action, &now.to_chrono().to_rfc3339())
 }
 
 /// 把请求折算成落库的计划（含按**全量**目标铺好的 `pending` 条目）。
@@ -256,7 +255,7 @@ pub(super) fn build_plan(input: &CreateRolloutPlanRequest) -> Result<UpgradePlan
         })
         .collect();
     Ok(UpgradePlanRecord {
-        plan_id: rollout_plan_id(&now),
+        plan_id: rollout_plan_id(action, &now),
         action: action.to_string(),
         spec: spec.to_string(),
         deadline_at,
