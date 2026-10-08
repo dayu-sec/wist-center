@@ -1,15 +1,13 @@
 //! 灰度发布计划（模型 `Control.Rollout`）在**中心**的编排口径。
 //!
-//! 与网关同一套共享口径（[`wist_release::rollout`]）：阶段由服务端切、固定闸门策略、终态结果
-//! 按 `advance_rule` 推进、末阶段自动收敛。差异只在**物化**：网关把阶段内的目标变成
-//! `OneShotWork`（交付走 `PollWork`）；中心铺的是**网关** —— 一次「升级」由网关自己来拉
+//! 与网关同一套共享口径（[`wist_release::rollout`] 的原子规则 + [`wist_release::plan`] 的编排）：
+//! 阶段由服务端切、固定闸门策略、终态结果按 `advance_rule` 推进、末阶段自动收敛。差异只在
+//! **物化**：网关把阶段内的目标变成 `OneShotWork`（交付走 `PollWork`）；中心铺的是**网关** —— 一次「升级」由网关自己来拉
 //! （`GET /api/v1/gateway/upgrade-plan`）、执行完再回执（`POST /api/v1/gateway/upgrade-result`），
 //! 中心不生成执行单元，所以这里只有「阶段闸门」，没有网关那样的 `batch_size` 节流。
 //!
 //! 管理面 handler 在 [`super::admin_ops`]、网关侧拉取/回执在 [`super::gateway_ops`]；
 //! 本模块是两者共用的**入参形状、读投影与推进逻辑**。
-
-use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
@@ -208,38 +206,15 @@ pub(super) fn build_plan(input: &CreateRolloutPlanRequest) -> Result<UpgradePlan
     if input.timeout_seconds < 0 {
         return Err("timeout_seconds must not be negative".to_string());
     }
-    // 目标：去掉空白与重复（保序）。
-    let mut target_ids: Vec<String> = Vec::with_capacity(input.target_ids.len());
-    {
-        let mut seen: HashSet<String> = HashSet::new();
-        for target in &input.target_ids {
-            let target = target.trim();
-            if target.is_empty() || !seen.insert(target.to_string()) {
-                continue;
-            }
-            target_ids.push(target.to_string());
-        }
-    }
-    if target_ids.is_empty() {
-        return Err("target_ids must name at least one target".to_string());
-    }
-    if input.phase_count < 1 {
-        return Err("phase_count must be at least 1".to_string());
-    }
-    let planned = wist_release::rollout::plan_phases(&target_ids, input.phase_count as usize)?;
-    let phases: Vec<UpgradePhaseRecord> = planned
+    // 目标去重、按阶梯切段、固定闸门策略 —— 口径在共享 crate `wist_release::plan`。
+    let drafts = wist_release::plan::build_phase_drafts(&input.target_ids, input.phase_count)?;
+    let phases: Vec<UpgradePhaseRecord> = drafts
         .into_iter()
-        .map(|phase| UpgradePhaseRecord {
-            phase_index: phase.index as i64,
-            gateway_ids: phase.target_ids,
-            // 固定闸门策略：金丝雀（首段）人工确认；其后「本段全部成功」自动推进。
-            advance_rule: if phase.index == 1 {
-                wist_release::rollout::ADVANCE_RULE_MANUAL
-            } else {
-                wist_release::rollout::ADVANCE_RULE_ALL_SUCCEEDED
-            }
-            .to_string(),
-            status: "pending".to_string(),
+        .map(|draft| UpgradePhaseRecord {
+            phase_index: draft.index,
+            gateway_ids: draft.target_ids,
+            advance_rule: draft.advance_rule,
+            status: draft.status,
         })
         .collect();
     let now = DateTime::now();
@@ -274,90 +249,111 @@ pub(super) fn build_plan(input: &CreateRolloutPlanRequest) -> Result<UpgradePlan
     })
 }
 
-// ── 推进（纯逻辑；中心不物化，所以是同步的） ──
+// ── 推进（口径在共享 crate `wist_release::plan`；中心只映射，不物化） ──
 
-/// 某阶段内各条目的状态列（口径函数只看状态）。
-fn phase_statuses<'a>(plan: &'a UpgradePlanRecord, phase: &UpgradePhaseRecord) -> Vec<&'a str> {
+/// 把中心的阶段记录 ↔ 共享的中立 [`wist_release::plan::PhaseDraft`] 互转。
+fn to_drafts(plan: &UpgradePlanRecord) -> Vec<wist_release::plan::PhaseDraft> {
+    plan.phases
+        .iter()
+        .map(|phase| wist_release::plan::PhaseDraft {
+            index: phase.phase_index,
+            target_ids: phase.gateway_ids.clone(),
+            advance_rule: phase.advance_rule.clone(),
+            status: phase.status.clone(),
+        })
+        .collect()
+}
+
+fn apply_drafts(plan: &mut UpgradePlanRecord, drafts: Vec<wist_release::plan::PhaseDraft>) {
+    for (phase, draft) in plan.phases.iter_mut().zip(drafts) {
+        phase.phase_index = draft.index;
+        phase.gateway_ids = draft.target_ids;
+        phase.advance_rule = draft.advance_rule;
+        phase.status = draft.status;
+    }
+}
+
+/// 批准：进入第一阶段（中心不物化）。返回是否进入了（`false` = 没有阶段，调用方折 409）。
+///
+/// 口径在共享 crate `wist_release::plan`（与网关同一份）。
+pub(super) fn approve_plan(plan: &mut UpgradePlanRecord) -> bool {
+    let mut drafts = to_drafts(plan);
+    let mut current_phase = plan.current_phase;
+    let mut status = plan.status.clone();
+    let entered = wist_release::plan::approve(&mut drafts, &mut current_phase, &mut status);
+    if entered {
+        apply_drafts(plan, drafts);
+        plan.current_phase = current_phase;
+        plan.status = status;
+    }
+    entered
+}
+
+/// 当前阶段各条目的状态（闸门 / 收尾只看这些）；越界 → 空。
+fn current_phase_statuses(plan: &UpgradePlanRecord) -> Vec<String> {
+    let idx = plan.current_phase as usize;
+    if idx == 0 || idx > plan.phases.len() {
+        return Vec::new();
+    }
+    let phase = &plan.phases[idx - 1];
     plan.entries
         .iter()
         .filter(|entry| phase.gateway_ids.contains(&entry.gateway_id))
-        .map(|entry| entry.status.as_str())
+        .map(|entry| entry.status.clone())
         .collect()
 }
 
 /// 把一份 `rolling` 计划推进一个阶段：当前阶段划 `completed`，进下一阶段或**收尾**。
 ///
-/// 收尾（末阶段）时看本段结果：**有失败就落 `failed`**，否则 `completed` —— 不把失败抹成
-/// 「完成」（曾因此让界面把一次失败报成成功）。
+/// 收尾（末阶段）时看本段结果：**有失败就落 `failed`**，否则 `completed`。
 pub(super) fn advance_plan(plan: &mut UpgradePlanRecord) {
-    let idx = plan.current_phase as usize;
-    if idx == 0 || idx > plan.phases.len() {
-        return;
-    }
-    let phase = plan.phases[idx - 1].clone();
-    plan.phases[idx - 1].status = "completed".to_string();
-    if idx == plan.phases.len() {
-        // 末阶段收尾：本段有失败就是 `failed`。
-        let statuses = phase_statuses(plan, &phase);
-        let had_failure = statuses.contains(&"failed");
-        plan.status = if had_failure { "failed" } else { "completed" }.to_string();
-    } else {
-        plan.phases[idx].status = "rolling".to_string();
-        plan.current_phase = (idx + 1) as i64;
-    }
+    let statuses = current_phase_statuses(plan);
+    let refs: Vec<&str> = statuses.iter().map(String::as_str).collect();
+    let mut drafts = to_drafts(plan);
+    let mut current_phase = plan.current_phase;
+    let mut status = plan.status.clone();
+    let _ = wist_release::plan::advance(&mut drafts, &mut current_phase, &mut status, &refs);
+    apply_drafts(plan, drafts);
+    plan.current_phase = current_phase;
+    plan.status = status;
 }
 
 /// 人工推进的**闸门**：要求当前阶段**已全部了结**（含失败）——「上一阶段确认无问题后再推下一批」。
 ///
-/// 末阶段同理：推进它不派新活、只收尾，也要等本段跑完。返回 `Some(原因)` 表示不可推进。
-/// 与网关侧 `advance_rollout_plan` 同一口径（两边都收紧）。
+/// 返回 `Some(原因)` 表示不可推进。口径在共享 crate `wist_release::plan`（与网关同一份）。
 pub(super) fn advance_gate_blocker(plan: &UpgradePlanRecord) -> Option<String> {
-    if plan.status != "rolling" {
-        return Some(format!("plan is {}, not rolling", plan.status));
-    }
-    let idx = plan.current_phase as usize;
-    if idx == 0 || idx > plan.phases.len() {
-        return Some("plan has no phase to advance".to_string());
-    }
-    let phase = &plan.phases[idx - 1];
-    if let Err(reason) = wist_release::rollout::validate_advance_rule(&phase.advance_rule) {
-        return Some(format!("phase advance_rule is invalid: {reason}"));
-    }
-    let statuses = phase_statuses(plan, phase);
-    if !wist_release::rollout::phase_settled(&statuses) {
-        return Some(format!(
-            "phase {} is not settled yet (some targets are still running)",
-            phase.phase_index
-        ));
-    }
-    None
+    let statuses = current_phase_statuses(plan);
+    let refs: Vec<&str> = statuses.iter().map(String::as_str).collect();
+    wist_release::plan::advance_gate_blocker(
+        &plan.status,
+        &to_drafts(plan),
+        plan.current_phase,
+        &refs,
+    )
 }
 
 /// 终态结果回填后按闸门推进：
 /// - 末阶段没有「下一段」，全部了结就直接**收尾**（本段有失败落 `failed`、否则 `completed`，**不看闸门**）；
 /// - 其余阶段：`manual` 等人工点「推进」，`all_succeeded` / `success_rate:` 满足即自动推进。
+///
+/// 口径在共享 crate `wist_release::plan`。
 pub(super) fn progress_plan_after_terminal_result(plan: &mut UpgradePlanRecord) {
-    if plan.status != "rolling" {
-        return;
-    }
-    let idx = plan.current_phase as usize;
-    if idx == 0 || idx > plan.phases.len() {
-        return;
-    }
-    let is_last_phase = idx == plan.phases.len();
-    let phase = plan.phases[idx - 1].clone();
-    let statuses = phase_statuses(plan, &phase);
-    if is_last_phase {
-        if wist_release::rollout::phase_settled(&statuses) {
-            advance_plan(plan);
-        }
-        return;
-    }
-    if phase.advance_rule == wist_release::rollout::ADVANCE_RULE_MANUAL {
-        return;
-    }
-    if wist_release::rollout::phase_should_advance(&phase.advance_rule, &statuses) {
-        advance_plan(plan);
+    let statuses = current_phase_statuses(plan);
+    let refs: Vec<&str> = statuses.iter().map(String::as_str).collect();
+    let mut drafts = to_drafts(plan);
+    let mut current_phase = plan.current_phase;
+    let mut status = plan.status.clone();
+    let stepped = wist_release::plan::progress_after_terminal(
+        &mut drafts,
+        &mut current_phase,
+        &mut status,
+        &refs,
+    )
+    .is_some();
+    if stepped {
+        apply_drafts(plan, drafts);
+        plan.current_phase = current_phase;
+        plan.status = status;
     }
 }
 
@@ -585,6 +581,30 @@ mod tests {
         // 已完成后再次推进是 no-op（handler 会先以 409 拦下）。
         advance_plan(&mut plan);
         assert_eq!(plan.status, "completed");
+    }
+
+    #[test]
+    fn approve_plan_opens_the_first_phase_and_rejects_an_empty_plan() {
+        let mut plan = plan_with(
+            vec![
+                phase(1, &["a"], "manual", "pending"),
+                phase(2, &["b"], "all_succeeded", "pending"),
+            ],
+            vec![entry("a", "pending"), entry("b", "pending")],
+            0,
+            "draft",
+        );
+        assert!(approve_plan(&mut plan));
+        assert_eq!(plan.status, "rolling");
+        assert_eq!(plan.current_phase, 1);
+        assert_eq!(plan.phases[0].status, "rolling");
+        assert_eq!(plan.phases[1].status, "pending", "未到的段仍 pending");
+
+        // 没有阶段 → 不进入，状态不动（handler 据此折 409）。
+        let mut empty = plan_with(Vec::new(), Vec::new(), 0, "draft");
+        assert!(!approve_plan(&mut empty));
+        assert_eq!(empty.status, "draft");
+        assert_eq!(empty.current_phase, 0);
     }
 
     #[test]

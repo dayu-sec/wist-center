@@ -16,10 +16,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux 出 **静态 musl**：制品被抽出到宿主原生运行，不能绑宿主 glibc 版本。
           - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
           - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
           - os: macos-14
             target: aarch64-apple-darwin
     steps:
@@ -30,7 +31,19 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
+      - name: Install musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
       - name: Cargo build
+        # ring / rustls(aws-lc-rs) 等 C 依赖按 target 取 CC；Rust 侧链接器指向 musl-gcc 才能真静态。
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          AR_x86_64_unknown_linux_musl: ar
+          CC_aarch64_unknown_linux_musl: musl-gcc
+          AR_aarch64_unknown_linux_musl: ar
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package tarball
@@ -58,15 +71,15 @@ jobs:
 
       - uses: actions/download-artifact@v8
         with:
-          pattern: wist-center-*-linux-gnu
+          pattern: wist-center-*-linux-musl
           path: staged
           merge-multiple: true
 
       - name: Stage binaries for docker build
         run: |
           mkdir -p docker/amd64 docker/arm64
-          tar -xzf "staged/wist-center-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz" -C docker/amd64
-          tar -xzf "staged/wist-center-${{ github.ref_name }}-aarch64-unknown-linux-gnu.tar.gz" -C docker/arm64
+          tar -xzf "staged/wist-center-${{ github.ref_name }}-x86_64-unknown-linux-musl.tar.gz" -C docker/amd64
+          tar -xzf "staged/wist-center-${{ github.ref_name }}-aarch64-unknown-linux-musl.tar.gz" -C docker/arm64
           ls -R docker/amd64 docker/arm64
 
       - uses: docker/setup-qemu-action@v4

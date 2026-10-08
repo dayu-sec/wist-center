@@ -3,7 +3,7 @@
 
 [package]
 name = "wist-center"
-version = "0.7.0" #@gxl:set(version)
+version = "0.7.1" #@gxl:set(version)
 edition = "2024"
 
 [dependencies]
@@ -31,8 +31,9 @@ time = { version = "0.3", features = ["std"] }
 
 # 读安装包顶层目录名，取 version/arch 自述（与网关侧 install_package.rs 同口径）。
 # 来源读取 / 摘要校验 / 身份解析 / 命名已收进共享 crate `wist-release`，本仓只做薄适配。
-wist-release = "0.4.0"
-#wist-release = { version = "0.4", path = "../wist-release" }
+wist-release = "0.5.0"
+# 本地联调：按 rust-gx 约定切下面这行用 path 指向本地 `wist-release`；发版/无关本仓改动时切回上面的 registry。
+#wist-release = { version = "0.5", path = "../wist-release" }
 
 # 中心服务端 TLS/mTLS：服务器证书（CA-S）+ 校网关客户端证书（CA-G）。
 # 与网关侧 infra/tls.rs 同构（WebPkiClientVerifier + allow_unauthenticated、握手后取客户端叶证书）。

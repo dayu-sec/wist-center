@@ -5,6 +5,24 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.7.1-alpha] - 2026-10-08
+
+### 修复
+
+- **升级计划按平台派生制品地址**：`GET /api/v1/gateway/upgrade-plan` 新增可选 query `platform`
+  （网关自述 target-triple）。多平台组件（`galaxy-ops` / `galaxy-flow` 一次发 macOS-ARM +
+  Linux x86_64/ARM64）此前按 `(component, version)` 反查只取**第一条**记录 —— 会把 Linux 制品
+  派给 macOS 网关，网关侧架构护栏拒装（`架构校验失败，未覆盖 gops：制品操作系统 linux 与本机 macos 不符`）。
+  现在按 完整三元组 ＞ 同平台家族（忽略 gnu/musl）＞ 无平台概念的包 挑，挑不到就不带地址
+  （回落版本），绝不派错平台。老网关不声明 `platform` 时只在「唯一候选 / 无平台概念的包」时派生。
+
+### 变更
+
+- **Linux 制品改为静态 musl**：发布矩阵从 `x86_64-unknown-linux-gnu` / `aarch64-unknown-linux-gnu`
+  收敛为 `x86_64-unknown-linux-musl` / `aarch64-unknown-linux-musl`（macOS 仍 `aarch64-apple-darwin`），
+  构建时装 `musl-tools` 并把 C 依赖（`ring` / rustls 的 aws-lc-rs）的 `CC`/链接器指向 `musl-gcc`，产出**静态链接**二进制。
+  docker 作业（多架构镜像）随之改取 musl 制品（`staged` / 解包文件名同步）。满足控制中心「三平台、不出现 glibc」的平台集。
+
 ## [0.7.0-alpha] - 2026-10-07
 
 ### 变更

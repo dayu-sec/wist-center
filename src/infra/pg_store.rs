@@ -720,16 +720,18 @@ impl Store for PgStore {
         version: &str,
         artifact_url: &str,
         package_sha256: Option<&str>,
+        platform: Option<&str>,
     ) -> Result<ReleaseRecord, StoreError> {
         let published_at = chrono::Utc::now();
         sqlx::query(
-            "INSERT INTO release_records (component, version, artifact_url, package_sha256, status, published_at) \
-             VALUES ($1, $2, $3, $4, 'published', $5)",
+            "INSERT INTO release_records (component, version, artifact_url, package_sha256, platform, status, published_at) \
+             VALUES ($1, $2, $3, $4, $5, 'published', $6)",
         )
         .bind(component)
         .bind(version)
         .bind(artifact_url)
         .bind(package_sha256)
+        .bind(platform)
         .bind(published_at)
         .execute(&self.pool)
         .await
@@ -738,6 +740,7 @@ impl Store for PgStore {
             version: version.to_string(),
             artifact_url: artifact_url.to_string(),
             package_sha256: package_sha256.map(str::to_string),
+            platform: platform.map(str::to_string),
             status: "published".to_string(),
             published_at: DateTime::from_rfc3339(&published_at.to_rfc3339())
                 .unwrap_or_else(DateTime::now),
@@ -746,7 +749,7 @@ impl Store for PgStore {
 
     async fn list_releases(&self, component: &str) -> Result<Vec<ReleaseRecord>, StoreError> {
         let rows: Vec<ReleaseRow> = sqlx::query_as(
-            "SELECT version, artifact_url, package_sha256, status, published_at FROM release_records \
+            "SELECT version, artifact_url, package_sha256, platform, status, published_at FROM release_records \
              WHERE component = $1 ORDER BY published_at DESC",
         )
         .bind(component)
@@ -754,6 +757,45 @@ impl Store for PgStore {
         .await
         .source_raw_err(StoreReason::Sql, "list releases")?;
         Ok(rows.into_iter().map(ReleaseRow::into_record).collect())
+    }
+
+    async fn set_release_status(
+        &self,
+        component: &str,
+        version: &str,
+        status: &str,
+    ) -> Result<u64, StoreError> {
+        let result = sqlx::query(
+            "UPDATE release_records SET status = $1 WHERE component = $2 AND version = $3",
+        )
+        .bind(status)
+        .bind(component)
+        .bind(version)
+        .execute(&self.pool)
+        .await
+        .source_raw_err(StoreReason::Sql, "update release status")?;
+        Ok(result.rows_affected())
+    }
+
+    async fn set_release_platform(
+        &self,
+        component: &str,
+        version: &str,
+        package_sha256: &str,
+        platform: Option<&str>,
+    ) -> Result<Option<ReleaseRecord>, StoreError> {
+        let row: Option<ReleaseRow> = sqlx::query_as(
+            "UPDATE release_records SET platform = $1 WHERE component = $2 AND version = $3 AND package_sha256 = $4 \
+             RETURNING version, artifact_url, package_sha256, platform, status, published_at",
+        )
+        .bind(platform)
+        .bind(component)
+        .bind(version)
+        .bind(package_sha256)
+        .fetch_optional(&self.pool)
+        .await
+        .source_raw_err(StoreReason::Sql, "update release platform")?;
+        Ok(row.map(ReleaseRow::into_record))
     }
 
     async fn create_upgrade_plan(
@@ -885,6 +927,7 @@ struct ReleaseRow {
     version: String,
     artifact_url: String,
     package_sha256: Option<String>,
+    platform: Option<String>,
     status: String,
     published_at: chrono::DateTime<chrono::Utc>,
 }
@@ -895,6 +938,7 @@ impl ReleaseRow {
             version: self.version,
             artifact_url: self.artifact_url,
             package_sha256: self.package_sha256,
+            platform: self.platform,
             status: self.status,
             published_at: DateTime::from_rfc3339(&self.published_at.to_rfc3339())
                 .unwrap_or_else(DateTime::now),

@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use wist_control::GatewayInstanceLifecycleState;
 use wist_control::types::DateTime;
 
-use super::sha256_hex;
+use super::{ReleaseArtifact, ReleasePackage, sha256_hex};
 use crate::config::GatewayCredentialSeed;
 
 pub use wist_error::{StoreError, StoreReason};
@@ -269,8 +269,70 @@ pub struct ReleaseRecord {
     /// 制品内容的 sha256（裸 hex）。录入时算出 / 校验；老记录为 `None`。
     #[serde(default)]
     pub package_sha256: Option<String>,
+    /// 目标平台（target-triple，如 `aarch64-apple-darwin` / `x86_64-unknown-linux-musl`）。
+    /// 无平台概念的包（如部署栈 `wist-gateway-stack`）解析不出 → `None`（界面显示「通用」）。
+    #[serde(default)]
+    pub platform: Option<String>,
+    /// 托管状态：`published`（已录入）/ `expired`（已过期）。
     pub status: String,
     pub published_at: DateTime,
+}
+
+/// 管理面「安装包」视图：共享的 `ReleasePackage`（version + artifacts）外挂目录字段。
+///
+/// JSON 形如 `{ component, version, artifacts: [...], status, published_at }`（`package` 被 flatten）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleasePackageRecord {
+    /// 组件（目录键，如 `galaxy-ops`）。
+    pub component: String,
+    /// 包级托管状态：`published` / `expired`。
+    pub status: String,
+    /// 首次录入时间（组内最早）。
+    pub published_at: DateTime,
+    #[serde(flatten)]
+    pub package: ReleasePackage,
+}
+
+/// 把某组件的扁平发布记录（一行一个制品）按 `version` 归成安装包。
+///
+/// - 组顺序 = 首次出现顺序（调用方一般按 `published_at` 新→旧传入）；
+/// - 组内 `published_at` 取最早（包首次出现时间）；
+/// - 组内制品按 `platform` 排序。
+pub fn group_release_packages(
+    component: &str,
+    records: Vec<ReleaseRecord>,
+) -> Vec<ReleasePackageRecord> {
+    let mut packages: Vec<ReleasePackageRecord> = Vec::new();
+    for record in records {
+        let artifact = ReleaseArtifact {
+            platform: record.platform,
+            sha256: record.package_sha256.unwrap_or_default(),
+            source: record.artifact_url,
+        };
+        if let Some(existing) = packages
+            .iter_mut()
+            .find(|existing| existing.package.version == record.version)
+        {
+            if record.published_at.to_chrono() < existing.published_at.to_chrono() {
+                existing.published_at = record.published_at;
+            }
+            existing.package.artifacts.push(artifact);
+        } else {
+            packages.push(ReleasePackageRecord {
+                component: component.to_string(),
+                status: record.status,
+                published_at: record.published_at,
+                package: ReleasePackage::new(record.version, vec![artifact]),
+            });
+        }
+    }
+    for package in &mut packages {
+        package
+            .package
+            .artifacts
+            .sort_by(|left, right| left.platform.cmp(&right.platform));
+    }
+    packages
 }
 
 /// 网关生命周期一次状态转变记录（过程历史，append-only）。
@@ -549,15 +611,34 @@ pub trait Store: Send + Sync + std::fmt::Debug {
         gateway_id: &str,
     ) -> Result<Vec<LifecycleEvent>, StoreError>;
     /// 记录一次版本发布（component = wist-agentd / wist-gateway-stack），返回记录。
+    /// `platform` 为目标平台（target-triple），无平台概念的包传 `None`。
     async fn publish_release(
         &self,
         component: &str,
         version: &str,
         artifact_url: &str,
         package_sha256: Option<&str>,
+        platform: Option<&str>,
     ) -> Result<ReleaseRecord, StoreError>;
     /// 查询某组件的历史发布记录（新→旧）。
     async fn list_releases(&self, component: &str) -> Result<Vec<ReleaseRecord>, StoreError>;
+    /// 更新某组件某版本的托管状态（如 `published` → `expired`）：该版本**全部制品行**一起改。
+    /// 返回受影响行数（0 = 无该版本）。
+    async fn set_release_status(
+        &self,
+        component: &str,
+        version: &str,
+        status: &str,
+    ) -> Result<u64, StoreError>;
+    /// 补写某**制品行**的平台（身份解析改好后的历史记录缺平台时用）。
+    /// 按 `(component, version, package_sha256)` 精确定位，避免把多平台包的其它平台行一并覆盖。无该行 → `None`。
+    async fn set_release_platform(
+        &self,
+        component: &str,
+        version: &str,
+        package_sha256: &str,
+        platform: Option<&str>,
+    ) -> Result<Option<ReleaseRecord>, StoreError>;
     /// 创建升级计划（多目标 + 网关范围 + 灰度阶段），status=draft。
     async fn create_upgrade_plan(
         &self,
@@ -971,11 +1052,13 @@ impl FileStore {
         version: &str,
         artifact_url: &str,
         package_sha256: Option<&str>,
+        platform: Option<&str>,
     ) -> Result<ReleaseRecord, StoreError> {
         let record = ReleaseRecord {
             version: version.to_string(),
             artifact_url: artifact_url.to_string(),
             package_sha256: package_sha256.map(str::to_string),
+            platform: platform.map(str::to_string),
             status: "published".to_string(),
             published_at: DateTime::now(),
         };
@@ -1003,6 +1086,49 @@ impl FileStore {
                 .cmp(&left.published_at.to_chrono())
         });
         Ok(records)
+    }
+
+    /// 更新某组件某版本的托管状态（同步，供测试与 trait 委托）：该版本全部制品行一起改。
+    /// 返回受影响行数。
+    pub fn set_release_status(
+        &self,
+        component: &str,
+        version: &str,
+        status: &str,
+    ) -> Result<u64, StoreError> {
+        self.update(|snapshot| {
+            let Some(records) = snapshot.releases.get_mut(component) else {
+                return 0;
+            };
+            let mut updated = 0u64;
+            for record in records
+                .iter_mut()
+                .filter(|record| record.version == version)
+            {
+                record.status = status.to_string();
+                updated += 1;
+            }
+            updated
+        })
+    }
+
+    /// 补写某**制品行**的平台（同步，供测试与 trait 委托）：按内容 sha 精确定位。无该行 → `None`。
+    pub fn set_release_platform(
+        &self,
+        component: &str,
+        version: &str,
+        package_sha256: &str,
+        platform: Option<&str>,
+    ) -> Result<Option<ReleaseRecord>, StoreError> {
+        self.update(|snapshot| {
+            let records = snapshot.releases.get_mut(component)?;
+            let record = records.iter_mut().find(|record| {
+                record.version == version
+                    && record.package_sha256.as_deref() == Some(package_sha256)
+            })?;
+            record.platform = platform.map(str::to_string);
+            Some(record.clone())
+        })
     }
 
     /// 创建升级计划（同步，供测试与 trait 委托）：status=draft，插入最前（新→旧）。
@@ -1361,12 +1487,39 @@ impl Store for FileStore {
         version: &str,
         artifact_url: &str,
         package_sha256: Option<&str>,
+        platform: Option<&str>,
     ) -> Result<ReleaseRecord, StoreError> {
-        FileStore::publish_release(self, component, version, artifact_url, package_sha256)
+        FileStore::publish_release(
+            self,
+            component,
+            version,
+            artifact_url,
+            package_sha256,
+            platform,
+        )
     }
 
     async fn list_releases(&self, component: &str) -> Result<Vec<ReleaseRecord>, StoreError> {
         FileStore::list_releases(self, component)
+    }
+
+    async fn set_release_status(
+        &self,
+        component: &str,
+        version: &str,
+        status: &str,
+    ) -> Result<u64, StoreError> {
+        FileStore::set_release_status(self, component, version, status)
+    }
+
+    async fn set_release_platform(
+        &self,
+        component: &str,
+        version: &str,
+        package_sha256: &str,
+        platform: Option<&str>,
+    ) -> Result<Option<ReleaseRecord>, StoreError> {
+        FileStore::set_release_platform(self, component, version, package_sha256, platform)
     }
 
     async fn create_upgrade_plan(

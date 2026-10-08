@@ -195,6 +195,8 @@ All require the admin Bearer token:
 | `POST` | `/api/v1/admin/policies/global` |
 | `POST` | `/api/v1/gateway/agents/dispatch` |
 | `POST` / `GET` | `/api/v1/admin/releases/:component` |
+| `POST` | `/api/v1/admin/releases/:component/batch` |
+| `POST` | `/api/v1/admin/releases/:component/:version/status` |
 | `POST` / `GET` | `/api/v1/admin/rollout-plans` |
 | `POST` | `/api/v1/admin/rollout-plans/approve` |
 | `POST` | `/api/v1/admin/rollout-plans/advance` |

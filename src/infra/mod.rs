@@ -2,6 +2,8 @@ pub mod artifacts;
 pub use artifacts::*;
 pub mod gateway_ca;
 pub use gateway_ca::*;
+pub mod github;
+pub use github::*;
 pub mod package;
 pub use package::*;
 pub mod pg_store;

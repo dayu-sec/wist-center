@@ -18,9 +18,9 @@ use wist_control::{
 };
 
 use crate::infra::{
-    EnrollmentTokenIssue, GatewayStatusUpdate, StoreReason, StoredAgent, StoredGateway,
-    StoredGatewayCredentialStatus, VerifiedGatewayIdentity, derive_regist_token, new_secret_token,
-    sha256_hex,
+    EnrollmentTokenIssue, GatewayStatusUpdate, ReleaseRecord, StoreReason, StoredAgent,
+    StoredGateway, StoredGatewayCredentialStatus, VerifiedGatewayIdentity, derive_regist_token,
+    new_secret_token, normalize_platform, platform_family, sha256_hex,
 };
 
 use super::{
@@ -292,9 +292,10 @@ pub async fn register_gateway(
     .into_response()
 }
 
-/// 取升级目标：`GET /api/v1/gateway/upgrade-plan?gateway_id=`（mTLS 客户端证书鉴权）。
+/// 取升级目标：`GET /api/v1/gateway/upgrade-plan?gateway_id=&platform=`（mTLS 客户端证书鉴权）。
 ///
 /// 解析「覆盖本网关的、最新的已批准升级计划」，给出应升到的目标；无则 `has_plan=false`。见 CR-002 C2。
+/// `platform`（target-triple，可选）为网关自述平台：中心据此挑平台匹配的制品下发地址（多平台组件）。
 pub async fn get_gateway_upgrade_plan(
     State(state): State<ApiState>,
     identity: Option<Extension<VerifiedGatewayIdentity>>,
@@ -313,7 +314,7 @@ pub async fn get_gateway_upgrade_plan(
     {
         return response;
     }
-    match upgrade_plan_for(&state, gateway_id).await {
+    match upgrade_plan_for(&state, gateway_id, params.platform.as_deref()).await {
         Ok(plan) => Json(plan).into_response(),
         Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
     }
@@ -322,6 +323,7 @@ pub async fn get_gateway_upgrade_plan(
 async fn upgrade_plan_for(
     state: &ApiState,
     gateway_id: &str,
+    platform: Option<&str>,
 ) -> Result<GatewayUpgradePlan, String> {
     // 该网关此刻该执行的计划：`rolling` 且它落在 `current_phase` 阶段内（阶段由服务端切，
     // 中心与网关同一套口径，见 `super::rollout`）。
@@ -338,9 +340,13 @@ async fn upgrade_plan_for(
     // 现模型的 `GatewayUpgradePlan` 只承载**单组件**目标；多组件计划这里取第一个
     // （要精确到组件，需把 `GatewayUpgradePlan` 扩成列表，届时同步发 `wist-control`）。
     let target = rollout::first_upgrade_target(&plan.spec);
-    // 地址由中心**派生**（反查已发布的 release 记录），不让运维手输。
+    // 地址由中心**派生**（反查已发布的 release 记录），不让运维手输。多平台组件
+    // （galaxy-ops / galaxy-flow 一次发三平台）还要按**网关声明的平台**挑，否则会把 Linux
+    // 制品派给 macOS 主机，网关侧架构护栏拒装、升级直接失败。
     let artifact_url = match &target {
-        Some((component, version)) => resolve_release_artifact_url(state, component, version).await,
+        Some((component, version)) => {
+            resolve_release_artifact_url(state, component, version, platform).await
+        }
         None => None,
     };
     // 网关已取走这份计划：把本阶段条目标 `dispatched`（幂等；失败只记日志，不影响下发）。
@@ -361,21 +367,70 @@ async fn upgrade_plan_for(
     })
 }
 
-/// 反查该组件该版本**已发布的制品下发地址**（镜像后的绝对 URL）；无对应 release 记录则 `None`
+/// 反查该组件该版本**已发布的制品下发地址**（镜像后的绝对 URL）；无匹配则 `None`
 /// （执行器会回落用 `to_version`）。
 ///
 /// 地址由中心派生，不让运维手输 —— 与 agent 包同款教训（手输的路径会漂到别的机器上）。
 /// 见设计 `wist-design/doc/design/edge/gateway-upgrade-and-releases.md`。
+///
+/// 多平台组件（同一 `(component, version)` 下多个平台制品行）必须按**网关声明的平台**
+/// `wanted_platform` 挑，挑不到就**不给**：宁可让执行器回落、也绝不把错平台制品派给主机
+/// （错平台二进制覆盖上去不会报错，只会让工具静默报废）。挑法优先级：
+/// 完整 target-triple 精确命中 ＞ 同平台家族（忽略 gnu/musl 等 abi）＞ 无平台概念的包
+/// （如 `wist-gateway-stack`，适用任意主机，仅当唯一时给）。
 async fn resolve_release_artifact_url(
     state: &ApiState,
     component: &str,
     version: &str,
+    wanted_platform: Option<&str>,
 ) -> Option<String> {
     let releases = state.store.list_releases(component).await.ok()?;
-    releases
-        .into_iter()
-        .find(|release| release.version == version)
-        .map(|release| release.artifact_url)
+    let candidates: Vec<&ReleaseRecord> = releases
+        .iter()
+        .filter(|release| release.version == version)
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    if let Some(wanted) = wanted_platform {
+        // 1) 完整 target-triple 精确命中。
+        let wanted = normalize_platform(wanted);
+        if let Some(record) = candidates.iter().find(|record| {
+            record
+                .platform
+                .as_deref()
+                .is_some_and(|platform| normalize_platform(platform) == wanted)
+        }) {
+            return Some(record.artifact_url.clone());
+        }
+        // 2) 同一平台家族（吃下 gnu / musl 之类的 abi 差异）；同家族多于一条则视为歧义。
+        if let Some(family) = platform_family(&wanted) {
+            let mut matched = candidates.iter().filter(|record| {
+                record.platform.as_deref().and_then(platform_family) == Some(family)
+            });
+            if let Some(record) = matched.next()
+                && matched.next().is_none()
+            {
+                return Some(record.artifact_url.clone());
+            }
+        }
+    }
+    // 3) 无平台概念的包（如部署栈 `wist-gateway-stack`）适用任意主机；仅当唯一时才给。
+    let mut agnostic = candidates.iter().filter(|record| record.platform.is_none());
+    if let Some(record) = agnostic.next()
+        && agnostic.next().is_none()
+    {
+        return Some(record.artifact_url.clone());
+    }
+    // 4) 老网关（不声明平台）：唯一候选即给，保持旧行为。
+    if wanted_platform.is_none()
+        && let [only] = candidates.as_slice()
+    {
+        return Some(only.artifact_url.clone());
+    }
+    // 5) 其余（多平台且网关没声明 / 声明对不上）→ 不给，执行器回落 `to_version`，
+    //    绝不把错平台制品派给主机。
+    None
 }
 
 /// 升级结果回执：`POST /api/v1/gateway/upgrade-result`（mTLS 客户端证书）。见 CR-002 C2。
@@ -435,6 +490,10 @@ pub async fn report_gateway_upgrade_result(
 #[derive(serde::Deserialize)]
 pub struct InitialConfigQueryParams {
     pub gateway_id: String,
+    /// 网关声明的目标平台（target-triple，如 `aarch64-apple-darwin`）。多平台组件的制品选择
+    /// 据此判定；缺省 = 老网关不声明，中心只在「唯一候选 / 无平台概念的包」时才派生地址。
+    #[serde(default)]
+    pub platform: Option<String>,
 }
 
 /// 链接上级 / 拉取网关初始配置：GET /api/v1/gateway/link-upstream。
@@ -1616,14 +1675,14 @@ mod tests {
     }
 
     /// 升级目标里的 `artifact_url` 由中心**反查已发布的 release** 派生；无对应记录那么为 `None`
-    /// （执行器回落用 `to_version`）。
+    /// （执行器回落用 `to_version`）。无平台概念的包（`wist-gateway-stack`）不声明平台也派生。
     #[tokio::test]
     async fn release_artifact_url_is_derived_from_the_published_release() {
         let state = provision_state("link-tok-release");
         let url = "https://center.example/api/v1/releases/artifact/wist-gateway-stack/0.1.27/wist-gateway-stack-0.1.27.tar.gz";
 
         assert!(
-            super::resolve_release_artifact_url(&state, "wist-gateway-stack", "0.1.27")
+            super::resolve_release_artifact_url(&state, "wist-gateway-stack", "0.1.27", None)
                 .await
                 .is_none(),
             "没发布过 → None"
@@ -1631,20 +1690,120 @@ mod tests {
 
         state
             .store
-            .publish_release("wist-gateway-stack", "0.1.27", url, None)
+            .publish_release("wist-gateway-stack", "0.1.27", url, None, None)
             .await
             .expect("publish release");
-        assert_eq!(
-            super::resolve_release_artifact_url(&state, "wist-gateway-stack", "0.1.27")
+        // 无平台概念的包：网关（老/新）都能拿到它。
+        for wanted in [
+            None,
+            Some("aarch64-apple-darwin"),
+            Some("x86_64-unknown-linux-gnu"),
+        ] {
+            assert_eq!(
+                super::resolve_release_artifact_url(
+                    &state,
+                    "wist-gateway-stack",
+                    "0.1.27",
+                    wanted,
+                )
                 .await
                 .as_deref(),
-            Some(url)
-        );
+                Some(url),
+                "wanted={wanted:?}"
+            );
+        }
         assert!(
-            super::resolve_release_artifact_url(&state, "wist-gateway-stack", "9.9.9")
+            super::resolve_release_artifact_url(&state, "wist-gateway-stack", "9.9.9", None)
                 .await
                 .is_none(),
             "版本不符 → None"
+        );
+    }
+
+    /// 多平台组件（galaxy-ops 一次发三平台）：中心必须按**网关声明的平台**挑制品，
+    /// 否则会把 Linux 制品派给 macOS 主机，网关侧架构护栏拒装、升级失败。
+    #[tokio::test]
+    async fn release_artifact_url_follows_the_gateway_platform() {
+        let state = provision_state("link-tok-platform");
+        let mac = "https://center.example/artifacts/galaxy-ops/v0/mac.tar.gz";
+        let linux_x86 = "https://center.example/artifacts/galaxy-ops/v0/linux-x86.tar.gz";
+        let linux_arm = "https://center.example/artifacts/galaxy-ops/v0/linux-arm.tar.gz";
+        for (url, platform) in [
+            (mac, "aarch64-apple-darwin"),
+            (linux_x86, "x86_64-unknown-linux-musl"),
+            (linux_arm, "aarch64-unknown-linux-musl"),
+        ] {
+            state
+                .store
+                .publish_release("galaxy-ops", "v0", url, None, Some(platform))
+                .await
+                .expect("publish release");
+        }
+
+        let resolve = |wanted: Option<&'static str>| {
+            let state = state.clone();
+            async move { super::resolve_release_artifact_url(&state, "galaxy-ops", "v0", wanted).await }
+        };
+
+        // 精确三元组命中。
+        assert_eq!(
+            resolve(Some("aarch64-apple-darwin")).await.as_deref(),
+            Some(mac)
+        );
+        // 同平台家族（gnu 主机也拿到 musl 制品）。
+        assert_eq!(
+            resolve(Some("x86_64-unknown-linux-gnu")).await.as_deref(),
+            Some(linux_x86)
+        );
+        assert_eq!(
+            resolve(Some("aarch64-unknown-linux-gnu")).await.as_deref(),
+            Some(linux_arm)
+        );
+        // 声明了对不上的平台 → **不给**（绝不派错平台制品）。
+        assert!(resolve(Some("x86_64-apple-darwin")).await.is_none());
+        // 老网关不声明平台、多平台无从判定 → 不给（执行器回落版本）。
+        assert!(resolve(None).await.is_none());
+
+        // 组件只有单一平台制品且声明对不上 → 也不给（不派错平台）；声明对得上（含同家族）才给。
+        state
+            .store
+            .publish_release(
+                "solo-linux",
+                "v0",
+                "https://center.example/solo/solo-linux-v0.tar.gz",
+                None,
+                Some("x86_64-unknown-linux-musl"),
+            )
+            .await
+            .expect("publish solo");
+        assert!(
+            super::resolve_release_artifact_url(
+                &state,
+                "solo-linux",
+                "v0",
+                Some("aarch64-apple-darwin"),
+            )
+            .await
+            .is_none(),
+            "单一 linux 制品不能派给 mac 主机"
+        );
+        assert_eq!(
+            super::resolve_release_artifact_url(
+                &state,
+                "solo-linux",
+                "v0",
+                Some("x86_64-unknown-linux-gnu"),
+            )
+            .await
+            .as_deref(),
+            Some("https://center.example/solo/solo-linux-v0.tar.gz")
+        );
+        // 老网关不声明平台：唯一候选即给（旧行为）。
+        assert_eq!(
+            super::resolve_release_artifact_url(&state, "solo-linux", "v0", None)
+                .await
+                .as_deref(),
+            Some("https://center.example/solo/solo-linux-v0.tar.gz")
         );
     }
 

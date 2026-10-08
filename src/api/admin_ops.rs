@@ -567,7 +567,8 @@ pub async fn admin_publish_release(
         };
     // 从包里读身份：包内目录名，读不出再回落来源文件名。
     // 覆盖 agentd 包（目录名带身份）与 gateway-stack / galaxy-ops / galaxy-flow 包（文件名带版本）。
-    let (package_version, _arch) =
+    // 第二项是目标平台（target-triple）：二进制包能切出，部署栈包为空串 —— 空串不落库（界面显示「通用」）。
+    let (package_version, package_arch) =
         crate::infra::read_package_identity(&request.artifact_url, &bytes);
     // 版本以**包自报为准**，不让运维手输：
     // - 请求带了 version → 与自报版本**核对**（不一致 → 400）；
@@ -603,18 +604,7 @@ pub async fn admin_publish_release(
                 .into_response();
         }
     };
-    // 同一 (component, version) 已镜像过**同一份内容** → 幂等返回，不重复下副本。
-    if let Ok(existing) = state.store.list_releases(&component).await
-        && let Some(record) = existing.iter().find(|record| {
-            record.version == version
-                && record.package_sha256.as_deref() == Some(package_sha256.as_str())
-        })
-    {
-        return Json(record.clone()).into_response();
-    }
-    // 落盘 / 下发文件名：**用来源原名**（URL 末段就是原名，人看着清楚）；
-    // 内容寻址不再靠文件名，而在 DB 的 `package_sha256` + `(component, version, sha)` 幂等。
-    // 版本号同样会拼进目录 —— 手输的那份也要过同一道关。
+    // 版本号会拼进制品目录 —— 手输的那份也要过同一道关。
     if !crate::infra::is_safe_path_segment(&version) {
         return (
             StatusCode::BAD_REQUEST,
@@ -622,36 +612,345 @@ pub async fn admin_publish_release(
         )
             .into_response();
     }
-    let filename = crate::infra::artifact_filename(&request.artifact_url, &component, &version);
-    let mirrored_url = match state
-        .artifact_store
-        .store(&component, &version, &filename, bytes)
-        .await
+    let platform = (!package_arch.is_empty()).then_some(package_arch.as_str());
+    match record_verified_release(
+        &state,
+        &component,
+        &version,
+        &request.artifact_url,
+        bytes,
+        &package_sha256,
+        platform,
+    )
+    .await
     {
-        Ok(url) => url,
-        Err(err) => {
-            return (
+        Ok(_record) => match load_package(&state, &component, &version).await {
+            Ok(Some(package)) => Json(package).into_response(),
+            Ok(None) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "release recorded but not found",
+            )
+                .into_response(),
+            Err(response) => response,
+        },
+        Err(response) => response,
+    }
+}
+
+/// 读取某组件某版本的「安装包」视图（把该组件全部发布记录归组成包后取该版本）。
+#[allow(clippy::result_large_err)]
+async fn load_package(
+    state: &ApiState,
+    component: &str,
+    version: &str,
+) -> Result<Option<crate::infra::ReleasePackageRecord>, Response> {
+    match state.store.list_releases(component).await {
+        Ok(records) => Ok(crate::infra::group_release_packages(component, records)
+            .into_iter()
+            .find(|package| package.package.version == version)),
+        Err(err) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to load releases: {err}"),
+        )
+            .into_response()),
+    }
+}
+
+/// 多平台组件一次录入的**必需平台集**（一次必须齐备）。`None` = 不受限（单制品组件）。
+fn required_platforms(component: &str) -> Option<&'static [&'static str]> {
+    match component {
+        // Gops / Gx：一次录入必须覆盖三平台（macOS-ARM + Linux x86_64 / ARM64 的 musl 静态版）。
+        "galaxy-ops" | "galaxy-flow" => Some(&[
+            "aarch64-apple-darwin",
+            "x86_64-unknown-linux-musl",
+            "aarch64-unknown-linux-musl",
+        ]),
+        _ => None,
+    }
+}
+
+/// 把一个**已验证**的制品镜像并落库（单条与批量共用）：
+/// - 同一 `(component, version, sha)` 已存在 → 幂等（不重复下副本；旧记录缺平台则补齐）；
+/// - 否则镜像到制品存储并写一条 `published` 记录。
+///
+/// `platform` 为目标平台（target-triple），无平台概念的包传 `None`。
+#[allow(clippy::result_large_err)]
+async fn record_verified_release(
+    state: &ApiState,
+    component: &str,
+    version: &str,
+    artifact_url: &str,
+    bytes: Vec<u8>,
+    package_sha256: &str,
+    platform: Option<&str>,
+) -> Result<crate::infra::ReleaseRecord, Response> {
+    // 同一 (component, version) 已镜像过**同一份内容** → 幂等返回，不重复下副本。
+    if let Ok(existing) = state.store.list_releases(component).await
+        && let Some(record) = existing.iter().find(|record| {
+            record.version == version && record.package_sha256.as_deref() == Some(package_sha256)
+        })
+    {
+        // 幂等命中：若旧记录缺平台而现在能解析出来（身份解析改好前的历史记录），顺手补齐，
+        // 避免列表一直显示「通用」（同一份内容不会重复下副本）。按 sha 精确定位该**制品行**，
+        // 不碰同版本其它平台的制品行。
+        if record.platform.is_none()
+            && let Some(platform) = platform
+            && let Ok(Some(updated)) = state
+                .store
+                .set_release_platform(component, version, package_sha256, Some(platform))
+                .await
+        {
+            return Ok(updated);
+        }
+        return Ok(record.clone());
+    }
+    // 落盘 / 下发文件名用来源原名（URL 末段就是原名，人看着清楚）；内容寻址靠 DB 的
+    // `package_sha256` + `(component, version, sha)` 幂等。版本号会拼进目录，调用方已校验过。
+    let filename = crate::infra::artifact_filename(artifact_url, component, version);
+    let mirrored_url = state
+        .artifact_store
+        .store(component, version, &filename, bytes)
+        .await
+        .map_err(|err| {
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("failed to store artifact: {err}"),
             )
-                .into_response();
-        }
-    };
-    let record = match state
+                .into_response()
+        })?;
+    state
         .store
-        .publish_release(&component, &version, &mirrored_url, Some(&package_sha256))
+        .publish_release(
+            component,
+            version,
+            &mirrored_url,
+            Some(package_sha256),
+            platform,
+        )
         .await
-    {
-        Ok(record) => record,
-        Err(err) => {
-            return (
+        .map_err(|err| {
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("failed to record release: {err}"),
             )
+                .into_response()
+        })
+}
+
+/// 批量录入请求体：多平台组件（galaxy-ops / galaxy-flow）一次覆盖三个平台。
+/// 平台由包自身解析，不由请求声明。
+#[derive(serde::Deserialize)]
+pub struct BatchPublishReleaseRequest {
+    pub requested_by: String,
+    pub artifacts: Vec<BatchArtifact>,
+}
+
+/// 批量录入里的单个制品。
+#[derive(serde::Deserialize)]
+pub struct BatchArtifact {
+    pub artifact_url: String,
+    pub expected_sha256: String,
+}
+
+/// 批量录入某组件的多平台制品：POST /api/v1/admin/releases/:component/batch。
+///
+/// 一次请求覆盖**同一版本**的多个平台（galaxy-ops / galaxy-flow 必须 macOS-ARM / Linux-ARM /
+/// Linux-X86 三平台齐备）。所有制品先**下载 + 校验摘要 + 解析身份**，任一不合格即整体拒绝
+/// （**不落任何记录**）；全部通过后再逐个镜像落库。
+pub async fn admin_publish_release_batch(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    client: PeerConnectInfo,
+    Path(component): Path<String>,
+    Json(request): Json<BatchPublishReleaseRequest>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    if !crate::infra::is_safe_path_segment(&component) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "component must be a single safe path segment",
+        )
+            .into_response();
+    }
+    if request.requested_by.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "requested_by must not be empty").into_response();
+    }
+    if request.artifacts.is_empty() {
+        return (StatusCode::BAD_REQUEST, "artifacts must not be empty").into_response();
+    }
+
+    // 单个制品的校验结果（下载 / 摘要 / 身份都在此步完成）。
+    struct Prepared {
+        version: String,
+        /// 完整 target-triple（如 `aarch64-apple-darwin`），即该制品的平台身份。
+        arch: String,
+        artifact_url: String,
+        bytes: Vec<u8>,
+        package_sha256: String,
+    }
+
+    // 第一阶段：全部下载 + 校验 + 解析身份，任一不合格即整体拒绝。
+    let mut prepared: Vec<Prepared> = Vec::with_capacity(request.artifacts.len());
+    for artifact in &request.artifacts {
+        let expected = artifact.expected_sha256.trim();
+        if artifact.artifact_url.trim().is_empty() || expected.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                "artifact_url and expected_sha256 must not be empty",
+            )
                 .into_response();
         }
-    };
-    Json(record).into_response()
+        let (bytes, package_sha256) =
+            match crate::infra::read_verified_package(&artifact.artifact_url, Some(expected)).await
+            {
+                Ok(verified) => verified,
+                Err(err) => {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        format!(
+                            "failed to fetch artifact `{}`: {err}",
+                            artifact.artifact_url
+                        ),
+                    )
+                        .into_response();
+                }
+            };
+        let (version, arch) = crate::infra::read_package_identity(&artifact.artifact_url, &bytes);
+        if version.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "cannot derive version from `{}`: use an artifact whose name carries a version",
+                    artifact.artifact_url
+                ),
+            )
+                .into_response();
+        }
+        if !crate::infra::is_safe_path_segment(&version) {
+            return (
+                StatusCode::BAD_REQUEST,
+                "version must be a single safe path segment",
+            )
+                .into_response();
+        }
+        if arch.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "cannot derive platform (target-triple) from `{}`",
+                    artifact.artifact_url
+                ),
+            )
+                .into_response();
+        }
+        prepared.push(Prepared {
+            version,
+            arch,
+            artifact_url: artifact.artifact_url.clone(),
+            bytes,
+            package_sha256,
+        });
+    }
+
+    // 版本必须一致。
+    let version = prepared[0].version.clone();
+    if prepared.iter().any(|item| item.version != version) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "all artifacts must share the same version",
+        )
+            .into_response();
+    }
+    // 平台：不得重复；多平台组件必须**覆盖**必需平台集。
+    let package = crate::infra::ReleasePackage::new(
+        version.clone(),
+        prepared
+            .iter()
+            .map(|item| crate::infra::ReleaseArtifact {
+                platform: Some(item.arch.clone()),
+                sha256: item.package_sha256.clone(),
+                source: item.artifact_url.clone(),
+            })
+            .collect(),
+    );
+    let required = required_platforms(&component).unwrap_or(&[]);
+    if let Err(err) = crate::infra::validate_platforms(&package, required) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("component `{component}`: {err}"),
+        )
+            .into_response();
+    }
+
+    // 第二阶段：逐个镜像落库（此时全部制品已校验通过）。
+    let mut records = Vec::with_capacity(prepared.len());
+    for item in prepared {
+        let platform = (!item.arch.is_empty()).then_some(item.arch.as_str());
+        match record_verified_release(
+            &state,
+            &component,
+            &item.version,
+            &item.artifact_url,
+            item.bytes,
+            &item.package_sha256,
+            platform,
+        )
+        .await
+        {
+            Ok(record) => records.push(record),
+            Err(response) => return response,
+        }
+    }
+    let _ = records;
+    // 返回归组后的「安装包」。
+    match load_package(&state, &component, &version).await {
+        Ok(Some(package)) => Json(package).into_response(),
+        Ok(None) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "release recorded but not found",
+        )
+            .into_response(),
+        Err(response) => response,
+    }
+}
+
+/// GitHub Release 解析请求体。
+#[derive(serde::Deserialize)]
+pub struct ResolveGitHubReleaseRequest {
+    pub release_url: String,
+}
+
+/// 解析 GitHub Release：POST /api/v1/admin/github-release/resolve。
+/// 从 `https://github.com/<owner>/<repo>/releases/tag/<tag>` 拉出 tag（版本）与各平台制品地址（含 sha256）。
+pub async fn admin_resolve_github_release(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    client: PeerConnectInfo,
+    Json(request): Json<ResolveGitHubReleaseRequest>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    let release_url = request.release_url.trim();
+    if release_url.is_empty() {
+        return (StatusCode::BAD_REQUEST, "release_url must not be empty").into_response();
+    }
+    // 可选 token：私有仓 / 提高匿名限流。优先专用名，其次通用名。
+    let token = std::env::var("WIST_CENTER_GITHUB_TOKEN")
+        .ok()
+        .or_else(|| std::env::var("GITHUB_TOKEN").ok());
+    match crate::infra::resolve_github_release(release_url, token.as_deref()).await {
+        Ok(resolved) => Json(resolved).into_response(),
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            format!("failed to resolve release: {err}"),
+        )
+            .into_response(),
+    }
 }
 
 /// 查询某组件的发布记录：GET /api/v1/admin/releases/:component（新→旧）。
@@ -683,7 +982,61 @@ pub async fn admin_list_releases(
                 .into_response();
         }
     };
-    Json(releases).into_response()
+    Json(crate::infra::group_release_packages(&component, releases)).into_response()
+}
+
+/// 改托管状态请求体：`status` ∈ {published, expired}。
+#[derive(serde::Deserialize)]
+pub struct SetReleaseStatusRequest {
+    pub status: String,
+}
+
+/// 更新某组件某版本的托管状态：
+/// POST /api/v1/admin/releases/:component/:version/status（`published` = 已录入 / 在用；`expired` = 已过期 / 停用）。
+pub async fn admin_set_release_status(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    client: PeerConnectInfo,
+    Path((component, version)): Path<(String, String)>,
+    Json(request): Json<SetReleaseStatusRequest>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    // 与发布 / 查询同口径：组件名必须是单一段。版本号同样要进 where 条件，顺手挡掉异常值。
+    if !crate::infra::is_safe_path_segment(&component) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "component must be a single safe path segment",
+        )
+            .into_response();
+    }
+    let status = request.status.trim();
+    if status != "published" && status != "expired" {
+        return (
+            StatusCode::BAD_REQUEST,
+            "status must be `published` or `expired`",
+        )
+            .into_response();
+    }
+    match state
+        .store
+        .set_release_status(&component, &version, status)
+        .await
+    {
+        Ok(0) => (StatusCode::NOT_FOUND, "release not found").into_response(),
+        Ok(_) => match load_package(&state, &component, &version).await {
+            Ok(Some(package)) => Json(package).into_response(),
+            Ok(None) => (StatusCode::NOT_FOUND, "release not found").into_response(),
+            Err(response) => response,
+        },
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to update release status: {err}"),
+        )
+            .into_response(),
+    }
 }
 
 /// 绑定客户请求体：对齐模型 AdminBindGatewayCustomer。
@@ -894,16 +1247,13 @@ pub async fn admin_approve_upgrade_plan(
         )
             .into_response();
     }
-    if plan.phases.is_empty() {
+    if !rollout::approve_plan(&mut plan) {
         return (
             StatusCode::CONFLICT,
             format!("rollout plan {plan_id} has no phase"),
         )
             .into_response();
     }
-    plan.status = "rolling".to_string();
-    plan.current_phase = 1;
-    plan.phases[0].status = "rolling".to_string();
     plan.approved_by = Some("admin".to_string());
     plan.approved_at = Some(DateTime::now());
     if let Err(err) = state.store.save_upgrade_plan(&plan).await {
@@ -1888,12 +2238,14 @@ mod tests {
             .expect("body")
             .to_bytes();
         let record: serde_json::Value = serde_json::from_slice(&body).expect("json");
-        assert_eq!(record["package_sha256"], serde_json::json!(sha));
+        // 回执是「安装包」：版本 + 制品列表（每个制品带 `sha256` / `source` / `platform`）。
+        assert_eq!(record["version"], serde_json::json!("0.1.27"));
+        assert_eq!(record["artifacts"][0]["sha256"], serde_json::json!(sha));
         assert_eq!(record["status"], serde_json::json!("published"));
         // 下发 URL 末段 = **来源原名**（内容寻址在 DB 的 `package_sha256`）。
         let expected_leaf = pkg.file_name().unwrap().to_string_lossy().to_string();
         assert!(
-            record["artifact_url"]
+            record["artifacts"][0]["source"]
                 .as_str()
                 .unwrap_or_default()
                 .ends_with(&format!(
@@ -1910,6 +2262,329 @@ mod tests {
         assert_eq!(bad.status(), StatusCode::BAD_GATEWAY);
 
         let _ = std::fs::remove_file(pkg);
+    }
+
+    /// 平台落库（二进制包从顶层目录名切 target-triple）+ 托管状态管理（published ↔ expired）。
+    #[tokio::test]
+    async fn publish_records_platform_and_release_status_is_manageable() {
+        let bytes = tar_gz_with_entry(
+            "wist-agentd-0.1.9-aarch64-apple-darwin/wist-agentd",
+            b"agentd-bin",
+        );
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let pkg = std::env::temp_dir().join(format!("wic-platform-{nanos}.tar.gz"));
+        std::fs::write(&pkg, &bytes).expect("write");
+        let source = pkg.to_string_lossy().to_string();
+        let sha = crate::infra::sha256_hex_bytes(&bytes);
+
+        let app = super::super::router_for(test_state());
+
+        // 发布：版本自报 `0.1.9`，平台从目录名切出。
+        let (status, record) = post_json(
+            &app,
+            "/api/v1/admin/releases/wist-agentd",
+            serde_json::json!({
+                "artifact_url": source,
+                "expected_sha256": sha,
+                "requested_by": "tester",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(record["version"], "0.1.9");
+        assert_eq!(record["artifacts"][0]["platform"], "aarch64-apple-darwin");
+        assert_eq!(record["status"], "published");
+
+        // 标记过期 → 200，回执状态同步。
+        let (status, expired) = post_json(
+            &app,
+            "/api/v1/admin/releases/wist-agentd/0.1.9/status",
+            serde_json::json!({ "status": "expired" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(expired["status"], "expired");
+
+        // 列表接口随之看到过期态。
+        let (list_status, list) = get_json(&app, "/api/v1/admin/releases/wist-agentd").await;
+        assert_eq!(list_status, StatusCode::OK);
+        assert_eq!(list[0]["status"], "expired");
+        assert_eq!(list[0]["artifacts"][0]["platform"], "aarch64-apple-darwin");
+
+        // 恢复在用。
+        let (status, restored) = post_json(
+            &app,
+            "/api/v1/admin/releases/wist-agentd/0.1.9/status",
+            serde_json::json!({ "status": "published" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(restored["status"], "published");
+
+        // 非法状态 → 400；不存在的版本 → 404。
+        let (bad_status, _) = post_json(
+            &app,
+            "/api/v1/admin/releases/wist-agentd/0.1.9/status",
+            serde_json::json!({ "status": "bogus" }),
+        )
+        .await;
+        assert_eq!(bad_status, StatusCode::BAD_REQUEST);
+        let (missing, _) = post_json(
+            &app,
+            "/api/v1/admin/releases/wist-agentd/9.9.9/status",
+            serde_json::json!({ "status": "expired" }),
+        )
+        .await;
+        assert_eq!(missing, StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_file(pkg);
+    }
+
+    /// 顶层目录只有 `<name>-<version>`（无 target-triple）时，**平台回落来源文件名** ——
+    /// galaxy-ops 实例（`galaxy-ops-v2.2.1-alpha-aarch64-apple-darwin.tar.gz`）。
+    #[tokio::test]
+    async fn publish_recovers_platform_from_the_source_name_when_dir_has_none() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("wic-galaxy-ops-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        // 包内顶层目录名不带 triple（真实 galaxy-ops 包的形态）；平台只在文件名里。
+        let pkg = dir.join("galaxy-ops-v2.2.1-alpha-aarch64-apple-darwin.tar.gz");
+        let bytes = tar_gz_with_entry("galaxy-ops-v2.2.1-alpha/galaxy-ops", b"gops-bin");
+        std::fs::write(&pkg, &bytes).expect("write");
+        let source = pkg.to_string_lossy().to_string();
+        let sha = crate::infra::sha256_hex_bytes(&bytes);
+
+        let app = super::super::router_for(test_state());
+        let (status, record) = post_json(
+            &app,
+            "/api/v1/admin/releases/galaxy-ops",
+            serde_json::json!({
+                "artifact_url": source,
+                "expected_sha256": sha,
+                "requested_by": "tester",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(record["version"], "v2.2.1-alpha");
+        assert_eq!(record["artifacts"][0]["platform"], "aarch64-apple-darwin");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 幂等命中时补齐历史记录缺失的平台（同一份内容重复发布不重复下副本，只补平台）。
+    #[tokio::test]
+    async fn republish_backfills_platform_on_an_existing_record() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("wic-heal-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let pkg = dir.join("galaxy-ops-v2.2.1-alpha-aarch64-apple-darwin.tar.gz");
+        let bytes = tar_gz_with_entry("galaxy-ops-v2.2.1-alpha/galaxy-ops", b"gops-bin");
+        std::fs::write(&pkg, &bytes).expect("write");
+        let source = pkg.to_string_lossy().to_string();
+        let sha = crate::infra::sha256_hex_bytes(&bytes);
+
+        let state = test_state();
+        // 预置一条「旧」记录：同一版本 + 同一 sha，但平台为空（模拟身份解析改好前录的）。
+        let seeded = state
+            .store
+            .publish_release("galaxy-ops", "v2.2.1-alpha", &source, Some(&sha), None)
+            .await
+            .expect("seed");
+        assert!(seeded.platform.is_none());
+
+        let app = super::super::router_for(state);
+        // 重复发布同一份内容 → 幂等命中，但平台被补齐。
+        let (status, record) = post_json(
+            &app,
+            "/api/v1/admin/releases/galaxy-ops",
+            serde_json::json!({
+                "artifact_url": source,
+                "expected_sha256": sha,
+                "requested_by": "tester",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(record["version"], "v2.2.1-alpha");
+        assert_eq!(record["artifacts"][0]["platform"], "aarch64-apple-darwin");
+
+        // 列表接口也看到补齐后的平台。
+        let (_, list) = get_json(&app, "/api/v1/admin/releases/galaxy-ops").await;
+        assert_eq!(list[0]["artifacts"][0]["platform"], "aarch64-apple-darwin");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 补齐平台只在**该内容所在的那一行**发生：同版本其它平台的制品行不受影响
+    /// （否则旧的无平台记录一旦重发其中一个平台，会把整包都写成同一个平台）。
+    #[tokio::test]
+    async fn backfill_platform_touches_only_the_matching_artifact_row() {
+        let mac = tar_gz_with_entry("galaxy-ops-v2.2.1-alpha/galaxy-ops", b"mac-bin");
+        let linux = tar_gz_with_entry("galaxy-ops-v2.2.1-alpha/galaxy-ops", b"linux-bin");
+        let mac_sha = crate::infra::sha256_hex_bytes(&mac);
+        let linux_sha = crate::infra::sha256_hex_bytes(&linux);
+        assert_ne!(mac_sha, linux_sha);
+
+        let state = test_state();
+        // 预置两条同版本、不同内容的「旧」记录，平台都为空。
+        state
+            .store
+            .publish_release(
+                "galaxy-ops",
+                "v2.2.1-alpha",
+                "src-mac",
+                Some(&mac_sha),
+                None,
+            )
+            .await
+            .expect("seed mac");
+        state
+            .store
+            .publish_release(
+                "galaxy-ops",
+                "v2.2.1-alpha",
+                "src-linux",
+                Some(&linux_sha),
+                None,
+            )
+            .await
+            .expect("seed linux");
+
+        // 只补 mac 那一行。
+        let updated = state
+            .store
+            .set_release_platform(
+                "galaxy-ops",
+                "v2.2.1-alpha",
+                &mac_sha,
+                Some("aarch64-apple-darwin"),
+            )
+            .await
+            .expect("backfill")
+            .expect("row");
+        assert_eq!(updated.platform.as_deref(), Some("aarch64-apple-darwin"));
+
+        let records = state.store.list_releases("galaxy-ops").await.expect("list");
+        let find = |sha: &str| {
+            records
+                .iter()
+                .find(|record| record.package_sha256.as_deref() == Some(sha))
+                .expect("record")
+        };
+        assert_eq!(
+            find(&mac_sha).platform.as_deref(),
+            Some("aarch64-apple-darwin")
+        );
+        assert!(
+            find(&linux_sha).platform.is_none(),
+            "同版本其它平台行不该被覆盖"
+        );
+    }
+
+    /// 多平台批量录入：galaxy-ops / galaxy-flow 必须三平台（macOS-ARM / Linux-ARM / Linux-X86）齐备，
+    /// 缺一即整体拒绝且不落记录；齐备则一次落三条（同版本）。
+    #[tokio::test]
+    async fn batch_publish_requires_and_records_all_three_platforms() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("wic-batch-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let mk = |triple: &str, payload: &[u8]| -> (String, String) {
+            let bytes = tar_gz_with_entry(
+                &format!("galaxy-ops-v2.2.1-alpha-{triple}/galaxy-ops"),
+                payload,
+            );
+            let path = dir.join(format!("galaxy-ops-v2.2.1-alpha-{triple}.tar.gz"));
+            std::fs::write(&path, &bytes).expect("write");
+            (
+                path.to_string_lossy().to_string(),
+                crate::infra::sha256_hex_bytes(&bytes),
+            )
+        };
+        let (macos, macos_sha) = mk("aarch64-apple-darwin", b"mac-bin");
+        let (linux_x86, lx_sha) = mk("x86_64-unknown-linux-musl", b"lx-bin");
+        let (linux_arm, la_sha) = mk("aarch64-unknown-linux-musl", b"la-bin");
+
+        let app = super::super::router_for(test_state());
+
+        // 缺一个平台（只给两个）→ 400，且**不落**记录。
+        let (status, _) = post_json(
+            &app,
+            "/api/v1/admin/releases/galaxy-ops/batch",
+            serde_json::json!({
+                "requested_by": "tester",
+                "artifacts": [
+                    { "artifact_url": macos, "expected_sha256": macos_sha },
+                    { "artifact_url": linux_x86, "expected_sha256": lx_sha },
+                ],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (_, none_yet) = get_json(&app, "/api/v1/admin/releases/galaxy-ops").await;
+        assert_eq!(none_yet, serde_json::json!([]));
+
+        // 三平台齐备 → 200，回**一个安装包**（同版本、三个平台制品各一）。
+        let artifacts = serde_json::json!([
+            { "artifact_url": macos, "expected_sha256": macos_sha },
+            { "artifact_url": linux_x86, "expected_sha256": lx_sha },
+            { "artifact_url": linux_arm, "expected_sha256": la_sha },
+        ]);
+        let (status, package) = post_json(
+            &app,
+            "/api/v1/admin/releases/galaxy-ops/batch",
+            serde_json::json!({ "requested_by": "tester", "artifacts": artifacts.clone() }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(package["version"], "v2.2.1-alpha");
+        let package_artifacts = package["artifacts"].as_array().expect("artifacts");
+        assert_eq!(package_artifacts.len(), 3);
+        let mut platforms: Vec<String> = package_artifacts
+            .iter()
+            .map(|artifact| {
+                artifact["platform"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        platforms.sort();
+        assert_eq!(
+            platforms,
+            vec![
+                "aarch64-apple-darwin",
+                "aarch64-unknown-linux-musl",
+                "x86_64-unknown-linux-musl",
+            ]
+        );
+
+        // 同一批重复提 → 幂等，仍是一个包（三个平台各一，不重复）。
+        let (status, _) = post_json(
+            &app,
+            "/api/v1/admin/releases/galaxy-ops/batch",
+            serde_json::json!({ "requested_by": "tester", "artifacts": artifacts }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, list) = get_json(&app, "/api/v1/admin/releases/galaxy-ops").await;
+        let list = list.as_array().expect("list");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0]["artifacts"].as_array().expect("artifacts").len(), 3);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// gateway-stack 包（顶层 `sys/…`，无包装目录）：身份来自**文件名**，版本核对同样生效。
@@ -2109,7 +2784,7 @@ mod tests {
         // 文件名用来源原名。
         let first_name = first.file_name().unwrap().to_string_lossy().to_string();
         assert!(
-            first_record["artifact_url"]
+            first_record["artifacts"][0]["source"]
                 .as_str()
                 .unwrap_or_default()
                 .ends_with(&first_name),
@@ -2124,7 +2799,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let second_record = json_of(response).await;
         assert_eq!(
-            first_record["artifact_url"], second_record["artifact_url"],
+            first_record["artifacts"][0]["source"], second_record["artifacts"][0]["source"],
             "同内容同版本 → 幂等，不落第二份"
         );
 

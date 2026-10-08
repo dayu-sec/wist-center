@@ -29,7 +29,8 @@ use admin_ops::{
     admin_get_gateway_initial_config, admin_get_gateway_uptime, admin_list_gateway_agents,
     admin_list_gateway_instances, admin_list_gateway_lifecycle, admin_list_gateway_status,
     admin_list_releases, admin_list_upgrade_plans, admin_publish_release,
-    admin_rotate_gateway_link_token, admin_show_gateway_status, admin_view_gateway_list,
+    admin_publish_release_batch, admin_resolve_github_release, admin_rotate_gateway_link_token,
+    admin_set_release_status, admin_show_gateway_status, admin_view_gateway_list,
     admin_view_upgrade_plan,
 };
 use gateway_ops::{
@@ -244,6 +245,21 @@ pub fn router_for(state: ApiState) -> Router {
         .route(
             "/api/v1/admin/releases/{component}",
             post(admin_publish_release).get(admin_list_releases),
+        )
+        // 管理面：多平台批量录入（galaxy-ops / galaxy-flow 一次覆盖三平台，先全校验再落库）
+        .route(
+            "/api/v1/admin/releases/{component}/batch",
+            post(admin_publish_release_batch),
+        )
+        // 管理面：解析 GitHub Release（拉 tag + 多平台制品地址，供录入页一键填充）
+        .route(
+            "/api/v1/admin/github-release/resolve",
+            post(admin_resolve_github_release),
+        )
+        // 管理面：改托管状态（published / expired）
+        .route(
+            "/api/v1/admin/releases/{component}/{version}/status",
+            post(admin_set_release_status),
         )
         // 制品下载（本地镜像）
         .route(
