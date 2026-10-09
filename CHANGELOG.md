@@ -5,14 +5,28 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
-## [未发布]
+## [0.8.0-alpha] - 2026-10-09
 
 ### 新增
 
+- **脚本安装命令内置宿主侧 `wist-gwlinkd`**：`GET /api/v1/gateway/install-script` 生成的脚本在拉起
+  gops/gx 与 gateway-stack 之后，按宿主平台从中心**最新已发布**制品取 `wist-gwlinkd`：装到
+  `/usr/local/bin`、配置/身份放**部署用户**家目录 `~/.wist-gwlinkd/`（`control_center_endpoint`=中心、
+  `trust_bundle`=中心 CA、`gateway_self_endpoint`/`gateway_self_ca`=网关环回自述面、`upgrade_project_dir`=工程根），
+  再用 `wist-gwlinkd service install --system --run-as <部署用户>` 装成**系统级、非 root 运行**的
+  常驻服务（开机自启 / 崩溃拉起；身份回写与 gops 升级都落在部署用户属主下）—— 一条命令即让新网关
+  既起得来、又能接入中心。`wist-gwlinkd` **未发布时不阻塞**：脚本照常生成，只跳过该步并明确提示。
+- **制品下载改为带 sha256 校验**：安装脚本对 gops / gx / gwlinkd 的下载都按中心制品摘要校验
+  （无 `sha256sum`/`shasum` 时跳过并提示），不再只靠 TLS 传输完整。
 - **发布② 「Agent 包下发」回带多平台清单**：`GET /api/v1/gateway/upgrade-plan` 在 `action=push-agent-package`
   时回带 `artifacts`（该版本**全部平台**的 `{platform, artifact_url, artifact_sha256}`；按平台名归一化去重、
   同平台取最新、跳过缺摘要/无平台的记录），供 gwlinkd 把各平台包一并交付网关托管（机队平台可 ≠ 网关主机平台）；
   ① 升级仍用单值 `artifact_url`。契约 `wist-control 0.13.0`。见设计 `edge/agent-package-push-to-gateways.md`。
+
+### 变更
+
+- **对齐生态版本**：`wist-control` `0.13 → 0.14`（连带 `wist-shared` `0.1 → 0.2`）、
+  `wist-error` `0.1 → 0.2`（连带 `orion-error` `0.8 → 0.9`）。纯版本 pin，无行为变更。
 
 ### 修复
 

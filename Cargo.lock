@@ -1910,9 +1910,9 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "orion-error"
-version = "0.8.2"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbe9152fc994472b27b45759c8a9206fe133363c6a53a1d5164e7cefaf4baf43"
+checksum = "575552089359a03595b39776384dac800d02938e8821eadf2b57ccef28477044"
 dependencies = [
  "log",
  "orion-error-derive",
@@ -1924,13 +1924,13 @@ dependencies = [
 
 [[package]]
 name = "orion-error-derive"
-version = "0.8.2"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c65661e12ef3a6bccf07c117c222c8d97339ba8170367463f137f635ab20b81"
+checksum = "e9864158ef9ac77e9540459781704e6706080bc3f795e7be2fbb8947b6d5e3dc"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -3638,9 +3638,9 @@ dependencies = [
 
 [[package]]
 name = "wist-control"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8499abebca2a20d3d994ec55fd0d310aa564b5097f6aaeb7afce6dea0c729b10"
+checksum = "5f957ecf13d04337844f4bba750e1a214d5a0df3bcc37ce85f4b4f1fa2c96018"
 dependencies = [
  "chrono",
  "jumo-derive",
@@ -3650,9 +3650,9 @@ dependencies = [
 
 [[package]]
 name = "wist-error"
-version = "0.1.2"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "21ef56ce2924470f14b826458dce32f706c68f2123ad23b311cd9184b9dd5351"
+checksum = "e8eaf34e1a1145e20a485ff02ec21813469d49b53ca7be8fb0e48787a4536856"
 dependencies = [
  "orion-error",
 ]
@@ -3671,9 +3671,9 @@ dependencies = [
 
 [[package]]
 name = "wist-shared"
-version = "0.1.1"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb248ae9e6c57651296666df8bf3205384fe06f1aab7f6b5fd78f4598ed1e821"
+checksum = "3c9b16ccb1f4661774c7e452f119bd551b66c1d8860b7a9ded3be0e56e9dce82"
 dependencies = [
  "chrono",
  "serde",
