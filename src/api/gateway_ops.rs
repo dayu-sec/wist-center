@@ -9,7 +9,7 @@ use axum::{
 };
 
 use wist_control::{
-    AgentStatusAcceptedReturned, DateTime, GatewayCredentialBundle,
+    ACTION_PUSH_AGENT_PACKAGE, AgentStatusAcceptedReturned, DateTime, GatewayCredentialBundle,
     GatewayCredentialVerificationResult, GatewayEnrollmentResult, GatewayInitialConfig,
     GatewayInitializationStatus, GatewayInstanceLifecycleState, GatewayStatusAccepted,
     GatewayUpgradePlan, GatewayUpgradeResultAccepted, QueryGatewayInitializationStatus,
@@ -335,19 +335,44 @@ async fn upgrade_plan_for(
             component: None,
             to_version: None,
             artifact_url: None,
+            action: None,
+            artifact_sha256: None,
+            artifacts: Vec::new(),
         });
     };
     // 现模型的 `GatewayUpgradePlan` 只承载**单组件**目标；多组件计划这里取第一个
     // （要精确到组件，需把 `GatewayUpgradePlan` 扩成列表，届时同步发 `wist-control`）。
     let target = rollout::first_upgrade_target(&plan.spec);
-    // 地址由中心**派生**（反查已发布的 release 记录），不让运维手输。多平台组件
-    // （galaxy-ops / galaxy-flow 一次发三平台）还要按**网关声明的平台**挑，否则会把 Linux
-    // 制品派给 macOS 主机，网关侧架构护栏拒装、升级直接失败。
-    let artifact_url = match &target {
+    // 地址与摘要都取自**同一条**已发布的 release 记录（不新增存储；release 记录是唯一真源）。
+    // 多平台组件（galaxy-ops / galaxy-flow 一次发三平台）还要按**网关声明的平台**挑，否则会把
+    // Linux 制品派给 macOS 主机，网关侧架构护栏拒装、升级直接失败。
+    let resolved = match &target {
         Some((component, version)) => {
-            resolve_release_artifact_url(state, component, version, platform).await
+            resolve_release_artifact(state, component, version, platform).await
         }
         None => None,
+    };
+    let artifact_url = resolved.as_ref().map(|record| record.artifact_url.clone());
+    // 摘要**只**给「agent 包下发」（②）：① 升级路径的取件/校验另有一套（gops / 工具目录），
+    // 现在给它加摘要会改变其既有行为，超出本特性范围。
+    let artifact_sha256 = if plan.action == ACTION_PUSH_AGENT_PACKAGE {
+        resolved
+            .as_ref()
+            .and_then(|record| record.package_sha256.clone())
+    } else {
+        None
+    };
+    // ②「Agent 包下发」：带该版本的**全部平台**制品 —— 网关替 **Agent 机队**托管各平台的包
+    // （机队平台可能 ≠ 网关自己主机的平台）；① 升级不带（网关本机一个平台，用上面的单值 artifact_url）。
+    let artifacts = if plan.action == ACTION_PUSH_AGENT_PACKAGE {
+        match &target {
+            Some((component, version)) => {
+                resolve_release_artifacts(state, component, version).await
+            }
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
     };
     // 网关已取走这份计划：把本阶段条目标 `dispatched`（幂等；失败只记日志，不影响下发）。
     if let Err(err) = rollout::mark_gateway_entry_dispatched(state, &plan.plan_id, gateway_id).await
@@ -361,33 +386,45 @@ async fn upgrade_plan_for(
         gateway_id: gateway_id.to_string(),
         has_plan: true,
         plan_id: Some(plan.plan_id),
+        action: Some(plan.action),
         component: target.as_ref().map(|(component, _)| component.clone()),
         to_version: target.map(|(_, version)| version),
         artifact_url,
+        artifact_sha256,
+        artifacts,
     })
 }
 
-/// 反查该组件该版本**已发布的制品下发地址**（镜像后的绝对 URL）；无匹配则 `None`
+/// 反查该组件该版本**已发布的那条 release 记录**（地址 + 摘要同源）；无匹配则 `None`
 /// （执行器会回落用 `to_version`）。
 ///
 /// 地址由中心派生，不让运维手输 —— 与 agent 包同款教训（手输的路径会漂到别的机器上）。
-/// 见设计 `wist-design/doc/design/edge/gateway-upgrade-and-releases.md`。
+/// 返回**整条记录**（不只地址）：调用方既要 `artifact_url`，也要 `package_sha256`（② 必需）。
+/// 见设计 `wist-design/doc/design/edge/gateway-upgrade-and-releases.md`、
+/// `wist-design/doc/design/edge/agent-package-push-to-gateways.md`。
 ///
 /// 多平台组件（同一 `(component, version)` 下多个平台制品行）必须按**网关声明的平台**
 /// `wanted_platform` 挑，挑不到就**不给**：宁可让执行器回落、也绝不把错平台制品派给主机
 /// （错平台二进制覆盖上去不会报错，只会让工具静默报废）。挑法优先级：
 /// 完整 target-triple 精确命中 ＞ 同平台家族（忽略 gnu/musl 等 abi）＞ 无平台概念的包
 /// （如 `wist-gateway-stack`，适用任意主机，仅当唯一时给）。
-async fn resolve_release_artifact_url(
+/// 该 release 记录此刻**可否派发**：`expired`（已下架）的不再派发 —— 新升级 / 新包下发都不该拿过期制品；
+/// 其余状态（`published`，或历史缺省）视为可派发（对老数据保守：只跳过**显式** `expired`）。
+fn is_dispatchable(record: &ReleaseRecord) -> bool {
+    record.status != "expired"
+}
+
+/// 按平台匹配的单条解析。
+async fn resolve_release_artifact(
     state: &ApiState,
     component: &str,
     version: &str,
     wanted_platform: Option<&str>,
-) -> Option<String> {
+) -> Option<ReleaseRecord> {
     let releases = state.store.list_releases(component).await.ok()?;
-    let candidates: Vec<&ReleaseRecord> = releases
-        .iter()
-        .filter(|release| release.version == version)
+    let candidates: Vec<ReleaseRecord> = releases
+        .into_iter()
+        .filter(|release| release.version == version && is_dispatchable(release))
         .collect();
     if candidates.is_empty() {
         return None;
@@ -401,7 +438,7 @@ async fn resolve_release_artifact_url(
                 .as_deref()
                 .is_some_and(|platform| normalize_platform(platform) == wanted)
         }) {
-            return Some(record.artifact_url.clone());
+            return Some(record.clone());
         }
         // 2) 同一平台家族（吃下 gnu / musl 之类的 abi 差异）；同家族多于一条则视为歧义。
         if let Some(family) = platform_family(&wanted) {
@@ -411,7 +448,7 @@ async fn resolve_release_artifact_url(
             if let Some(record) = matched.next()
                 && matched.next().is_none()
             {
-                return Some(record.artifact_url.clone());
+                return Some(record.clone());
             }
         }
     }
@@ -420,17 +457,91 @@ async fn resolve_release_artifact_url(
     if let Some(record) = agnostic.next()
         && agnostic.next().is_none()
     {
-        return Some(record.artifact_url.clone());
+        return Some(record.clone());
     }
     // 4) 老网关（不声明平台）：唯一候选即给，保持旧行为。
     if wanted_platform.is_none()
         && let [only] = candidates.as_slice()
     {
-        return Some(only.artifact_url.clone());
+        return Some(only.clone());
     }
     // 5) 其余（多平台且网关没声明 / 声明对不上）→ 不给，执行器回落 `to_version`，
     //    绝不把错平台制品派给主机。
     None
+}
+
+/// ② 用：该 `(component, version)` 已发布的**全部平台**制品（平台 + 地址 + 摘要）。
+///
+/// 与 [`resolve_release_artifact`]（按网关平台**挑一条**，供 ①）不同：② 要的是**全平台** —— 网关替
+/// Agent 机队托管各平台的包，机队平台可能 ≠ 网关自己主机的平台。按平台**归一化**（trim+小写）后去重、
+/// 按平台名排序（稳定输出）；缺/空白摘要、无平台或纯空白平台的记录跳过（网关侧要校验，没摘要无法安全交付）；
+/// **`expired` 的跳过**（与①同口径）；同平台多条按 `published_at` 取**最新**（不依赖 store 返回顺序）。
+async fn resolve_release_artifacts(
+    state: &ApiState,
+    component: &str,
+    version: &str,
+) -> Vec<wist_control::GatewayUpgradeArtifact> {
+    let Ok(releases) = state.store.list_releases(component).await else {
+        return Vec::new();
+    };
+    artifacts_for_version(&releases, version)
+}
+
+/// 纯函数（便于按**任意顺序**单测）：从 release 记录里挑出该版本的**全平台**制品。
+/// 剥去 store 依赖后，同平台取最新的判定**不依赖**输入顺序。
+fn artifacts_for_version(
+    records: &[ReleaseRecord],
+    version: &str,
+) -> Vec<wist_control::GatewayUpgradeArtifact> {
+    // 值带 `published_at`：同平台取最新（幂等，不依赖 store 的排序）。
+    let mut by_platform: std::collections::BTreeMap<
+        String,
+        (wist_control::DateTime, wist_control::GatewayUpgradeArtifact),
+    > = std::collections::BTreeMap::new();
+    for record in records {
+        if record.version != version || !is_dispatchable(record) {
+            continue;
+        }
+        let Some(platform) = record.platform.as_deref() else {
+            continue;
+        };
+        // 归一化（trim + 小写）后作去重键与回带值 —— 与 ① 的 `resolve_release_artifact` 同口径
+        // （同一主机类别的 `AArch64-Apple-Darwin ` / `aarch64-apple-darwin` 不该当成两个平台）；
+        // **归一化后为空**（无平台 / 纯空白）→ 跳过：绝不下发空平台槽。
+        let platform = normalize_platform(platform);
+        if platform.is_empty() {
+            continue;
+        }
+        let Some(artifact_sha256) = record
+            .package_sha256
+            .as_deref()
+            .filter(|sha| !sha.trim().is_empty())
+        else {
+            continue;
+        };
+        let candidate = (
+            record.published_at.clone(),
+            wist_control::GatewayUpgradeArtifact {
+                platform: platform.clone(),
+                artifact_url: record.artifact_url.clone(),
+                artifact_sha256: artifact_sha256.to_string(),
+            },
+        );
+        match by_platform.entry(platform) {
+            std::collections::btree_map::Entry::Occupied(mut occupied) => {
+                if record.published_at.to_chrono() > occupied.get().0.to_chrono() {
+                    occupied.insert(candidate);
+                }
+            }
+            std::collections::btree_map::Entry::Vacant(vacant) => {
+                vacant.insert(candidate);
+            }
+        }
+    }
+    by_platform
+        .into_values()
+        .map(|(_, artifact)| artifact)
+        .collect()
 }
 
 /// 升级结果回执：`POST /api/v1/gateway/upgrade-result`（mTLS 客户端证书）。见 CR-002 C2。
@@ -1682,7 +1793,7 @@ mod tests {
         let url = "https://center.example/api/v1/releases/artifact/wist-gateway-stack/0.1.27/wist-gateway-stack-0.1.27.tar.gz";
 
         assert!(
-            super::resolve_release_artifact_url(&state, "wist-gateway-stack", "0.1.27", None)
+            super::resolve_release_artifact(&state, "wist-gateway-stack", "0.1.27", None)
                 .await
                 .is_none(),
             "没发布过 → None"
@@ -1700,20 +1811,16 @@ mod tests {
             Some("x86_64-unknown-linux-gnu"),
         ] {
             assert_eq!(
-                super::resolve_release_artifact_url(
-                    &state,
-                    "wist-gateway-stack",
-                    "0.1.27",
-                    wanted,
-                )
-                .await
-                .as_deref(),
+                super::resolve_release_artifact(&state, "wist-gateway-stack", "0.1.27", wanted)
+                    .await
+                    .map(|record| record.artifact_url)
+                    .as_deref(),
                 Some(url),
                 "wanted={wanted:?}"
             );
         }
         assert!(
-            super::resolve_release_artifact_url(&state, "wist-gateway-stack", "9.9.9", None)
+            super::resolve_release_artifact(&state, "wist-gateway-stack", "9.9.9", None)
                 .await
                 .is_none(),
             "版本不符 → None"
@@ -1742,7 +1849,11 @@ mod tests {
 
         let resolve = |wanted: Option<&'static str>| {
             let state = state.clone();
-            async move { super::resolve_release_artifact_url(&state, "galaxy-ops", "v0", wanted).await }
+            async move {
+                super::resolve_release_artifact(&state, "galaxy-ops", "v0", wanted)
+                    .await
+                    .map(|record| record.artifact_url)
+            }
         };
 
         // 精确三元组命中。
@@ -1777,7 +1888,7 @@ mod tests {
             .await
             .expect("publish solo");
         assert!(
-            super::resolve_release_artifact_url(
+            super::resolve_release_artifact(
                 &state,
                 "solo-linux",
                 "v0",
@@ -1788,22 +1899,411 @@ mod tests {
             "单一 linux 制品不能派给 mac 主机"
         );
         assert_eq!(
-            super::resolve_release_artifact_url(
+            super::resolve_release_artifact(
                 &state,
                 "solo-linux",
                 "v0",
                 Some("x86_64-unknown-linux-gnu"),
             )
             .await
+            .map(|record| record.artifact_url)
             .as_deref(),
             Some("https://center.example/solo/solo-linux-v0.tar.gz")
         );
         // 老网关不声明平台：唯一候选即给（旧行为）。
         assert_eq!(
-            super::resolve_release_artifact_url(&state, "solo-linux", "v0", None)
+            super::resolve_release_artifact(&state, "solo-linux", "v0", None)
                 .await
+                .map(|record| record.artifact_url)
                 .as_deref(),
             Some("https://center.example/solo/solo-linux-v0.tar.gz")
+        );
+    }
+
+    /// 建一份**已批准（rolling，进第一阶段）**的单阶段计划并落库（目标 `gateway_id`）。
+    async fn seed_rolling_plan(state: &ApiState, action: &str, spec: &str, gateway_id: &str) {
+        use super::super::rollout;
+
+        let request = rollout::CreateRolloutPlanRequest {
+            action: action.to_string(),
+            spec: spec.to_string(),
+            target_ids: vec![gateway_id.to_string()],
+            phase_count: 1,
+            deadline_at: None,
+            timeout_seconds: 600,
+            batch_size: 0,
+        };
+        let mut plan = rollout::build_plan(&request).expect("build plan");
+        assert!(rollout::approve_plan(&mut plan), "enter first phase");
+        state
+            .store
+            .create_upgrade_plan(&plan)
+            .await
+            .expect("store plan");
+    }
+
+    /// 发布 ②：`push-agent-package` 的下发目标带 **action** 与 **摘要**（`artifact_sha256`）；
+    /// ① `upgrade` 只带地址、**不**带摘要（不改其既有取件/校验行为）。
+    #[tokio::test]
+    async fn push_agent_package_plan_carries_action_and_digest_but_upgrade_does_not() {
+        let digest = "3f9a1c0d5e7b2a6489f0c1d2e3a4b5c6d7e8f9012345678abcdef0123456789";
+
+        // ②：agentd 包**多平台**发布（各带摘要）→ 计划 action = push-agent-package，带**全平台**清单。
+        let state = provision_state("link-tok-push-digest");
+        let platforms = [
+            "aarch64-apple-darwin",
+            "x86_64-unknown-linux-musl",
+            "aarch64-unknown-linux-musl",
+        ];
+        for platform in platforms {
+            let url = format!(
+                "https://center.example/api/v1/releases/artifact/wist-agentd/0.1.9/wist-agentd-0.1.9-{platform}.tar.gz"
+            );
+            state
+                .store
+                .publish_release("wist-agentd", "0.1.9", &url, Some(digest), Some(platform))
+                .await
+                .expect("publish agentd release");
+        }
+        seed_rolling_plan(
+            &state,
+            ACTION_PUSH_AGENT_PACKAGE,
+            r#"{"targets":[{"component":"wist-agentd","target_version":"0.1.9"}]}"#,
+            "gw-p",
+        )
+        .await;
+
+        let plan = super::upgrade_plan_for(&state, "gw-p", Some("aarch64-apple-darwin"))
+            .await
+            .expect("plan");
+        assert_eq!(plan.action.as_deref(), Some(ACTION_PUSH_AGENT_PACKAGE));
+        // 单值 `artifact_url` 仍按**网关平台**挑（供 ① / 兼容）；② 的多平台清单才是全平台。
+        assert_eq!(
+            plan.artifact_url.as_deref(),
+            Some(
+                "https://center.example/api/v1/releases/artifact/wist-agentd/0.1.9/wist-agentd-0.1.9-aarch64-apple-darwin.tar.gz"
+            ),
+        );
+        assert_eq!(plan.artifact_sha256.as_deref(), Some(digest));
+        let got: Vec<(String, String)> = plan
+            .artifacts
+            .iter()
+            .map(|artifact| (artifact.platform.clone(), artifact.artifact_sha256.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("aarch64-apple-darwin".to_string(), digest.to_string()),
+                ("aarch64-unknown-linux-musl".to_string(), digest.to_string()),
+                ("x86_64-unknown-linux-musl".to_string(), digest.to_string()),
+            ],
+            "② 应带该版本**全部平台**（按平台名排序，机队平台可能 ≠ 网关本机平台）"
+        );
+        // 每个平台地址指向对应制品的原名。
+        assert!(
+            plan.artifacts
+                .iter()
+                .all(|artifact| artifact.artifact_url.contains(&artifact.platform)),
+            "{:?}",
+            plan.artifacts
+        );
+
+        // ①：同一条发布也给得出摘要，但 `upgrade` 计划**不**回带摘要（地址照旧）。
+        let state = provision_state("link-tok-upgrade-no-digest");
+        let stack_url = "https://center.example/api/v1/releases/artifact/wist-gateway-stack/0.1.28/wist-gateway-stack-0.1.28.tar.gz";
+        state
+            .store
+            .publish_release(
+                "wist-gateway-stack",
+                "0.1.28",
+                stack_url,
+                Some(digest),
+                None,
+            )
+            .await
+            .expect("publish stack release");
+        seed_rolling_plan(
+            &state,
+            "upgrade",
+            r#"{"targets":[{"component":"wist-gateway-stack","target_version":"0.1.28"}]}"#,
+            "gw-p",
+        )
+        .await;
+
+        let plan = super::upgrade_plan_for(&state, "gw-p", None)
+            .await
+            .expect("plan");
+        assert_eq!(plan.action.as_deref(), Some("upgrade"));
+        assert_eq!(plan.artifact_url.as_deref(), Some(stack_url));
+        assert_eq!(plan.artifact_sha256, None, "① upgrade 不回带摘要");
+        assert!(
+            plan.artifacts.is_empty(),
+            "① upgrade 不带多平台清单：网关本机一个平台，用单值 artifact_url"
+        );
+    }
+
+    /// 发布 ②：`resolve_release_artifacts` 取该版本**全部平台**制品（平台 + 地址 + 摘要），
+    /// 平台去重、按平台名排序；**缺摘要 / 无平台**的记录跳过（网关侧要校验摘要，缺则无法安全交付）。
+    #[tokio::test]
+    async fn agent_package_artifacts_cover_all_platforms_and_skip_incomplete_records() {
+        let state = provision_state("link-tok-artifacts-all");
+        let sha = "sha256:aa";
+        let publish =
+            |url: &'static str, sha: Option<&'static str>, platform: Option<&'static str>| {
+                state
+                    .store
+                    .publish_release("wist-agentd", "0.2.1", url, sha, platform)
+            };
+        // 三平台齐备；另一条**缺摘要**、再一条**无平台**（如部署栈类，② 不适用）。
+        publish(
+            "https://c/wist-agentd-aarch64-apple-darwin.tar.gz",
+            Some(sha),
+            Some("aarch64-apple-darwin"),
+        )
+        .await
+        .expect("publish");
+        publish(
+            "https://c/wist-agentd-x86_64-unknown-linux-musl.tar.gz",
+            Some(sha),
+            Some("x86_64-unknown-linux-musl"),
+        )
+        .await
+        .expect("publish");
+        publish(
+            "https://c/wist-agentd-aarch64-unknown-linux-musl.tar.gz",
+            Some(sha),
+            Some("aarch64-unknown-linux-musl"),
+        )
+        .await
+        .expect("publish");
+        publish(
+            "https://c/wist-agentd-no-sha.tar.gz",
+            None,
+            Some("riscv64gc-unknown-linux-gnu"),
+        )
+        .await
+        .expect("publish");
+        publish("https://c/wist-agentd-platformless.tar.gz", Some(sha), None)
+            .await
+            .expect("publish");
+
+        let artifacts = super::resolve_release_artifacts(&state, "wist-agentd", "0.2.1").await;
+        let platforms: Vec<&str> = artifacts
+            .iter()
+            .map(|artifact| artifact.platform.as_str())
+            .collect();
+        assert_eq!(
+            platforms,
+            vec![
+                "aarch64-apple-darwin",
+                "aarch64-unknown-linux-musl",
+                "x86_64-unknown-linux-musl",
+            ],
+            "全平台、按平台名排序；缺摘要 / 无平台的跳过"
+        );
+        assert!(
+            artifacts
+                .iter()
+                .all(|artifact| artifact.artifact_sha256 == sha),
+            "{artifacts:?}"
+        );
+
+        // 版本不符 → 空（不串版本）。
+        assert!(
+            super::resolve_release_artifacts(&state, "wist-agentd", "9.9.9")
+                .await
+                .is_empty(),
+            "版本不符 → 空"
+        );
+
+        // 同平台重复发布 → 按平台去重，**最新一条胜出**（store 按 published_at 新→旧）。
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        publish(
+            "https://c/wist-agentd-x86_64-unknown-linux-musl-dup.tar.gz",
+            Some("sha256:bb"),
+            Some("x86_64-unknown-linux-musl"),
+        )
+        .await
+        .expect("publish");
+        let artifacts = super::resolve_release_artifacts(&state, "wist-agentd", "0.2.1").await;
+        let x86: Vec<_> = artifacts
+            .iter()
+            .filter(|artifact| artifact.platform == "x86_64-unknown-linux-musl")
+            .collect();
+        assert_eq!(x86.len(), 1, "同平台去重");
+        assert_eq!(
+            x86[0].artifact_url, "https://c/wist-agentd-x86_64-unknown-linux-musl-dup.tar.gz",
+            "去重保留**最新**一条"
+        );
+        assert_eq!(x86[0].artifact_sha256, "sha256:bb");
+
+        // 大小写 / 空白变体归一化后与规范形态同平台（去重），不出现第二个条目。
+        publish(
+            "https://c/wist-agentd-AArch64-Apple-Darwin.tar.gz",
+            Some("sha256:cc"),
+            Some("AArch64-Apple-Darwin "),
+        )
+        .await
+        .expect("publish");
+        let artifacts = super::resolve_release_artifacts(&state, "wist-agentd", "0.2.1").await;
+        assert_eq!(
+            artifacts
+                .iter()
+                .filter(|artifact| artifact.platform == "aarch64-apple-darwin")
+                .count(),
+            1,
+            "平台归一化后同平台去重"
+        );
+        assert!(
+            artifacts
+                .iter()
+                .all(|artifact| artifact.platform == artifact.platform.trim().to_ascii_lowercase()),
+            "回带的平台已归一化：{artifacts:?}"
+        );
+    }
+
+    /// 发布 ②：平台 / 摘要的**空串、纯空白**都要跳过（不能回带空平台槽或不可校验的摘要）；
+    /// 且目标版本**未发布过**时 ② 计划仍下发（has_plan=true）但 `artifacts` 为空（不下发地址）。
+    #[tokio::test]
+    async fn agent_package_artifacts_skip_blank_platform_and_sha() {
+        let state = provision_state("link-tok-artifacts-blank");
+        // 各造一条不合格行：空平台 / 纯空白平台 / 空摘要 / 纯空白摘要。
+        state
+            .store
+            .publish_release("wist-agentd", "0.3.0", "https://c/blank-platform.tar.gz", Some("sha256:aa"), Some(""))
+            .await
+            .expect("publish");
+        state
+            .store
+            .publish_release("wist-agentd", "0.3.0", "https://c/space-platform.tar.gz", Some("sha256:aa"), Some("   "))
+            .await
+            .expect("publish");
+        state
+            .store
+            .publish_release("wist-agentd", "0.3.0", "https://c/blank-sha.tar.gz", Some(""), Some("x86_64-unknown-linux-musl"))
+            .await
+            .expect("publish");
+        state
+            .store
+            .publish_release("wist-agentd", "0.3.0", "https://c/space-sha.tar.gz", Some("   "), Some("aarch64-unknown-linux-musl"))
+            .await
+            .expect("publish");
+        // 唯一合格的一条。
+        state
+            .store
+            .publish_release("wist-agentd", "0.3.0", "https://c/ok.tar.gz", Some("sha256:ok"), Some("aarch64-apple-darwin"))
+            .await
+            .expect("publish");
+
+        let artifacts = super::resolve_release_artifacts(&state, "wist-agentd", "0.3.0").await;
+        assert_eq!(
+            artifacts.len(),
+            1,
+            "仅合格那条留下（空/空白平台与摘要均跳过）：{artifacts:?}"
+        );
+        assert_eq!(artifacts[0].platform, "aarch64-apple-darwin");
+        assert_eq!(artifacts[0].artifact_url, "https://c/ok.tar.gz");
+
+        // ② 计划指向**未发布**的版本：计划照样下发（动作/目标在），但不给任何地址/摘要/清单。
+        seed_rolling_plan(
+            &state,
+            ACTION_PUSH_AGENT_PACKAGE,
+            r#"{"targets":[{"component":"wist-agentd","target_version":"9.9.9"}]}"#,
+            "gw-p",
+        )
+        .await;
+        let plan = super::upgrade_plan_for(&state, "gw-p", Some("aarch64-apple-darwin"))
+            .await
+            .expect("plan");
+        assert!(plan.has_plan);
+        assert_eq!(plan.action.as_deref(), Some(ACTION_PUSH_AGENT_PACKAGE));
+        assert_eq!(plan.to_version.as_deref(), Some("9.9.9"));
+        assert_eq!(plan.artifact_url, None, "未发布 → 不给地址");
+        assert_eq!(plan.artifact_sha256, None, "未发布 → 不给摘要");
+        assert!(plan.artifacts.is_empty(), "未发布 → 清单为空");
+    }
+
+    /// P5：同平台多条按 `published_at` 取**最新**，**不依赖输入顺序**（纯函数，直接喂乱序）。
+    #[test]
+    fn artifacts_for_version_picks_the_newest_per_platform_regardless_of_order() {
+        let older =
+            wist_control::DateTime::from_rfc3339("2026-10-01T00:00:00Z").expect("older");
+        let newer =
+            wist_control::DateTime::from_rfc3339("2026-10-02T00:00:00Z").expect("newer");
+        let record = |url: &str, sha: &str, at: wist_control::DateTime| ReleaseRecord {
+            version: "1.0.0".to_string(),
+            artifact_url: url.to_string(),
+            package_sha256: Some(sha.to_string()),
+            platform: Some("aarch64-apple-darwin".to_string()),
+            status: "published".to_string(),
+            published_at: at,
+        };
+        // 乱序两种：新的在前 / 新的在后 —— 都必须选到新的。
+        for records in [
+            vec![
+                record("https://c/new.tar.gz", "sha256:new", newer.clone()),
+                record("https://c/old.tar.gz", "sha256:old", older.clone()),
+            ],
+            vec![
+                record("https://c/old.tar.gz", "sha256:old", older.clone()),
+                record("https://c/new.tar.gz", "sha256:new", newer.clone()),
+            ],
+        ] {
+            let artifacts = artifacts_for_version(&records, "1.0.0");
+            assert_eq!(artifacts.len(), 1);
+            assert_eq!(
+                artifacts[0].artifact_url, "https://c/new.tar.gz",
+                "取最新（与输入顺序无关）：{artifacts:?}"
+            );
+            assert_eq!(artifacts[0].artifact_sha256, "sha256:new");
+        }
+    }
+
+    /// P3：`expired`（下架）版本的制品不再派发 —— ② 全平台清单与 ① 单值解析都跳过。
+    #[tokio::test]
+    async fn expired_releases_are_not_dispatched() {
+        let state = provision_state("link-tok-expired");
+        state
+            .store
+            .publish_release("wist-agentd", "0.4.0", "https://c/a.tar.gz", Some("sha256:aa"), Some("aarch64-apple-darwin"))
+            .await
+            .expect("publish");
+        state
+            .store
+            .publish_release("wist-agentd", "0.4.0", "https://c/l.tar.gz", Some("sha256:ll"), Some("x86_64-unknown-linux-musl"))
+            .await
+            .expect("publish");
+        // 下架前：两平台都在。
+        assert_eq!(
+            super::resolve_release_artifacts(&state, "wist-agentd", "0.4.0")
+                .await
+                .len(),
+            2
+        );
+        // 下架该版本（该版本全部制品行一起改）。
+        let changed = state
+            .store
+            .set_release_status("wist-agentd", "0.4.0", "expired")
+            .await
+            .expect("set status");
+        assert!(changed >= 1, "至少改到一行");
+        // 下架后：② 清单空、① 单值 None。
+        assert!(
+            super::resolve_release_artifacts(&state, "wist-agentd", "0.4.0")
+                .await
+                .is_empty(),
+            "downlisted → ② 不清单"
+        );
+        assert!(
+            super::resolve_release_artifact(
+                &state,
+                "wist-agentd",
+                "0.4.0",
+                Some("aarch64-apple-darwin")
+            )
+            .await
+            .is_none(),
+            "downlisted → ① 不派"
         );
     }
 

@@ -5,6 +5,20 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [未发布]
+
+### 新增
+
+- **发布② 「Agent 包下发」回带多平台清单**：`GET /api/v1/gateway/upgrade-plan` 在 `action=push-agent-package`
+  时回带 `artifacts`（该版本**全部平台**的 `{platform, artifact_url, artifact_sha256}`；按平台名归一化去重、
+  同平台取最新、跳过缺摘要/无平台的记录），供 gwlinkd 把各平台包一并交付网关托管（机队平台可 ≠ 网关主机平台）；
+  ① 升级仍用单值 `artifact_url`。契约 `wist-control 0.13.0`。见设计 `edge/agent-package-push-to-gateways.md`。
+
+### 修复
+
+- **下架（`expired`）的版本不再派发**：① 升级与 ② 包下发的制品解析都跳过 `status == "expired"` 的 release
+  记录（只跳过**显式** `expired`，历史缺省状态视为可派发）—— 避免把已下架的制品派给网关。
+
 ## [0.7.1-alpha] - 2026-10-08
 
 ### 修复
