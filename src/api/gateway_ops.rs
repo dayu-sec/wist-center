@@ -3,7 +3,7 @@
 
 use axum::{
     Json,
-    extract::{Extension, Path, Query, State},
+    extract::{Extension, Path, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
@@ -25,6 +25,7 @@ use crate::infra::{
 
 use super::{
     ApiState, PeerConnectInfo, build_control_center_trust_bundle, control_center_tls_required,
+    extract::{ApiJson, ApiQuery},
     rate_limit, rollout,
 };
 
@@ -45,7 +46,7 @@ pub async fn submit_agent_status(
     State(state): State<ApiState>,
     identity: Option<Extension<VerifiedGatewayIdentity>>,
     client: PeerConnectInfo,
-    Json(input): Json<ReportAgentStatus>,
+    ApiJson(input): ApiJson<ReportAgentStatus>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     match authorize_gateway_certificate(
@@ -78,11 +79,12 @@ pub async fn submit_agent_status(
                 .upsert_agent_status(&input.gateway_id, &stored)
                 .await
             {
-                return (
+                return super::error::internal_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to update agent status: {err}"),
-                )
-                    .into_response();
+                    super::codes::AGENT_STATUS_UPDATE_FAILED,
+                    "failed to update agent status",
+                    err.display_chain(),
+                );
             }
             if let Some(vm_url) = &state.config.victoriametrics_url
                 && let Err(err) = crate::infra::vm::push_agent_status(
@@ -93,7 +95,7 @@ pub async fn submit_agent_status(
                 )
                 .await
             {
-                eprintln!("warn agent_status vm push failed: {err}");
+                log::warn!("agent_status vm push failed: {err}");
             }
             (
                 StatusCode::OK,
@@ -126,7 +128,11 @@ pub async fn download_release_artifact(
         || !crate::infra::is_safe_path_segment(&version)
         || !crate::infra::is_safe_path_segment(&filename)
     {
-        return (StatusCode::NOT_FOUND, "artifact not found").into_response();
+        return super::error::ApiError::not_found(
+            super::codes::ARTIFACT_NOT_FOUND,
+            "artifact not found",
+        )
+        .into_response();
     }
     let path = state
         .config
@@ -140,7 +146,11 @@ pub async fn download_release_artifact(
             bytes,
         )
             .into_response(),
-        Err(_) => (StatusCode::NOT_FOUND, "artifact not found").into_response(),
+        Err(_) => super::error::ApiError::not_found(
+            super::codes::ARTIFACT_NOT_FOUND,
+            "artifact not found",
+        )
+        .into_response(),
     }
 }
 
@@ -152,7 +162,7 @@ pub async fn download_release_artifact(
 pub async fn register_gateway(
     State(state): State<ApiState>,
     client: PeerConnectInfo,
-    Json(input): Json<RegisterGateway>,
+    ApiJson(input): ApiJson<RegisterGateway>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     // 注册自携带 token 鉴权（无网关身份可查），独立限流桶防 token 暴力枚举。
@@ -164,11 +174,11 @@ pub async fn register_gateway(
     // 先校验 CSR（不签发）：坏 CSR 不应消耗一次性注册 token。
     if let Err(reason) = crate::infra::validate_csr(&input.certificate_signing_request) {
         rate_limit::record_auth_failure(&state, &client_key, GATEWAY_REGISTER_SCOPE);
-        return (
-            StatusCode::BAD_REQUEST,
+        return super::error::ApiError::bad_request(
+            super::codes::INVALID_CSR,
             format!("invalid certificate signing request: {reason}"),
         )
-            .into_response();
+        .into_response();
     }
     let consumed = match state
         .store
@@ -182,18 +192,20 @@ pub async fn register_gateway(
                 .detail()
                 .as_deref()
                 .unwrap_or("enrollment token rejected");
-            return (
-                StatusCode::UNAUTHORIZED,
+            return super::error::ApiError::unauthorized(
+                super::codes::ENROLLMENT_TOKEN_REJECTED,
                 format!("enrollment token rejected: {reason}"),
             )
-                .into_response();
+            .with_no_store()
+            .into_response();
         }
         Err(err) => {
-            return (
+            return super::error::internal_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to consume enrollment token: {err}"),
-            )
-                .into_response();
+                super::codes::ENROLLMENT_TOKEN_CONSUME_FAILED,
+                "failed to consume enrollment token",
+                err.display_chain(),
+            );
         }
     };
     // token 绑定的网关必须已创建。
@@ -201,20 +213,22 @@ pub async fn register_gateway(
         Ok(Some(_)) => true,
         Ok(None) => false,
         Err(err) => {
-            return (
+            return super::error::internal_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load gateway store: {err}"),
-            )
-                .into_response();
+                super::codes::GATEWAY_STORE_UNAVAILABLE,
+                "failed to load gateway store",
+                err.display_chain(),
+            );
         }
     };
     if !gateway_exists {
         rate_limit::record_auth_failure(&state, &client_key, GATEWAY_REGISTER_SCOPE);
-        return (
-            StatusCode::UNAUTHORIZED,
-            "enrollment token bound to unknown gateway".to_string(),
+        return super::error::ApiError::unauthorized(
+            super::codes::ENROLLMENT_TOKEN_UNKNOWN_GATEWAY,
+            "enrollment token bound to unknown gateway",
         )
-            .into_response();
+        .with_no_store()
+        .into_response();
     }
     // 注册成功：用 **CA-G** 按网关 CSR 签一张「每网关一张」客户端证书（长期身份，取代运行期 bearer）。
     let issued = match state.gateway_ca.issue_client_certificate(
@@ -225,11 +239,11 @@ pub async fn register_gateway(
         Ok(issued) => issued,
         Err(reason) => {
             rate_limit::record_auth_failure(&state, &client_key, GATEWAY_REGISTER_SCOPE);
-            return (
-                StatusCode::BAD_REQUEST,
+            return super::error::ApiError::bad_request(
+                super::codes::INVALID_CSR,
                 format!("invalid certificate signing request: {reason}"),
             )
-                .into_response();
+            .into_response();
         }
     };
     // 存证书指纹（供吊销/拒绝名单）；过期时间 = 证书 not_after。
@@ -243,15 +257,23 @@ pub async fn register_gateway(
         .await
         .unwrap_or(false);
     if !updated {
-        return (
+        return super::error::ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to persist gateway client certificate".to_string(),
+            super::codes::CLIENT_CERTIFICATE_PERSIST_FAILED,
+            "failed to persist gateway client certificate",
         )
-            .into_response();
+        .into_response();
     }
     let credential_id = match new_secret_token("cred") {
         Ok(id) => id,
-        Err(reason) => return (StatusCode::INTERNAL_SERVER_ERROR, reason).into_response(),
+        Err(reason) => {
+            return super::error::internal_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                super::codes::CREDENTIAL_ID_GENERATION_FAILED,
+                "failed to generate gateway credential id",
+                reason,
+            );
+        }
     };
     let bundle = GatewayCredentialBundle {
         credential_id,
@@ -269,7 +291,7 @@ pub async fn register_gateway(
         .mark_gateway_initializing(&consumed.gateway_id)
         .await
     {
-        eprintln!("warn mark gateway initializing failed: {err}");
+        log::warn!("mark gateway initializing failed: {}", err.display_chain());
     }
     // 注册即带上网关对外域名 → 中心第一时间记下（早于第一拍状态上报）；不带则跳过。
     if let Some(public_base_url) = input.public_base_url.as_deref()
@@ -278,10 +300,14 @@ pub async fn register_gateway(
             .set_gateway_public_base_url(&consumed.gateway_id, public_base_url)
             .await
     {
-        eprintln!("warn set gateway public_base_url failed: {err}");
+        log::warn!(
+            "set gateway public_base_url failed: {}",
+            err.display_chain()
+        );
     }
     rate_limit::clear_auth_failures(&state, &client_key, GATEWAY_REGISTER_SCOPE);
-    Json(GatewayEnrollmentResult {
+    // 响应含证书凭据（bundle）→ `no-store`。
+    super::error::json_no_store(GatewayEnrollmentResult {
         status: "accepted".to_string(),
         gateway_id: consumed.gateway_id.clone(),
         instance_id: input.instance_id,
@@ -289,7 +315,6 @@ pub async fn register_gateway(
         initial_config: "v1".to_string(),
         credential_bundle: bundle,
     })
-    .into_response()
 }
 
 /// 取升级目标：`GET /api/v1/gateway/upgrade-plan?gateway_id=&platform=`（mTLS 客户端证书鉴权）。
@@ -300,7 +325,7 @@ pub async fn get_gateway_upgrade_plan(
     State(state): State<ApiState>,
     identity: Option<Extension<VerifiedGatewayIdentity>>,
     client: PeerConnectInfo,
-    Query(params): Query<InitialConfigQueryParams>,
+    ApiQuery(params): ApiQuery<InitialConfigQueryParams>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     let gateway_id = params.gateway_id.as_str();
@@ -316,7 +341,12 @@ pub async fn get_gateway_upgrade_plan(
     }
     match upgrade_plan_for(&state, gateway_id, params.platform.as_deref()).await {
         Ok(plan) => Json(plan).into_response(),
-        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
+        Err(err) => super::error::internal_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            super::codes::UPGRADE_PLAN_LOAD_FAILED,
+            "failed to load gateway upgrade plan",
+            err,
+        ),
     }
 }
 
@@ -377,7 +407,7 @@ async fn upgrade_plan_for(
     // 网关已取走这份计划：把本阶段条目标 `dispatched`（幂等；失败只记日志，不影响下发）。
     if let Err(err) = rollout::mark_gateway_entry_dispatched(state, &plan.plan_id, gateway_id).await
     {
-        eprintln!(
+        log::warn!(
             "event=GatewayUpgradeDispatchMarkFailed gateway_id={gateway_id} plan_id={} err={err}",
             plan.plan_id
         );
@@ -552,7 +582,7 @@ pub async fn report_gateway_upgrade_result(
     State(state): State<ApiState>,
     identity: Option<Extension<VerifiedGatewayIdentity>>,
     client: PeerConnectInfo,
-    Json(input): Json<ReportGatewayUpgradeResult>,
+    ApiJson(input): ApiJson<ReportGatewayUpgradeResult>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = authorize_gateway_certificate(
@@ -565,7 +595,7 @@ pub async fn report_gateway_upgrade_result(
     {
         return response;
     }
-    eprintln!(
+    log::info!(
         "event=GatewayUpgradeResult gateway_id={} work_id={} from={} to={} step={} status={} detail={}",
         input.gateway_id,
         input.work_id,
@@ -585,9 +615,10 @@ pub async fn report_gateway_upgrade_result(
     )
     .await
     {
-        eprintln!(
+        log::warn!(
             "event=GatewayUpgradeResultReconcileFailed gateway_id={} work_id={} err={err}",
-            input.gateway_id, input.work_id
+            input.gateway_id,
+            input.work_id
         );
     }
     Json(GatewayUpgradeResultAccepted {
@@ -619,7 +650,7 @@ pub async fn get_gateway_initial_config(
     headers: HeaderMap,
     identity: Option<Extension<VerifiedGatewayIdentity>>,
     client: PeerConnectInfo,
-    Query(params): Query<InitialConfigQueryParams>,
+    ApiQuery(params): ApiQuery<InitialConfigQueryParams>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     let gateway_id = params.gateway_id.as_str();
@@ -628,24 +659,30 @@ pub async fn get_gateway_initial_config(
     if control_center_tls_required(&state.config)
         && build_control_center_trust_bundle(&state.config, gateway_id).is_none()
     {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
+        return super::error::ApiError::unavailable(
+            super::codes::TLS_TRUST_ROOT_MISSING,
             "TLS is required but the control center trust root is not configured",
         )
-            .into_response();
+        .into_response();
     }
     let gateway = match state.store.get_gateway(gateway_id).await {
         Ok(Some(gateway)) => gateway,
         Ok(None) => {
             rate_limit::record_auth_failure(&state, &client_key, GATEWAY_AUTH_SCOPE);
-            return (StatusCode::UNAUTHORIZED, "unknown gateway").into_response();
+            return super::error::ApiError::unauthorized(
+                super::codes::UNKNOWN_GATEWAY,
+                "unknown gateway",
+            )
+            .with_no_store()
+            .into_response();
         }
         Err(err) => {
-            return (
+            return super::error::internal_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load gateway store: {err}"),
-            )
-                .into_response();
+                super::codes::GATEWAY_STORE_UNAVAILABLE,
+                "failed to load gateway store",
+                err.display_chain(),
+            );
         }
     };
     // 未初始化 → 置备路径。
@@ -679,11 +716,11 @@ pub async fn get_gateway_initial_config(
                 .unwrap_or_default();
             let config =
                 build_initial_config_json(&state, &gateway, gateway_id, &enrollment_token_id);
-            Json(InitialConfigReturned {
+            // 配置类响应 → `no-store`（本路径无一次性明文凭据，仍不缓存）。
+            super::error::json_no_store(InitialConfigReturned {
                 config,
                 regist_token: None,
             })
-            .into_response()
         }
         Err(response) => response,
     }
@@ -699,11 +736,21 @@ async fn provision_gateway_initial_config(
     client_key: &str,
 ) -> Response {
     let Some(link_token) = bearer_token(headers) else {
-        return (StatusCode::UNAUTHORIZED, "missing bearer credential").into_response();
+        return super::error::ApiError::unauthorized(
+            super::codes::MISSING_BEARER_CREDENTIAL,
+            "missing bearer credential",
+        )
+        .with_no_store()
+        .into_response();
     };
     if sha256_hex(link_token) != gateway.link_token_hash {
         rate_limit::record_auth_failure(state, client_key, GATEWAY_AUTH_SCOPE);
-        return (StatusCode::UNAUTHORIZED, "invalid link token").into_response();
+        return super::error::ApiError::unauthorized(
+            super::codes::INVALID_LINK_TOKEN,
+            "invalid link token",
+        )
+        .with_no_store()
+        .into_response();
     }
     let identity_token = headers
         .get("x-gateway-identity-token")
@@ -711,11 +758,11 @@ async fn provision_gateway_initial_config(
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let Some(identity_token) = identity_token else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "missing X-Gateway-Identity-Token".to_string(),
+        return super::error::ApiError::bad_request(
+            super::codes::MISSING_GATEWAY_IDENTITY_TOKEN,
+            "missing X-Gateway-Identity-Token",
         )
-            .into_response();
+        .into_response();
     };
     // 派生 RegistToken：HMAC(center_secret, "gateway-reg:" + gateway_id + ":" + identity_token)。
     let regist_token = derive_regist_token(&state.config.hmac_secret, gateway_id, identity_token);
@@ -734,42 +781,44 @@ async fn provision_gateway_initial_config(
     {
         Ok(token) => token,
         Err(err) => {
-            return (
+            return super::error::internal_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to issue regist token: {err}"),
-            )
-                .into_response();
+                super::codes::REGIST_TOKEN_ISSUE_FAILED,
+                "failed to issue regist token",
+                err.display_chain(),
+            );
         }
     };
     // 成功落库 RegistToken 后才消费 link（一次性；网络抖动可重试置备）。
     match state.store.consume_link_token(gateway_id, link_token).await {
         Ok(true) => {}
         Ok(false) => {
-            return (
-                StatusCode::CONFLICT,
-                "link token already consumed or gateway initialized".to_string(),
+            return super::error::ApiError::conflict(
+                super::codes::LINK_TOKEN_CONSUMED,
+                "link token already consumed or gateway initialized",
             )
-                .into_response();
+            .into_response();
         }
         Err(err) => {
-            return (
+            return super::error::internal_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to consume link token: {err}"),
-            )
-                .into_response();
+                super::codes::LINK_TOKEN_CONSUME_FAILED,
+                "failed to consume link token",
+                err.display_chain(),
+            );
         }
     }
     // 生命周期：Provisioned → Initializing。
     if let Err(err) = state.store.mark_gateway_initializing(gateway_id).await {
-        eprintln!("warn mark gateway initializing failed: {err}");
+        log::warn!("mark gateway initializing failed: {}", err.display_chain());
     }
     rate_limit::clear_auth_failures(state, client_key, GATEWAY_AUTH_SCOPE);
     let config = build_initial_config_json(state, gateway, gateway_id, &enrollment.token_id);
-    Json(InitialConfigReturned {
+    // 含一次性 RegistToken 明文 → `no-store`。
+    super::error::json_no_store(InitialConfigReturned {
         config,
         regist_token: Some(regist_token),
     })
-    .into_response()
 }
 
 /// initial-config 响应（JSON 契约）：中心下发的控制面连接配置 + 派生 RegistToken。
@@ -802,7 +851,7 @@ pub async fn submit_gateway_status(
     State(state): State<ApiState>,
     identity: Option<Extension<VerifiedGatewayIdentity>>,
     client: PeerConnectInfo,
-    Json(input): Json<ReportGatewayStatus>,
+    ApiJson(input): ApiJson<ReportGatewayStatus>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     match authorize_gateway_certificate(
@@ -844,18 +893,19 @@ pub async fn submit_gateway_status(
             };
             let update_result = state.store.upsert_gateway_status(&update).await;
             if let Err(err) = update_result {
-                return (
+                return super::error::internal_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to update gateway status: {err}"),
-                )
-                    .into_response();
+                    super::codes::GATEWAY_STATUS_UPDATE_FAILED,
+                    "failed to update gateway status",
+                    err.display_chain(),
+                );
             }
             // 时序历史：配置了 VictoriaMetrics 则推送指标（失败仅告警，不影响上报成功）。
             if let Some(vm_url) = &state.config.victoriametrics_url
                 && let Err(err) =
                     crate::infra::vm::push_gateway_status(vm_client(), vm_url, &update).await
             {
-                eprintln!("warn gateway_status vm push failed: {err}");
+                log::warn!("gateway_status vm push failed: {err}");
             }
             (
                 StatusCode::OK,
@@ -879,7 +929,7 @@ pub async fn renew_gateway_credential(
     State(state): State<ApiState>,
     identity: Option<Extension<VerifiedGatewayIdentity>>,
     client: PeerConnectInfo,
-    Json(input): Json<RenewGatewayCredential>,
+    ApiJson(input): ApiJson<RenewGatewayCredential>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = authorize_gateway_certificate(
@@ -899,11 +949,11 @@ pub async fn renew_gateway_credential(
     ) {
         Ok(issued) => issued,
         Err(reason) => {
-            return (
-                StatusCode::BAD_REQUEST,
+            return super::error::ApiError::bad_request(
+                super::codes::INVALID_CSR,
                 format!("invalid certificate signing request: {reason}"),
             )
-                .into_response();
+            .into_response();
         }
     };
     let updated = state
@@ -916,19 +966,29 @@ pub async fn renew_gateway_credential(
         .await
         .unwrap_or(false);
     if !updated {
-        return (
+        return super::error::ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to persist renewed gateway client certificate".to_string(),
+            super::codes::CLIENT_CERTIFICATE_PERSIST_FAILED,
+            "failed to persist renewed gateway client certificate",
         )
-            .into_response();
+        .into_response();
     }
-    eprintln!(
+    log::info!(
         "event=GatewayCredentialRenewed gateway_id={} old_serial={} new_serial={}",
-        input.gateway_id, input.current_certificate_serial, issued.serial_hex
+        input.gateway_id,
+        input.current_certificate_serial,
+        issued.serial_hex
     );
     let credential_id = match new_secret_token("cred") {
         Ok(id) => id,
-        Err(reason) => return (StatusCode::INTERNAL_SERVER_ERROR, reason).into_response(),
+        Err(reason) => {
+            return super::error::internal_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                super::codes::CREDENTIAL_ID_GENERATION_FAILED,
+                "failed to generate gateway credential id",
+                reason,
+            );
+        }
     };
     let bundle = GatewayCredentialBundle {
         credential_id,
@@ -961,25 +1021,26 @@ async fn authorize_gateway_certificate(
     }
     let Some(identity) = identity else {
         // 没带证书属未认证请求，不计入暴力尝试。
-        return Err(unauthorized_code("certificate_required"));
+        return Err(unauthorized_code(super::codes::CERTIFICATE_REQUIRED));
     };
     // 证书身份是权威：不接受「证书说是 A、请求体说是 B」。
     if identity.gateway_id != gateway_id {
         rate_limit::record_auth_failure(state, client_key, GATEWAY_AUTH_SCOPE);
-        return Err(unauthorized_code("certificate_mismatch"));
+        return Err(unauthorized_code(super::codes::CERTIFICATE_MISMATCH));
     }
     let gateway = match state.store.get_gateway(gateway_id).await {
         Ok(Some(gateway)) => gateway,
         Ok(None) => {
             rate_limit::record_auth_failure(state, client_key, GATEWAY_AUTH_SCOPE);
-            return Err(unauthorized_code("unknown_gateway"));
+            return Err(unauthorized_code(super::codes::UNKNOWN_GATEWAY));
         }
         Err(err) => {
-            return Err((
+            return Err(super::error::internal_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load gateway credential store: {err}"),
-            )
-                .into_response());
+                super::codes::GATEWAY_CREDENTIAL_STORE_UNAVAILABLE,
+                "failed to load gateway credential store",
+                err.display_chain(),
+            ));
         }
     };
     // 登记在册的凭据指纹必须与出示证书一致：轮换 / 吊销后旧证书立即失效。
@@ -988,26 +1049,24 @@ async fn authorize_gateway_certificate(
         identity.fingerprint_sha256.as_bytes(),
     ) {
         rate_limit::record_auth_failure(state, client_key, GATEWAY_AUTH_SCOPE);
-        return Err(unauthorized_code("certificate_not_registered"));
+        return Err(unauthorized_code(super::codes::CERTIFICATE_NOT_REGISTERED));
     }
     if gateway.credential_status != StoredGatewayCredentialStatus::Active {
-        return Err(unauthorized_code("certificate_not_active"));
+        return Err(unauthorized_code(super::codes::CERTIFICATE_NOT_ACTIVE));
     }
     if let Some(expires_at) = &gateway.credential_expires_at
         && credential_is_expired(expires_at)
     {
-        return Err(unauthorized_code("certificate_expired"));
+        return Err(unauthorized_code(super::codes::CERTIFICATE_EXPIRED));
     }
     rate_limit::clear_auth_failures(state, client_key, GATEWAY_AUTH_SCOPE);
     Ok(gateway)
 }
 
 /// 401 正文里带一个稳定 `code`，网关侧按它决定要不要自愈。
-fn unauthorized_code(code: &str) -> Response {
-    (
-        StatusCode::UNAUTHORIZED,
-        format!("gateway identity rejected: {code}"),
-    )
+fn unauthorized_code(code: &'static str) -> Response {
+    super::error::ApiError::unauthorized(code, format!("gateway identity rejected: {code}"))
+        .with_no_store()
         .into_response()
 }
 
@@ -1053,7 +1112,7 @@ pub async fn verify_gateway_credential(
     State(state): State<ApiState>,
     identity: Option<Extension<VerifiedGatewayIdentity>>,
     client: PeerConnectInfo,
-    Json(input): Json<VerifyGatewayCredential>,
+    ApiJson(input): ApiJson<VerifyGatewayCredential>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     match authorize_gateway_certificate(
@@ -1080,24 +1139,25 @@ pub async fn verify_gateway_credential(
 /// lifecycle_state 未记录（None）时按未初始化（Provisioned）处理。
 pub async fn query_gateway_initialization_status(
     State(state): State<ApiState>,
-    Query(params): Query<QueryGatewayInitializationStatus>,
+    ApiQuery(params): ApiQuery<QueryGatewayInitializationStatus>,
 ) -> Response {
     let gateway_id = params.gateway_id.as_str();
     let gateway = match state.store.get_gateway(gateway_id).await {
         Ok(Some(gateway)) => gateway,
         Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
+            return super::error::ApiError::not_found(
+                super::codes::GATEWAY_NOT_FOUND,
                 format!("unknown gateway `{gateway_id}`"),
             )
-                .into_response();
+            .into_response();
         }
         Err(err) => {
-            return (
+            return super::error::internal_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load gateway store: {err}"),
-            )
-                .into_response();
+                super::codes::GATEWAY_STORE_UNAVAILABLE,
+                "failed to load gateway store",
+                err.display_chain(),
+            );
         }
     };
     let lifecycle_state = gateway
@@ -1222,6 +1282,7 @@ mod tests {
                 hmac_secret: "test-hmac-secret".to_string(),
                 credential_ttl_seconds: 3600,
                 link_ttl_seconds: 900,
+                log: Default::default(),
             },
             store: std::sync::Arc::new(store),
             artifact_store: std::sync::Arc::new(crate::infra::LocalArtifactStore::new(
@@ -1279,6 +1340,7 @@ mod tests {
                 hmac_secret: "test-hmac-secret".to_string(),
                 credential_ttl_seconds: 3600,
                 link_ttl_seconds: 900,
+                log: Default::default(),
             },
             store: std::sync::Arc::new(store),
             artifact_store: std::sync::Arc::new(crate::infra::LocalArtifactStore::new(
@@ -1323,6 +1385,7 @@ mod tests {
                 hmac_secret: "test-hmac-secret".to_string(),
                 credential_ttl_seconds: 3600,
                 link_ttl_seconds: 900,
+                log: Default::default(),
             },
             store: std::sync::Arc::new(store),
             artifact_store: std::sync::Arc::new(crate::infra::LocalArtifactStore::new(
@@ -2170,28 +2233,58 @@ mod tests {
         // 各造一条不合格行：空平台 / 纯空白平台 / 空摘要 / 纯空白摘要。
         state
             .store
-            .publish_release("wist-agentd", "0.3.0", "https://c/blank-platform.tar.gz", Some("sha256:aa"), Some(""))
+            .publish_release(
+                "wist-agentd",
+                "0.3.0",
+                "https://c/blank-platform.tar.gz",
+                Some("sha256:aa"),
+                Some(""),
+            )
             .await
             .expect("publish");
         state
             .store
-            .publish_release("wist-agentd", "0.3.0", "https://c/space-platform.tar.gz", Some("sha256:aa"), Some("   "))
+            .publish_release(
+                "wist-agentd",
+                "0.3.0",
+                "https://c/space-platform.tar.gz",
+                Some("sha256:aa"),
+                Some("   "),
+            )
             .await
             .expect("publish");
         state
             .store
-            .publish_release("wist-agentd", "0.3.0", "https://c/blank-sha.tar.gz", Some(""), Some("x86_64-unknown-linux-musl"))
+            .publish_release(
+                "wist-agentd",
+                "0.3.0",
+                "https://c/blank-sha.tar.gz",
+                Some(""),
+                Some("x86_64-unknown-linux-musl"),
+            )
             .await
             .expect("publish");
         state
             .store
-            .publish_release("wist-agentd", "0.3.0", "https://c/space-sha.tar.gz", Some("   "), Some("aarch64-unknown-linux-musl"))
+            .publish_release(
+                "wist-agentd",
+                "0.3.0",
+                "https://c/space-sha.tar.gz",
+                Some("   "),
+                Some("aarch64-unknown-linux-musl"),
+            )
             .await
             .expect("publish");
         // 唯一合格的一条。
         state
             .store
-            .publish_release("wist-agentd", "0.3.0", "https://c/ok.tar.gz", Some("sha256:ok"), Some("aarch64-apple-darwin"))
+            .publish_release(
+                "wist-agentd",
+                "0.3.0",
+                "https://c/ok.tar.gz",
+                Some("sha256:ok"),
+                Some("aarch64-apple-darwin"),
+            )
             .await
             .expect("publish");
 
@@ -2226,10 +2319,8 @@ mod tests {
     /// P5：同平台多条按 `published_at` 取**最新**，**不依赖输入顺序**（纯函数，直接喂乱序）。
     #[test]
     fn artifacts_for_version_picks_the_newest_per_platform_regardless_of_order() {
-        let older =
-            wist_control::DateTime::from_rfc3339("2026-10-01T00:00:00Z").expect("older");
-        let newer =
-            wist_control::DateTime::from_rfc3339("2026-10-02T00:00:00Z").expect("newer");
+        let older = wist_control::DateTime::from_rfc3339("2026-10-01T00:00:00Z").expect("older");
+        let newer = wist_control::DateTime::from_rfc3339("2026-10-02T00:00:00Z").expect("newer");
         let record = |url: &str, sha: &str, at: wist_control::DateTime| ReleaseRecord {
             version: "1.0.0".to_string(),
             artifact_url: url.to_string(),
@@ -2265,12 +2356,24 @@ mod tests {
         let state = provision_state("link-tok-expired");
         state
             .store
-            .publish_release("wist-agentd", "0.4.0", "https://c/a.tar.gz", Some("sha256:aa"), Some("aarch64-apple-darwin"))
+            .publish_release(
+                "wist-agentd",
+                "0.4.0",
+                "https://c/a.tar.gz",
+                Some("sha256:aa"),
+                Some("aarch64-apple-darwin"),
+            )
             .await
             .expect("publish");
         state
             .store
-            .publish_release("wist-agentd", "0.4.0", "https://c/l.tar.gz", Some("sha256:ll"), Some("x86_64-unknown-linux-musl"))
+            .publish_release(
+                "wist-agentd",
+                "0.4.0",
+                "https://c/l.tar.gz",
+                Some("sha256:ll"),
+                Some("x86_64-unknown-linux-musl"),
+            )
             .await
             .expect("publish");
         // 下架前：两平台都在。
@@ -2794,6 +2897,7 @@ mod tests {
                 hmac_secret: "test-hmac-secret".to_string(),
                 credential_ttl_seconds: 3600,
                 link_ttl_seconds: 900,
+                log: Default::default(),
             },
             store: std::sync::Arc::new(file_store),
             artifact_store: std::sync::Arc::new(crate::infra::LocalArtifactStore::new(

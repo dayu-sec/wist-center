@@ -62,3 +62,13 @@ object_storage_secret_key = ""
 # 启动时写入 store（仅缺失时写入）的网关种子凭据，每项 `gateway_id:token`。
 # 例：gateway_credentials = ["gw-demo:change-me"]
 gateway_credentials = []
+
+# ── 可选：本进程运行日志（缺省 info / text / stderr；`RUST_LOG` 环境变量优先）──
+# [log]
+# level  = "info"                       # 或 "wist_center=debug,sqlx=warn"
+# format = "json"                       # 缺省 text；只有要 JSON 行才需写
+# file   = "/var/log/wist-center.log"   # 给了就写文件（相对配置目录解析；自动建父目录）；缺省 stderr
+# max_bytes       = 67108864            # 单文件上限（字节），写满轮转成 file.1/file.2/…（缺省 64 MiB）
+# keep_files      = 4                   # 保留的历史分卷个数（0 = 不留历史；缺省 4）
+# max_age_seconds = 604800              # 历史分卷保留时长（秒）；0 = 不按时间清（缺省 7 天）
+# 注意：轮转由中心进程自己做；不要再给这个文件挂 logrotate。

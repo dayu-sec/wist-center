@@ -3,7 +3,7 @@
 
 [package]
 name = "wist-center"
-version = "0.8.0" #@gxl:set(version)
+version = "0.9.0" #@gxl:set(version)
 edition = "2024"
 
 [dependencies]
@@ -22,6 +22,8 @@ sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "tls-none", "
 wist-control =  "0.14"
 #wist-control = { path = "../wist-control" }
 wist-error =  "0.2"
+# 错误投影 wire 类型（`ProtocolError` / `ProtocolErrorEnvelope`）：与 gateway / gwlinkd / agentd 共用同一份。
+wist-shared = "0.2"
 
 # 网关客户端证书（mTLS）签发：中心当 CA-G，按网关 CSR 签「每网关一张」客户端证书。
 # 与网关侧 infra/agent_ca.rs 同口径（rcgen 签、x509-parser 读 URI SAN）。
@@ -46,6 +48,10 @@ hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service", "
 #wist-control = { path = "../wist-control" }
 #wist-error = { path = "../wist-error" }
 orion-error = { version = "0.9", features = ["derive", "serde_json"] }
+
+# 运行日志：`env_logger` 走 `log` facade（与 `orion-error` 默认 `log` feature 同一入口）。
+log = "0.4"
+env_logger = "0.11"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

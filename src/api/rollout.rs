@@ -15,7 +15,7 @@ use wist_control::types::DateTime;
 
 use crate::infra::{UpgradePhaseRecord, UpgradePlanEntryRecord, UpgradePlanRecord};
 
-use super::ApiState;
+use super::{ApiState, codes, error::ApiError};
 
 // ── 入参（与网关**同形**；形状的单一真源是模型 `Control.RolloutApp.AdminInterface`） ──
 
@@ -26,7 +26,8 @@ use super::ApiState;
 /// 阶段由**服务端**按阶梯切（`wist_release::rollout::plan_phases`），客户端只给目标与阶段数。
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateRolloutPlanRequest {
-    /// 动作面：今天只有 `upgrade`。
+    /// 动作面：`upgrade`（升级安装）/ `push-agent-package`（Agent 包下发，见
+    /// [`wist_control::ACTION_PUSH_AGENT_PACKAGE`]）。
     pub action: String,
     /// 动作参数（JSON）：中心铺网关 —— `{"targets":[{"component","target_version"}]}`。
     pub spec: String,
@@ -49,6 +50,19 @@ pub struct CreateRolloutPlanRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct PlanRefRequest {
     pub plan_id: String,
+}
+
+/// 重派某份计划的失败目标（中心侧**新建补跑计划**）：`POST /api/v1/admin/rollout-plans/retry`。
+///
+/// 与网关侧 `RetryRolloutPlanRequest` **同名同义**（形状的单一真源是模型
+/// `Control.RolloutApp.AdminInterface`）；差在落地方式 —— 网关原地重开同一份计划，中心新建一份，
+/// 理由见 [`build_retry_plan`]。
+#[derive(Debug, Clone, Deserialize)]
+pub struct RetryRolloutPlanRequest {
+    pub plan_id: String,
+    /// 要重试的目标；省略 / 为空 = 该计划里**所有**失败目标。
+    #[serde(default)]
+    pub target_ids: Vec<String>,
 }
 
 // ── 读投影（模型里只到「计划」/「计划 + 条目」的形状；与网关视图同形） ──
@@ -180,15 +194,22 @@ fn rollout_plan_id(action: &str, now: &DateTime) -> String {
 ///
 /// 阶段由服务端按阶梯切（共享 `wist_release::rollout::plan_phases`），闸门固定策略：
 /// 首段 `manual`（金丝雀人工确认），其后 `all_succeeded`（末段不看闸门）。
-/// 校验不过 → 返回中性原因字符串，由 handler 折成 **400**。
-pub(super) fn build_plan(input: &CreateRolloutPlanRequest) -> Result<UpgradePlanRecord, String> {
+/// 校验不过 → 返回带具体 `code` 的 [`ApiError`]（均为 `400`），由 handler 直接投影。
+#[allow(clippy::result_large_err)] // 与全仓一致：错误直接是可响应的 `ApiError`，不额外装箱。
+pub(super) fn build_plan(input: &CreateRolloutPlanRequest) -> Result<UpgradePlanRecord, ApiError> {
     let action = input.action.trim();
     if action.is_empty() {
-        return Err("action is required".to_string());
+        return Err(ApiError::bad_request(
+            codes::INVALID_ACTION,
+            "action is required",
+        ));
     }
     let spec = input.spec.trim();
     if spec.is_empty() {
-        return Err("spec is required".to_string());
+        return Err(ApiError::bad_request(
+            codes::INVALID_SPEC,
+            "spec is required",
+        ));
     }
     // 截止时间可省；给了就要是合法 RFC3339。
     let deadline_at = match input
@@ -197,17 +218,23 @@ pub(super) fn build_plan(input: &CreateRolloutPlanRequest) -> Result<UpgradePlan
         .map(str::trim)
         .filter(|raw| !raw.is_empty())
     {
-        Some(raw) => Some(
-            DateTime::from_rfc3339(raw)
-                .ok_or_else(|| format!("deadline_at must be RFC3339, got {raw:?}"))?,
-        ),
+        Some(raw) => Some(DateTime::from_rfc3339(raw).ok_or_else(|| {
+            ApiError::bad_request(
+                codes::INVALID_DEADLINE,
+                format!("deadline_at must be RFC3339, got {raw:?}"),
+            )
+        })?),
         None => None,
     };
     if input.timeout_seconds < 0 {
-        return Err("timeout_seconds must not be negative".to_string());
+        return Err(ApiError::bad_request(
+            codes::INVALID_TIMEOUT,
+            "timeout_seconds must not be negative",
+        ));
     }
     // 目标去重、按阶梯切段、固定闸门策略 —— 口径在共享 crate `wist_release::plan`。
-    let drafts = wist_release::plan::build_phase_drafts(&input.target_ids, input.phase_count)?;
+    let drafts = wist_release::plan::build_phase_drafts(&input.target_ids, input.phase_count)
+        .map_err(|reason| ApiError::bad_request(codes::INVALID_PHASE_PLAN, reason))?;
     let phases: Vec<UpgradePhaseRecord> = drafts
         .into_iter()
         .map(|draft| UpgradePhaseRecord {
@@ -247,6 +274,87 @@ pub(super) fn build_plan(input: &CreateRolloutPlanRequest) -> Result<UpgradePlan
         legacy_steps: Vec::new(),
         legacy_targets: Vec::new(),
     })
+}
+
+/// 补跑计划的 id：在原口径上加 `-retry` 后缀 —— 计划列表里一眼看出「这是重派出来的那份」。
+fn retry_plan_id(action: &str, now: &DateTime) -> String {
+    format!("{}-retry", rollout_plan_id(action, now))
+}
+
+/// 「重试」的落地：把一份失败计划里的**失败目标**重派成**一份新计划**（新 `plan_id`、单阶段、
+/// 直接放行 `rolling`）。
+///
+/// **为什么必须是新计划（不是把原计划改回 `pending`）**：gwlinkd 对每份计划**只驱一次** ——
+/// 它落盘 `last_plan_id` 游标，拉到时若 `plan.plan_id == cursor.last_plan_id` 就**跳过**
+/// （② Agent 包下发连失败也落游标）。所以「同一份计划、条目改回 pending」在网关看来还是那份
+/// 计划 → 被静默跳过：中心显示待派、网关永不重跑，正是最难查的那种假重试。新 `plan_id` 才真的
+/// 重驱；原计划**原样留作历史** —— 它是「那次尝试」的记录，不该被改写。
+///
+/// 单阶段 + 直接放行：重试是人工点的「现在就重派」，再要求一次「批准」只是多一次点击；单阶段也
+/// 意味着**末阶段**（全部了结即收尾，不设人工闸门），重试目标全了结时这份补跑计划自动收敛。
+///
+/// `targets` 为空 → 返回 [`ApiError`]（`no_failed_targets`，`400`）。
+#[allow(clippy::result_large_err)] // 同上。
+pub(super) fn build_retry_plan(
+    original: &UpgradePlanRecord,
+    targets: &[String],
+) -> Result<UpgradePlanRecord, ApiError> {
+    if targets.is_empty() {
+        return Err(ApiError::bad_request(
+            codes::NO_FAILED_TARGETS,
+            "no failed target to retry",
+        ));
+    }
+    let drafts = wist_release::plan::build_phase_drafts(targets, 1)
+        .map_err(|reason| ApiError::bad_request(codes::INVALID_PHASE_PLAN, reason))?;
+    let phases: Vec<UpgradePhaseRecord> = drafts
+        .into_iter()
+        .map(|draft| UpgradePhaseRecord {
+            phase_index: draft.index,
+            gateway_ids: draft.target_ids,
+            advance_rule: draft.advance_rule,
+            status: draft.status,
+        })
+        .collect();
+    let now = DateTime::now();
+    let entries: Vec<UpgradePlanEntryRecord> = phases
+        .iter()
+        .flat_map(|phase| phase.gateway_ids.iter())
+        .map(|gateway_id| UpgradePlanEntryRecord {
+            gateway_id: gateway_id.clone(),
+            status: "pending".to_string(),
+            detail: String::new(),
+            updated_at: now.clone(),
+        })
+        .collect();
+    let mut plan = UpgradePlanRecord {
+        plan_id: retry_plan_id(&original.action, &now),
+        // 同一个动作面、同一份参数：重试的是**同一件事**，改的只是「再派一次」。
+        action: original.action.clone(),
+        spec: original.spec.clone(),
+        deadline_at: original.deadline_at.clone(),
+        timeout_seconds: original.timeout_seconds,
+        phases,
+        batch_size: original.batch_size,
+        current_phase: 0,
+        status: "draft".to_string(),
+        created_by: "admin".to_string(),
+        created_at: now,
+        approved_by: None,
+        approved_at: None,
+        entries,
+        legacy_steps: Vec::new(),
+        legacy_targets: Vec::new(),
+    };
+    if !approve_plan(&mut plan) {
+        return Err(ApiError::conflict(
+            codes::PLAN_NO_PHASE,
+            "retry plan has no phase",
+        ));
+    }
+    plan.approved_by = Some("admin".to_string());
+    plan.approved_at = Some(DateTime::now());
+    Ok(plan)
 }
 
 // ── 推进（口径在共享 crate `wist_release::plan`；中心只映射，不物化） ──
@@ -669,6 +777,63 @@ mod tests {
         );
         progress_plan_after_terminal_result(&mut plan);
         assert_eq!(plan.status, "completed");
+    }
+
+    /// 重试落地成**新计划**：只带失败目标、单阶段、直接放行；动作/参数从原计划继承。
+    #[test]
+    fn build_retry_plan_is_a_new_single_phase_plan_for_failed_targets() {
+        let original = plan_with(
+            vec![phase(
+                1,
+                &["gw-001", "gw-002", "gw-003"],
+                "manual",
+                "completed",
+            )],
+            vec![
+                entry("gw-001", "succeeded"),
+                entry("gw-002", "failed"),
+                entry("gw-003", "pending"),
+            ],
+            1,
+            "failed",
+        );
+        let retry = build_retry_plan(&original, &["gw-002".to_string()]).expect("retry plan");
+
+        assert_ne!(
+            retry.plan_id, original.plan_id,
+            "必须是新 id（网关按 plan_id 去重）"
+        );
+        assert!(
+            retry.plan_id.ends_with("-retry"),
+            "id 要一眼看出是重派：{}",
+            retry.plan_id
+        );
+        assert_eq!(retry.status, "rolling", "重试 = 现在就重派，直接放行");
+        assert_eq!(retry.current_phase, 1);
+        assert_eq!(retry.phases.len(), 1, "单阶段：重试目标一次铺完");
+        assert_eq!(retry.phases[0].gateway_ids, vec!["gw-002".to_string()]);
+        assert_eq!(retry.phases[0].status, "rolling");
+        assert_eq!(retry.action, original.action);
+        assert_eq!(retry.spec, original.spec);
+        assert_eq!(retry.timeout_seconds, original.timeout_seconds);
+        assert_eq!(retry.entries.len(), 1);
+        assert_eq!(retry.entries[0].gateway_id, "gw-002");
+        assert_eq!(
+            retry.entries[0].status, "pending",
+            "回到待派，网关下次轮询即可取走"
+        );
+        assert!(retry.approved_at.is_some());
+    }
+
+    #[test]
+    fn build_retry_plan_rejects_an_empty_target_list() {
+        let original = plan_with(
+            vec![phase(1, &["gw-001"], "manual", "completed")],
+            vec![entry("gw-001", "failed")],
+            1,
+            "failed",
+        );
+        assert!(build_retry_plan(&original, &[]).is_err());
     }
 
     #[test]

@@ -5,10 +5,10 @@ use std::sync::{Arc, Mutex};
 
 use axum::{
     Router,
-    extract::{Extension, Request, connect_info::ConnectInfo},
-    http::{HeaderValue, header},
+    extract::{Extension, OriginalUri, Request, connect_info::ConnectInfo},
+    http::{HeaderValue, Method, header},
     middleware::{Next, from_fn},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 
@@ -18,7 +18,13 @@ use crate::{config::CenterConfig, infra::ArtifactStore, infra::Store};
 
 mod admin_auth;
 mod admin_ops;
+/// 稳定错误码词表（`{ "error": { "code": … } }` 里 `code` 的唯一来源）。
+pub mod codes;
+pub mod error;
+pub use error::{ApiError, ProtocolError, ProtocolErrorEnvelope, Severity};
+mod extract;
 mod gateway_ops;
+mod install_script;
 mod rate_limit;
 mod rollout;
 
@@ -29,9 +35,9 @@ use admin_ops::{
     admin_get_gateway_initial_config, admin_get_gateway_uptime, admin_list_gateway_agents,
     admin_list_gateway_instances, admin_list_gateway_lifecycle, admin_list_gateway_status,
     admin_list_releases, admin_list_upgrade_plans, admin_publish_release,
-    admin_publish_release_batch, admin_resolve_github_release, admin_rotate_gateway_link_token,
-    admin_set_release_status, admin_show_gateway_status, admin_view_gateway_list,
-    admin_view_upgrade_plan,
+    admin_publish_release_batch, admin_resolve_github_release, admin_retry_upgrade_plan,
+    admin_rotate_gateway_link_token, admin_set_gateway_archived, admin_set_release_status,
+    admin_show_gateway_status, admin_view_gateway_list, admin_view_upgrade_plan,
 };
 use gateway_ops::{
     download_release_artifact, get_gateway_initial_config, get_gateway_upgrade_plan,
@@ -109,6 +115,23 @@ async fn gateway_initial_config_cors(request: Request, next: Next) -> Response {
     response
 }
 
+/// 未命中任何路由（`404`）：也折成统一信封 —— 默认 axum 回的是空体 `404`，绕过 `{ "error": … }` 契约。
+async fn fallback_not_found(OriginalUri(uri): OriginalUri) -> Response {
+    log::warn!("unmatched route: {uri}");
+    ApiError::not_found(codes::ROUTE_NOT_FOUND, "route not found").into_response()
+}
+
+/// 路由存在但方法不允许（`405`）：同样折成信封（axum 默认给裸 `405`）。
+async fn fallback_method_not_allowed(method: Method, OriginalUri(uri): OriginalUri) -> Response {
+    log::warn!("method not allowed: {method} {uri}");
+    ApiError::new(
+        axum::http::StatusCode::METHOD_NOT_ALLOWED,
+        codes::METHOD_NOT_ALLOWED,
+        "method not allowed",
+    )
+    .into_response()
+}
+
 pub fn router(
     config: CenterConfig,
     store: Arc<dyn Store>,
@@ -133,7 +156,17 @@ pub fn router_for(state: ApiState) -> Router {
         .route("/api/v1/gateway/agents/status", post(submit_agent_status))
         // 网关面：WarpGateway 持注册 Token 注册（RegisterGatewayFlow）
         .route("/api/v1/gateway/register", post(register_gateway))
-        // 网关面：Gateway 链接上级 link-upstream（初始化 URL 指向此端点；返回 application/json）
+        // 网关面：前置环境准备脚本（curl ... | bash）——公开、无令牌（补 tar/docker/compose）
+        .route(
+            "/api/v1/gateway/prepare-script",
+            get(install_script::get_gateway_prepare_script),
+        )
+        // 网关面：脚本安装（curl ... | bash）——一次性接入券鉴权，返回 shell 脚本
+        .route(
+            "/api/v1/gateway/install-script",
+            get(install_script::get_gateway_install_script),
+        )
+        // 网关面：链接上级 link-upstream（初始化 URL 指向此端点；返回 application/json）
         .route(
             "/api/v1/gateway/link-upstream",
             get(get_gateway_initial_config)
@@ -241,6 +274,11 @@ pub fn router_for(state: ApiState) -> Router {
             "/api/v1/admin/gateways/{gateway_id}/lifecycle",
             get(admin_list_gateway_lifecycle),
         )
+        // 管理面：归档 / 取消归档一台网关（标记，不删除；只允许归档离线网关）
+        .route(
+            "/api/v1/admin/gateways/{gateway_id}/archive",
+            post(admin_set_gateway_archived),
+        )
         // 管理面：版本发布（wist-agentd / wist-gateway-stack / galaxy-ops / galaxy-flow，镜像外部制品）
         .route(
             "/api/v1/admin/releases/{component}",
@@ -280,9 +318,17 @@ pub fn router_for(state: ApiState) -> Router {
             "/api/v1/admin/rollout-plans/advance",
             post(admin_advance_upgrade_plan),
         )
+        // 重派失败目标：**新建**一份补跑计划（新 plan_id —— 网关按 plan_id 去重，同一份改状态是假重试）
+        .route(
+            "/api/v1/admin/rollout-plans/retry",
+            post(admin_retry_upgrade_plan),
+        )
         .route(
             "/api/v1/admin/rollout-plans/{plan_id}",
             get(admin_view_upgrade_plan),
         )
+        // 兜底：未命中的路径 / 方法也回统一错误信封（默认 axum 是空体）。
+        .fallback(fallback_not_found)
+        .method_not_allowed_fallback(fallback_method_not_allowed)
         .with_state(state)
 }

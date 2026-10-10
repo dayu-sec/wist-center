@@ -28,8 +28,27 @@ impl PgStore {
             .connect(database_url)
             .await
             .source_raw_err(StoreReason::Sql, "connect postgres")?;
+        // **每次启动**都过一遍 schema（与 `docker/initdb/01_schema.sql` 同一份文件，全部
+        // `IF NOT EXISTS` 幂等）：initdb 只在数据卷**首次**初始化时跑，所以「新加一列」这种事
+        // 在已存在的库上不会自动到位 —— 而列名写在 `GATEWAY_COLUMNS` 里，缺列会让**读列表**
+        // 直接报 SQL 错（2026-10-09 真实踩过：加了 `archived_at` 没迁移，网关联表全 500）。
+        // 失败**只告警不中断**：生产库可能不给应用 DDL 权限（那时由运维按同一份 SQL 迁移），
+        // 不能让中心因为「迁移不了」而起不来。
+        if let Err(err) = apply_schema(&pool).await {
+            log::warn!(
+                "failed to apply postgres schema (continuing; run docker/initdb/01_schema.sql by hand if columns are missing): {err}"
+            );
+        }
         Ok(Self { pool })
     }
+}
+
+/// 把随二进制编译进来的 `01_schema.sql` 整份执行一遍（幂等：建表 / 补列 / 建索引）。
+async fn apply_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::raw_sql(include_str!("../../docker/initdb/01_schema.sql"))
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// gateways 表行（与 docker/initdb/01_schema.sql 列一一对应）。
@@ -69,6 +88,7 @@ struct GatewayRow {
     initialized_at: Option<chrono::DateTime<chrono::Utc>>,
     created_at: Option<chrono::DateTime<chrono::Utc>>,
     last_seen_at: Option<chrono::DateTime<chrono::Utc>>,
+    archived_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 fn parse_lifecycle(value: &str) -> GatewayInstanceLifecycleState {
@@ -151,6 +171,9 @@ impl GatewayRow {
                 DateTime::from_rfc3339(&value.to_rfc3339()).unwrap_or_else(DateTime::now)
             }),
             last_seen_at: self.last_seen_at.map(|value| {
+                DateTime::from_rfc3339(&value.to_rfc3339()).unwrap_or_else(DateTime::now)
+            }),
+            archived_at: self.archived_at.map(|value| {
                 DateTime::from_rfc3339(&value.to_rfc3339()).unwrap_or_else(DateTime::now)
             }),
         }
@@ -241,7 +264,8 @@ const GATEWAY_COLUMNS: &str = "gateway_id, instance_id, credential_token_hash, \
                                store_bytes, ingest_accepted_total, ingest_rejected_total, last_ingest_at, \
                                memory_total_bytes, load_1m, load_5m, load_15m, \
                                disk_usage_percent, disk_total_bytes, disk_available_bytes, \
-                               lifecycle_state, initialized_at, created_at, last_seen_at";
+                               lifecycle_state, initialized_at, created_at, last_seen_at, \
+                               archived_at";
 
 #[async_trait::async_trait]
 impl Store for PgStore {
@@ -309,6 +333,7 @@ impl Store for PgStore {
                  disk_usage_percent = $21, disk_total_bytes = $22, disk_available_bytes = $23, \
                  lifecycle_state = 'Running', \
                  initialized_at = COALESCE(initialized_at, NOW()), \
+                 archived_at = CASE WHEN $4 = 'online' THEN NULL ELSE archived_at END, \
                  last_seen_at = $24 \
              WHERE gateway_id = $1",
         )
@@ -369,6 +394,20 @@ impl Store for PgStore {
             .await
             .source_raw_err(StoreReason::Sql, "set gateway public_base_url")?;
         Ok(())
+    }
+
+    async fn set_gateway_archived(
+        &self,
+        gateway_id: &str,
+        archived_at: Option<DateTime>,
+    ) -> Result<bool, StoreError> {
+        let result = sqlx::query("UPDATE gateways SET archived_at = $2 WHERE gateway_id = $1")
+            .bind(gateway_id)
+            .bind(archived_at.map(|value| value.to_chrono()))
+            .execute(&self.pool)
+            .await
+            .source_raw_err(StoreReason::Sql, "set gateway archived_at")?;
+        Ok(result.rows_affected() > 0)
     }
 
     async fn create_gateway(
@@ -453,7 +492,7 @@ impl Store for PgStore {
         let expires_at = parse_optional_timestamptz(&expires_at);
         let result = sqlx::query(
             "UPDATE gateways SET credential_token_hash = $2, credential_status = 'active', \
-                 credential_expires_at = $3 \
+                 credential_expires_at = $3, archived_at = NULL \
              WHERE gateway_id = $1",
         )
         .bind(gateway_id)

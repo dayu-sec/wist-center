@@ -110,6 +110,8 @@ pub struct CenterConfig {
     /// 来源：配置文件的 `security.link_ttl_seconds` 或
     /// env：`WARP_INSIGHT_CENTER_LINK_TTL_SECONDS`。默认 15 分钟。
     pub link_ttl_seconds: i64,
+    /// `[log]` 段：本进程运行日志（级别 / 格式 / 落点 / 轮转）。
+    pub log: crate::logging::LogSection,
 }
 
 /// S3 兼容对象存储配置（MinIO 等）。
@@ -151,6 +153,7 @@ struct RawCenterConfig {
     security: RawSecurityConfig,
     artifacts: RawArtifactsConfig,
     enrollment: RawEnrollmentConfig,
+    log: crate::logging::LogSection,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -292,6 +295,11 @@ impl CenterConfig {
         let ca_cert_path = normalize_optional(security.ca_cert_path)
             .map(|path| absolutize_path(config_dir, Path::new(&path)))
             .unwrap_or_else(default_ca_cert_path);
+        // 运行日志：`[log] file` 的相对路径按**配置文件所在目录**解析（与 wist-gateway / wist-gwlinkd 同口径）。
+        let mut log = raw.log;
+        if let Some(file) = log.file.take() {
+            log.file = Some(absolutize_path(config_dir, &file));
+        }
         // 服务端 TLS：成对配（validate 会卡住只配一半）；相对路径按配置目录解析。
         let server_cert_path = normalize_optional(serve.server_cert_path)
             .map(|path| absolutize_path(config_dir, Path::new(&path)));
@@ -348,6 +356,7 @@ impl CenterConfig {
             link_ttl_seconds: security
                 .link_ttl_seconds
                 .unwrap_or(DEFAULT_LINK_TTL_SECONDS),
+            log,
         })
     }
 
@@ -933,5 +942,33 @@ listen_addr = ""
                 _ => out.push(path),
             }
         }
+    }
+
+    #[test]
+    fn log_section_parses_and_absolutizes_file() {
+        let path = write_temp_config(
+            r#"
+[server]
+listen_addr = "127.0.0.1:3100"
+public_url = "https://center.example"
+protocol_version = "1.0"
+
+[log]
+level = "warn"
+format = "json"
+file = "logs/center.log"
+max_bytes = 1048576
+"#,
+        );
+        let config = CenterConfig::load_from_path(&path).expect("config loads");
+        assert_eq!(config.log.level.as_deref(), Some("warn"));
+        assert_eq!(config.log.format, crate::logging::LogFormat::Json);
+        let file = config.log.file.expect("log file resolved");
+        assert!(
+            file.is_absolute(),
+            "log file should be absolutized: {file:?}"
+        );
+        assert!(file.ends_with("logs/center.log"), "{file:?}");
+        let _ = std::fs::remove_file(&path);
     }
 }

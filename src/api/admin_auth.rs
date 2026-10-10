@@ -3,7 +3,7 @@
 // 代码库统一采用 admin bearer token 模式（jwt 后续对齐）。
 
 use axum::{
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, header},
     response::{IntoResponse, Response},
 };
 
@@ -30,11 +30,21 @@ pub(super) fn require_admin_bearer(
     };
     let Some(token) = bearer_token(headers) else {
         // 缺 token 属未认证请求，不计入暴力尝试（否则无 token 的轮询会锁死客户端）。
-        return Err((StatusCode::UNAUTHORIZED, "missing admin bearer token").into_response());
+        return Err(super::error::ApiError::unauthorized(
+            super::codes::MISSING_ADMIN_BEARER_TOKEN,
+            "missing admin bearer token",
+        )
+        .with_no_store()
+        .into_response());
     };
     if !constant_time_eq(sha256_hex(token).as_bytes(), expected_hash.as_bytes()) {
         rate_limit::record_auth_failure(state, client_key, ADMIN_AUTH_SCOPE);
-        return Err((StatusCode::UNAUTHORIZED, "invalid admin bearer token").into_response());
+        return Err(super::error::ApiError::unauthorized(
+            super::codes::INVALID_ADMIN_BEARER_TOKEN,
+            "invalid admin bearer token",
+        )
+        .with_no_store()
+        .into_response());
     }
     rate_limit::clear_auth_failures(state, client_key, ADMIN_AUTH_SCOPE);
     Ok(())

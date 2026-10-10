@@ -3,7 +3,7 @@
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -19,8 +19,11 @@ use wist_control::{
 use crate::infra::{StoreReason, StoredGateway};
 
 use super::{
-    ApiState, PeerConnectInfo, admin_auth::require_admin_bearer, build_control_center_trust_bundle,
-    control_center_tls_required, rate_limit, rollout,
+    ApiState, PeerConnectInfo,
+    admin_auth::require_admin_bearer,
+    build_control_center_trust_bundle, control_center_tls_required,
+    extract::{ApiJson, ApiQuery},
+    rate_limit, rollout,
 };
 
 /// 创建网关实例请求体：对齐模型 `AdminCreateGatewayInstanceRequest`（gateway_name/requested_by）。
@@ -45,6 +48,11 @@ pub struct GatewayInstallInfo {
     pub trust_bundle_pem: Option<String>,
     /// 服务端生成的 curl 验证命令：Bearer 用接入 token + 网关自生成身份调 init_url。
     pub init_curl: String,
+    /// 脚本安装命令（`curl ... | bash`）：在目标主机上装 gops/gx 并拉起 gateway-stack。
+    /// URL 里带同一张一次性接入券（回执交付后 s 刷新即丢，可随时重新生成/轮换）。
+    pub install_script_command: String,
+    /// 前置环境准备命令（`curl ... | bash`）：补 tar/docker/docker compose 等；无需令牌，可先于安装单独跑。
+    pub prepare_command: String,
 }
 
 /// 创建网关实例返回：**仅实例视图**。接入凭据不在 create 响应里交付（设计 §6/§8），
@@ -63,6 +71,44 @@ pub struct AdminGatewayInstanceView {
     pub created_at: DateTime,
     pub initialized_at: Option<DateTime>,
     pub init_url: String,
+    /// 归档时刻；`None` = 未归档。归档是**标记**（默认视图隐藏、历史保留、可恢复），不是删除 ——
+    /// 页面据此显示「已归档」与「取消归档」。
+    #[serde(default)]
+    pub archived_at: Option<DateTime>,
+}
+
+/// 实例视图（列表与归档回执共用一份）：`init_url` 由中心对外地址派生。
+fn gateway_instance_view(state: &ApiState, gateway: StoredGateway) -> AdminGatewayInstanceView {
+    let init_url = format!(
+        "{}/api/v1/gateway/link-upstream?gateway_id={}",
+        state.config.public_url.trim_end_matches('/'),
+        gateway.gateway_id
+    );
+    AdminGatewayInstanceView {
+        gateway_id: gateway.gateway_id,
+        instance_id: gateway.instance_id,
+        lifecycle_state: gateway
+            .lifecycle_state
+            .unwrap_or(GatewayInstanceLifecycleState::Provisioned),
+        created_at: gateway.created_at.unwrap_or_else(DateTime::now),
+        initialized_at: gateway.initialized_at,
+        init_url,
+        archived_at: gateway.archived_at,
+    }
+}
+
+/// 列表类查询的共用开关：是否把**已归档**的网关也带上（默认不带）。
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct IncludeArchivedQuery {
+    #[serde(default)]
+    pub include_archived: bool,
+}
+
+/// 归档 / 取消归档的请求体（`POST /api/v1/admin/gateways/{gateway_id}/archive`）。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SetGatewayArchivedRequest {
+    /// `true` = 归档（默认视图不再显示这台网关）；`false` = 取消归档。
+    pub archived: bool,
 }
 
 /// 注册 Token 管理视图：只公开状态/限量/有效期，不暴露 token_hash。
@@ -72,7 +118,7 @@ pub async fn admin_create_gateway_instance(
     State(state): State<ApiState>,
     headers: HeaderMap,
     client: PeerConnectInfo,
-    Json(request): Json<AdminCreateGatewayInstanceRequest>,
+    ApiJson(request): ApiJson<AdminCreateGatewayInstanceRequest>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
@@ -80,11 +126,11 @@ pub async fn admin_create_gateway_instance(
     }
     let gateway_id = request.gateway_name.trim();
     if gateway_id.is_empty() || request.requested_by.trim().is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
+        return super::error::ApiError::bad_request(
+            super::codes::GATEWAY_NAME_AND_REQUESTED_BY_REQUIRED,
             "gateway_name and requested_by must not be empty",
         )
-            .into_response();
+        .into_response();
     }
     // 设计 §8：接入凭据**不在 create 响应里交付** —— create 只建实例；明文接入券由
     // 「生成/轮换」（POST .../link-token）产出、页面一次性展示（短 TTL）。
@@ -102,16 +148,17 @@ pub async fn admin_create_gateway_instance(
             }),
         )
             .into_response(),
-        Err(err) if err.reason() == &StoreReason::Conflict => (
-            StatusCode::CONFLICT,
+        Err(err) if err.reason() == &StoreReason::Conflict => super::error::ApiError::conflict(
+            super::codes::GATEWAY_ALREADY_EXISTS,
             format!("gateway {gateway_id} already exists"),
         )
-            .into_response(),
-        Err(err) => (
+        .into_response(),
+        Err(err) => super::error::internal_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to create gateway: {err}"),
-        )
-            .into_response(),
+            super::codes::GATEWAY_CREATE_FAILED,
+            "failed to create gateway",
+            err.display_chain(),
+        ),
     }
 }
 
@@ -152,6 +199,14 @@ fn build_install_info(state: &ApiState, gateway_id: &str, link_token: &str) -> G
         link_token: link_token.to_string(),
         trust_bundle_pem: state.config.ca_cert.clone(),
         init_curl,
+        install_script_command: super::install_script::build_install_script_command(
+            &state.config.public_url,
+            gateway_id,
+            link_token,
+        ),
+        prepare_command: super::install_script::build_prepare_script_command(
+            &state.config.public_url,
+        ),
     }
 }
 
@@ -184,7 +239,7 @@ pub async fn admin_rotate_gateway_link_token(
     Path(gateway_id): Path<String>,
     headers: HeaderMap,
     client: PeerConnectInfo,
-    Json(request): Json<AdminRotateGatewayLinkTokenRequest>,
+    ApiJson(request): ApiJson<AdminRotateGatewayLinkTokenRequest>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
@@ -192,15 +247,22 @@ pub async fn admin_rotate_gateway_link_token(
     }
     let gateway_id = gateway_id.trim();
     if gateway_id.is_empty() || request.requested_by.trim().is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
+        return super::error::ApiError::bad_request(
+            super::codes::GATEWAY_ID_AND_REQUESTED_BY_REQUIRED,
             "gateway_id and requested_by must not be empty",
         )
-            .into_response();
+        .into_response();
     }
     let token = match crate::infra::new_secret_token("link") {
         Ok(token) => token,
-        Err(reason) => return (StatusCode::INTERNAL_SERVER_ERROR, reason).into_response(),
+        Err(reason) => {
+            return super::error::internal_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                super::codes::LINK_TOKEN_GENERATION_FAILED,
+                "failed to generate link token",
+                reason,
+            );
+        }
     };
     let expires_at = link_expires_at(state.config.link_ttl_seconds);
     match state
@@ -214,26 +276,24 @@ pub async fn admin_rotate_gateway_link_token(
     {
         Ok(true) => {
             let install = build_install_info(&state, gateway_id, &token);
-            (
-                StatusCode::OK,
-                Json(AdminRotateGatewayLinkTokenReturned {
-                    gateway_id: gateway_id.to_string(),
-                    install,
-                    link_expires_at: Some(expires_at),
-                }),
-            )
-                .into_response()
+            // 含一次性明文接入券 → `no-store`。
+            super::error::json_no_store(AdminRotateGatewayLinkTokenReturned {
+                gateway_id: gateway_id.to_string(),
+                install,
+                link_expires_at: Some(expires_at),
+            })
         }
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
+        Ok(false) => super::error::ApiError::not_found(
+            super::codes::GATEWAY_NOT_FOUND,
             format!("gateway {gateway_id} not found"),
         )
-            .into_response(),
-        Err(err) => (
+        .into_response(),
+        Err(err) => super::error::internal_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to rotate setup token: {err}"),
-        )
-            .into_response(),
+            super::codes::SETUP_TOKEN_ROTATE_FAILED,
+            "failed to rotate setup token",
+            err.display_chain(),
+        ),
     }
 }
 
@@ -284,7 +344,7 @@ pub async fn admin_get_gateway_uptime(
     headers: HeaderMap,
     client: PeerConnectInfo,
     Path(gateway_id): Path<String>,
-    Query(params): Query<GatewayUptimeQueryParams>,
+    ApiQuery(params): ApiQuery<GatewayUptimeQueryParams>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
@@ -303,7 +363,7 @@ pub async fn admin_get_gateway_uptime(
             {
                 Ok(uptime) => uptime,
                 Err(err) => {
-                    eprintln!("warn gateway uptime vm query failed: {err}");
+                    log::warn!("gateway uptime vm query failed: {err}");
                     None
                 }
             }
@@ -326,7 +386,7 @@ pub async fn admin_get_gateway_history(
     headers: HeaderMap,
     client: PeerConnectInfo,
     Path(gateway_id): Path<String>,
-    Query(params): Query<GatewayHistoryQueryParams>,
+    ApiQuery(params): ApiQuery<GatewayHistoryQueryParams>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
@@ -334,11 +394,11 @@ pub async fn admin_get_gateway_history(
     }
     let window = params.window.as_deref().unwrap_or("1h");
     let Some((window_seconds, step_seconds)) = history_window_config(window) else {
-        return (
-            StatusCode::BAD_REQUEST,
+        return super::error::ApiError::bad_request(
+            super::codes::INVALID_WINDOW,
             "window must be one of: 1h, 6h, 24h",
         )
-            .into_response();
+        .into_response();
     };
     let now = chrono::Utc::now().timestamp();
     let end = now - now.rem_euclid(step_seconds);
@@ -356,7 +416,7 @@ pub async fn admin_get_gateway_history(
         {
             Ok(samples) => samples,
             Err(err) => {
-                eprintln!("warn gateway history vm query failed: {err}");
+                log::warn!("gateway history vm query failed: {err}");
                 Vec::new()
             }
         },
@@ -377,7 +437,7 @@ pub async fn admin_get_agent_history(
     headers: HeaderMap,
     client: PeerConnectInfo,
     Path((gateway_id, agent_id)): Path<(String, String)>,
-    Query(params): Query<GatewayHistoryQueryParams>,
+    ApiQuery(params): ApiQuery<GatewayHistoryQueryParams>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
@@ -385,11 +445,11 @@ pub async fn admin_get_agent_history(
     }
     let window = params.window.as_deref().unwrap_or("1h");
     let Some((window_seconds, step_seconds)) = history_window_config(window) else {
-        return (
-            StatusCode::BAD_REQUEST,
+        return super::error::ApiError::bad_request(
+            super::codes::INVALID_WINDOW,
             "window must be one of: 1h, 6h, 24h",
         )
-            .into_response();
+        .into_response();
     };
     let now = chrono::Utc::now().timestamp();
     let end = now - now.rem_euclid(step_seconds);
@@ -408,7 +468,7 @@ pub async fn admin_get_agent_history(
         {
             Ok(samples) => samples,
             Err(err) => {
-                eprintln!("warn agent history vm query failed: {err}");
+                log::warn!("agent history vm query failed: {err}");
                 Vec::new()
             }
         },
@@ -455,10 +515,14 @@ fn toml_basic_string_escape(value: &str) -> String {
 
 /// 对 URL fragment 值做百分号编码，确保任意凭证不会截断或改写初始化 URL。
 /// 实例列表：GET /api/v1/admin/gateways/instances（含生命周期状态）。
+///
+/// 默认**不带**已归档的实例（`?include_archived=true` 才带）—— 归档就是为了把死掉的网关从日常
+/// 视图里收起来；要看/恢复它们时再显式带上。
 pub async fn admin_list_gateway_instances(
     State(state): State<ApiState>,
     headers: HeaderMap,
     client: PeerConnectInfo,
+    ApiQuery(query): ApiQuery<IncludeArchivedQuery>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
@@ -467,34 +531,101 @@ pub async fn admin_list_gateway_instances(
     let gateways = match state.store.list_gateways().await {
         Ok(gateways) => gateways,
         Err(err) => {
-            return (
+            return super::error::internal_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load gateway instances: {err}"),
-            )
-                .into_response();
+                super::codes::GATEWAY_INSTANCES_LOAD_FAILED,
+                "failed to load gateway instances",
+                err.display_chain(),
+            );
         }
     };
     let instances: Vec<AdminGatewayInstanceView> = gateways
         .into_iter()
-        .map(|gateway| {
-            let init_url = format!(
-                "{}/api/v1/gateway/link-upstream?gateway_id={}",
-                state.config.public_url.trim_end_matches('/'),
-                gateway.gateway_id
-            );
-            AdminGatewayInstanceView {
-                gateway_id: gateway.gateway_id,
-                instance_id: gateway.instance_id,
-                lifecycle_state: gateway
-                    .lifecycle_state
-                    .unwrap_or(GatewayInstanceLifecycleState::Provisioned),
-                created_at: gateway.created_at.unwrap_or_else(DateTime::now),
-                initialized_at: gateway.initialized_at,
-                init_url,
-            }
-        })
+        .filter(|gateway| query.include_archived || gateway.archived_at.is_none())
+        .map(|gateway| gateway_instance_view(&state, gateway))
         .collect();
     Json(instances).into_response()
+}
+
+/// 归档 / 取消归档一台网关：`POST /api/v1/admin/gateways/{gateway_id}/archive`。
+///
+/// 归档是**标记**（`archived_at`）：默认视图不再显示这台网关，状态、历史、生命周期记录全留；
+/// `{"archived": false}` 随时恢复。**只允许归档离线网关** —— 在线的不该被藏起来（要停就先在网关上
+/// 停掉）；网关重新上线（换证注册，或重新上报 online）时归档会自动清空（见 `infra::store`）。
+pub async fn admin_set_gateway_archived(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    client: PeerConnectInfo,
+    Path(gateway_id): Path<String>,
+    ApiJson(request): ApiJson<SetGatewayArchivedRequest>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    let gateway_id = gateway_id.trim().to_string();
+    let stored = match state.store.get_gateway(&gateway_id).await {
+        Ok(Some(stored)) => stored,
+        Ok(None) => {
+            return super::error::ApiError::not_found(
+                super::codes::GATEWAY_NOT_FOUND,
+                format!("unknown gateway {gateway_id}"),
+            )
+            .into_response();
+        }
+        Err(err) => {
+            return super::error::internal_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                super::codes::GATEWAY_LOAD_FAILED,
+                "failed to load gateway",
+                err.display_chain(),
+            );
+        }
+    };
+    if request.archived && gateway_is_online(&stored) {
+        return super::error::ApiError::conflict(
+            super::codes::GATEWAY_ONLINE_CANNOT_ARCHIVE,
+            format!("gateway {gateway_id} is online; only an offline gateway can be archived"),
+        )
+        .into_response();
+    }
+    // 取消归档时清成 `None`；归档时落当下时刻（重复点归档不刷新时刻：幂等，便于审计「什么时候收的」）。
+    let archived_at = if request.archived {
+        stored.archived_at.clone().or_else(|| Some(DateTime::now()))
+    } else {
+        None
+    };
+    match state
+        .store
+        .set_gateway_archived(&gateway_id, archived_at.clone())
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            return super::error::ApiError::not_found(
+                super::codes::GATEWAY_NOT_FOUND,
+                format!("unknown gateway {gateway_id}"),
+            )
+            .into_response();
+        }
+        Err(err) => {
+            return super::error::internal_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                super::codes::GATEWAY_ARCHIVE_FAILED,
+                "failed to archive gateway",
+                err.display_chain(),
+            );
+        }
+    }
+    // 回执带上这台实例的最新视图（页面据此就地显示「已归档 / 取消归档」）。
+    match state.store.get_gateway(&gateway_id).await {
+        Ok(Some(stored)) => Json(gateway_instance_view(&state, stored)).into_response(),
+        _ => Json(serde_json::json!({
+            "gateway_id": gateway_id,
+            "archived_at": archived_at,
+        }))
+        .into_response(),
+    }
 }
 
 /// 版本发布请求体：**来源**（本机绝对路径 或 https URL；中心读进本地/对象存储镜像）。
@@ -525,7 +656,7 @@ pub async fn admin_publish_release(
     headers: HeaderMap,
     client: PeerConnectInfo,
     Path(component): Path<String>,
-    Json(request): Json<PublishReleaseRequest>,
+    ApiJson(request): ApiJson<PublishReleaseRequest>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
@@ -534,22 +665,22 @@ pub async fn admin_publish_release(
     // 组件名要拼进制品目录（`{artifact_dir}/{component}/{version}/{filename}`）与下发 URL：
     // 必须是**真的只有一段**，否则 `..` / 绝对路径会逃出制品目录。
     if !crate::infra::is_safe_path_segment(&component) {
-        return (
-            StatusCode::BAD_REQUEST,
+        return super::error::ApiError::bad_request(
+            super::codes::INVALID_COMPONENT,
             "component must be a single safe path segment",
         )
-            .into_response();
+        .into_response();
     }
     let expected_sha256 = request.expected_sha256.trim();
     if request.artifact_url.trim().is_empty()
         || request.requested_by.trim().is_empty()
         || expected_sha256.is_empty()
     {
-        return (
-            StatusCode::BAD_REQUEST,
+        return super::error::ApiError::bad_request(
+            super::codes::ARTIFACT_FIELDS_REQUIRED,
             "artifact_url, expected_sha256 and requested_by must not be empty",
         )
-            .into_response();
+        .into_response();
     }
     // 读来源（本机绝对路径 / https URL）+ **必须**核对期望摘要（不符即 502，不落记录）。
     let (bytes, package_sha256) =
@@ -558,11 +689,12 @@ pub async fn admin_publish_release(
         {
             Ok(verified) => verified,
             Err(err) => {
-                return (
+                return super::error::internal_response(
                     StatusCode::BAD_GATEWAY,
-                    format!("failed to fetch artifact: {err}"),
-                )
-                    .into_response();
+                    super::codes::ARTIFACT_FETCH_FAILED,
+                    "failed to fetch artifact",
+                    err,
+                );
             }
         };
     // 从包里读身份：包内目录名，读不出再回落来源文件名。
@@ -585,32 +717,29 @@ pub async fn admin_publish_release(
                 && crate::infra::normalize_version(declared)
                     != crate::infra::normalize_version(&package_version)
             {
-                return (
-                    StatusCode::BAD_REQUEST,
+                return super::error::ApiError::bad_request(
+                    super::codes::VERSION_MISMATCH,
                     format!(
                         "version mismatch: request declares {declared} but the package self-reports {package_version}"
                     ),
                 )
-                    .into_response();
+                .into_response();
             }
             declared.to_string()
         }
         None if !package_version.is_empty() => package_version,
         None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                "cannot derive version from the package: use an artifact whose name carries a version, or pass `version` explicitly",
-            )
+            return super::error::ApiError::bad_request(super::codes::VERSION_UNDERIVABLE, "cannot derive version from the package: use an artifact whose name carries a version, or pass `version` explicitly")
                 .into_response();
         }
     };
     // 版本号会拼进制品目录 —— 手输的那份也要过同一道关。
     if !crate::infra::is_safe_path_segment(&version) {
-        return (
-            StatusCode::BAD_REQUEST,
+        return super::error::ApiError::bad_request(
+            super::codes::INVALID_VERSION,
             "version must be a single safe path segment",
         )
-            .into_response();
+        .into_response();
     }
     let platform = (!package_arch.is_empty()).then_some(package_arch.as_str());
     match record_verified_release(
@@ -626,11 +755,12 @@ pub async fn admin_publish_release(
     {
         Ok(_record) => match load_package(&state, &component, &version).await {
             Ok(Some(package)) => Json(package).into_response(),
-            Ok(None) => (
+            Ok(None) => super::error::ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
+                super::codes::RELEASE_NOT_FOUND_AFTER_WRITE,
                 "release recorded but not found",
             )
-                .into_response(),
+            .into_response(),
             Err(response) => response,
         },
         Err(response) => response,
@@ -648,19 +778,25 @@ async fn load_package(
         Ok(records) => Ok(crate::infra::group_release_packages(component, records)
             .into_iter()
             .find(|package| package.package.version == version)),
-        Err(err) => Err((
+        Err(err) => Err(super::error::internal_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to load releases: {err}"),
-        )
-            .into_response()),
+            super::codes::RELEASE_LIST_FAILED,
+            "failed to load releases",
+            err.display_chain(),
+        )),
     }
 }
 
 /// 多平台组件一次录入的**必需平台集**（一次必须齐备）。`None` = 不受限（单制品组件）。
 fn required_platforms(component: &str) -> Option<&'static [&'static str]> {
     match component {
-        // Gops / Gx：一次录入必须覆盖三平台（macOS-ARM + Linux x86_64 / ARM64 的 musl 静态版）。
-        "galaxy-ops" | "galaxy-flow" => Some(&[
+        // Agentd / Gops / Gx / gwlinkd：一次录入必须覆盖三平台
+        // （macOS-ARM + Linux x86_64 / ARM64 的 musl 静态版）。
+        // agentd 与网关侧（`wist-gateway` `install_package.rs` 的 `PLATFORM_*`）是**同一份发布矩阵**：
+        // 网关按平台分别托管 agent 安装包，少一个平台就有主机装不上。
+        // gwlinkd 是**宿主侧**常驻（容器外），按宿主平台取件，同样三平台。
+        // gateway-stack 是单制品包，不受限。
+        "wist-agentd" | "galaxy-ops" | "galaxy-flow" | "wist-gwlinkd" => Some(&[
             "aarch64-apple-darwin",
             "x86_64-unknown-linux-musl",
             "aarch64-unknown-linux-musl",
@@ -712,11 +848,12 @@ async fn record_verified_release(
         .store(component, version, &filename, bytes)
         .await
         .map_err(|err| {
-            (
+            super::error::internal_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to store artifact: {err}"),
+                super::codes::ARTIFACT_STORE_FAILED,
+                "failed to store artifact",
+                err,
             )
-                .into_response()
         })?;
     state
         .store
@@ -729,11 +866,12 @@ async fn record_verified_release(
         )
         .await
         .map_err(|err| {
-            (
+            super::error::internal_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to record release: {err}"),
+                super::codes::RELEASE_PUBLISH_FAILED,
+                "failed to record release",
+                err.display_chain(),
             )
-                .into_response()
         })
 }
 
@@ -754,32 +892,40 @@ pub struct BatchArtifact {
 
 /// 批量录入某组件的多平台制品：POST /api/v1/admin/releases/:component/batch。
 ///
-/// 一次请求覆盖**同一版本**的多个平台（galaxy-ops / galaxy-flow 必须 macOS-ARM / Linux-ARM /
-/// Linux-X86 三平台齐备）。所有制品先**下载 + 校验摘要 + 解析身份**，任一不合格即整体拒绝
-/// （**不落任何记录**）；全部通过后再逐个镜像落库。
+/// 一次请求覆盖**同一版本**的多个平台（wist-agentd / galaxy-ops / galaxy-flow 必须
+/// macOS-ARM / Linux-ARM / Linux-X86 三平台齐备）。所有制品先**下载 + 校验摘要 + 解析身份**，
+/// 任一不合格即整体拒绝（**不落任何记录**）；全部通过后再逐个镜像落库。
 pub async fn admin_publish_release_batch(
     State(state): State<ApiState>,
     headers: HeaderMap,
     client: PeerConnectInfo,
     Path(component): Path<String>,
-    Json(request): Json<BatchPublishReleaseRequest>,
+    ApiJson(request): ApiJson<BatchPublishReleaseRequest>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
         return response;
     }
     if !crate::infra::is_safe_path_segment(&component) {
-        return (
-            StatusCode::BAD_REQUEST,
+        return super::error::ApiError::bad_request(
+            super::codes::INVALID_COMPONENT,
             "component must be a single safe path segment",
         )
-            .into_response();
+        .into_response();
     }
     if request.requested_by.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, "requested_by must not be empty").into_response();
+        return super::error::ApiError::bad_request(
+            super::codes::REQUESTED_BY_REQUIRED,
+            "requested_by must not be empty",
+        )
+        .into_response();
     }
     if request.artifacts.is_empty() {
-        return (StatusCode::BAD_REQUEST, "artifacts must not be empty").into_response();
+        return super::error::ApiError::bad_request(
+            super::codes::ARTIFACTS_REQUIRED,
+            "artifacts must not be empty",
+        )
+        .into_response();
     }
 
     // 单个制品的校验结果（下载 / 摘要 / 身份都在此步完成）。
@@ -797,54 +943,52 @@ pub async fn admin_publish_release_batch(
     for artifact in &request.artifacts {
         let expected = artifact.expected_sha256.trim();
         if artifact.artifact_url.trim().is_empty() || expected.is_empty() {
-            return (
-                StatusCode::BAD_REQUEST,
+            return super::error::ApiError::bad_request(
+                super::codes::ARTIFACT_URL_AND_SHA256_REQUIRED,
                 "artifact_url and expected_sha256 must not be empty",
             )
-                .into_response();
+            .into_response();
         }
         let (bytes, package_sha256) =
             match crate::infra::read_verified_package(&artifact.artifact_url, Some(expected)).await
             {
                 Ok(verified) => verified,
                 Err(err) => {
-                    return (
+                    return super::error::internal_response(
                         StatusCode::BAD_GATEWAY,
-                        format!(
-                            "failed to fetch artifact `{}`: {err}",
-                            artifact.artifact_url
-                        ),
-                    )
-                        .into_response();
+                        super::codes::ARTIFACT_FETCH_FAILED,
+                        "failed to fetch artifact",
+                        err,
+                    );
                 }
             };
         let (version, arch) = crate::infra::read_package_identity(&artifact.artifact_url, &bytes);
         if version.is_empty() {
-            return (
-                StatusCode::BAD_REQUEST,
+            return super::error::ApiError::bad_request(
+                super::codes::VERSION_UNDERIVABLE,
                 format!(
                     "cannot derive version from `{}`: use an artifact whose name carries a version",
                     artifact.artifact_url
                 ),
             )
-                .into_response();
+            .into_response();
         }
         if !crate::infra::is_safe_path_segment(&version) {
-            return (
-                StatusCode::BAD_REQUEST,
+            return super::error::ApiError::bad_request(
+                super::codes::INVALID_VERSION,
                 "version must be a single safe path segment",
             )
-                .into_response();
+            .into_response();
         }
         if arch.is_empty() {
-            return (
-                StatusCode::BAD_REQUEST,
+            return super::error::ApiError::bad_request(
+                super::codes::PLATFORM_UNDERIVABLE,
                 format!(
                     "cannot derive platform (target-triple) from `{}`",
                     artifact.artifact_url
                 ),
             )
-                .into_response();
+            .into_response();
         }
         prepared.push(Prepared {
             version,
@@ -858,11 +1002,11 @@ pub async fn admin_publish_release_batch(
     // 版本必须一致。
     let version = prepared[0].version.clone();
     if prepared.iter().any(|item| item.version != version) {
-        return (
-            StatusCode::BAD_REQUEST,
+        return super::error::ApiError::bad_request(
+            super::codes::ARTIFACTS_VERSION_MISMATCH,
             "all artifacts must share the same version",
         )
-            .into_response();
+        .into_response();
     }
     // 平台：不得重复；多平台组件必须**覆盖**必需平台集。
     let package = crate::infra::ReleasePackage::new(
@@ -878,11 +1022,11 @@ pub async fn admin_publish_release_batch(
     );
     let required = required_platforms(&component).unwrap_or(&[]);
     if let Err(err) = crate::infra::validate_platforms(&package, required) {
-        return (
-            StatusCode::BAD_REQUEST,
+        return super::error::ApiError::bad_request(
+            super::codes::ARTIFACT_INVALID,
             format!("component `{component}`: {err}"),
         )
-            .into_response();
+        .into_response();
     }
 
     // 第二阶段：逐个镜像落库（此时全部制品已校验通过）。
@@ -908,11 +1052,12 @@ pub async fn admin_publish_release_batch(
     // 返回归组后的「安装包」。
     match load_package(&state, &component, &version).await {
         Ok(Some(package)) => Json(package).into_response(),
-        Ok(None) => (
+        Ok(None) => super::error::ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
+            super::codes::RELEASE_NOT_FOUND_AFTER_WRITE,
             "release recorded but not found",
         )
-            .into_response(),
+        .into_response(),
         Err(response) => response,
     }
 }
@@ -929,7 +1074,7 @@ pub async fn admin_resolve_github_release(
     State(state): State<ApiState>,
     headers: HeaderMap,
     client: PeerConnectInfo,
-    Json(request): Json<ResolveGitHubReleaseRequest>,
+    ApiJson(request): ApiJson<ResolveGitHubReleaseRequest>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
@@ -937,7 +1082,11 @@ pub async fn admin_resolve_github_release(
     }
     let release_url = request.release_url.trim();
     if release_url.is_empty() {
-        return (StatusCode::BAD_REQUEST, "release_url must not be empty").into_response();
+        return super::error::ApiError::bad_request(
+            super::codes::RELEASE_URL_REQUIRED,
+            "release_url must not be empty",
+        )
+        .into_response();
     }
     // 可选 token：私有仓 / 提高匿名限流。优先专用名，其次通用名。
     let token = std::env::var("WIST_CENTER_GITHUB_TOKEN")
@@ -945,11 +1094,12 @@ pub async fn admin_resolve_github_release(
         .or_else(|| std::env::var("GITHUB_TOKEN").ok());
     match crate::infra::resolve_github_release(release_url, token.as_deref()).await {
         Ok(resolved) => Json(resolved).into_response(),
-        Err(err) => (
+        Err(err) => super::error::internal_response(
             StatusCode::BAD_GATEWAY,
-            format!("failed to resolve release: {err}"),
-        )
-            .into_response(),
+            super::codes::RELEASE_RESOLVE_FAILED,
+            "failed to resolve release",
+            err,
+        ),
     }
 }
 
@@ -966,20 +1116,21 @@ pub async fn admin_list_releases(
     }
     // 与发布侧同一套口径：写不进去的组件名（不是单一段），也不该能被查到。
     if !crate::infra::is_safe_path_segment(&component) {
-        return (
-            StatusCode::BAD_REQUEST,
+        return super::error::ApiError::bad_request(
+            super::codes::INVALID_COMPONENT,
             "component must be a single safe path segment",
         )
-            .into_response();
+        .into_response();
     }
     let releases = match state.store.list_releases(&component).await {
         Ok(releases) => releases,
         Err(err) => {
-            return (
+            return super::error::internal_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load releases: {err}"),
-            )
-                .into_response();
+                super::codes::RELEASE_LIST_FAILED,
+                "failed to load releases",
+                err.display_chain(),
+            );
         }
     };
     Json(crate::infra::group_release_packages(&component, releases)).into_response()
@@ -998,7 +1149,7 @@ pub async fn admin_set_release_status(
     headers: HeaderMap,
     client: PeerConnectInfo,
     Path((component, version)): Path<(String, String)>,
-    Json(request): Json<SetReleaseStatusRequest>,
+    ApiJson(request): ApiJson<SetReleaseStatusRequest>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
@@ -1006,36 +1157,44 @@ pub async fn admin_set_release_status(
     }
     // 与发布 / 查询同口径：组件名必须是单一段。版本号同样要进 where 条件，顺手挡掉异常值。
     if !crate::infra::is_safe_path_segment(&component) {
-        return (
-            StatusCode::BAD_REQUEST,
+        return super::error::ApiError::bad_request(
+            super::codes::INVALID_COMPONENT,
             "component must be a single safe path segment",
         )
-            .into_response();
+        .into_response();
     }
     let status = request.status.trim();
     if status != "published" && status != "expired" {
-        return (
-            StatusCode::BAD_REQUEST,
+        return super::error::ApiError::bad_request(
+            super::codes::INVALID_RELEASE_STATUS,
             "status must be `published` or `expired`",
         )
-            .into_response();
+        .into_response();
     }
     match state
         .store
         .set_release_status(&component, &version, status)
         .await
     {
-        Ok(0) => (StatusCode::NOT_FOUND, "release not found").into_response(),
+        Ok(0) => {
+            super::error::ApiError::not_found(super::codes::RELEASE_NOT_FOUND, "release not found")
+                .into_response()
+        }
         Ok(_) => match load_package(&state, &component, &version).await {
             Ok(Some(package)) => Json(package).into_response(),
-            Ok(None) => (StatusCode::NOT_FOUND, "release not found").into_response(),
+            Ok(None) => super::error::ApiError::not_found(
+                super::codes::RELEASE_NOT_FOUND,
+                "release not found",
+            )
+            .into_response(),
             Err(response) => response,
         },
-        Err(err) => (
+        Err(err) => super::error::internal_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to update release status: {err}"),
-        )
-            .into_response(),
+            super::codes::RELEASE_STATUS_UPDATE_FAILED,
+            "failed to update release status",
+            err.display_chain(),
+        ),
     }
 }
 
@@ -1052,7 +1211,7 @@ pub async fn admin_bind_gateway_customer(
     State(state): State<ApiState>,
     headers: HeaderMap,
     client: PeerConnectInfo,
-    Json(request): Json<BindGatewayCustomerRequest>,
+    ApiJson(request): ApiJson<BindGatewayCustomerRequest>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
@@ -1062,11 +1221,11 @@ pub async fn admin_bind_gateway_customer(
         || request.customer_id.trim().is_empty()
         || request.requested_by.trim().is_empty()
     {
-        return (
-            StatusCode::BAD_REQUEST,
+        return super::error::ApiError::bad_request(
+            super::codes::GATEWAY_ID_CUSTOMER_ID_REQUESTED_BY_REQUIRED,
             "gateway_id, customer_id and requested_by must not be empty",
         )
-            .into_response();
+        .into_response();
     }
     let binding = match state
         .store
@@ -1075,11 +1234,12 @@ pub async fn admin_bind_gateway_customer(
     {
         Ok(binding) => binding,
         Err(err) => {
-            return (
+            return super::error::internal_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to bind gateway customer: {err}"),
-            )
-                .into_response();
+                super::codes::GATEWAY_BIND_FAILED,
+                "failed to bind gateway customer",
+                err.display_chain(),
+            );
         }
     };
     Json(GatewayCustomerBinding {
@@ -1115,13 +1275,14 @@ pub async fn admin_get_gateway_initial_config(
     let trust_bundle = build_control_center_trust_bundle(&state.config, &gateway_id);
     // 安全 #1（fail-closed）：TLS 开启但未配置信任根 → 拒绝服务。
     if server_tls_required && trust_bundle.is_none() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
+        return super::error::ApiError::unavailable(
+            super::codes::TLS_TRUST_ROOT_MISSING,
             "TLS is required but the control center trust root is not configured",
         )
-            .into_response();
+        .into_response();
     }
-    Json(GatewayInitialConfig {
+    // 配置类响应（信任包 / 端点）→ `no-store`。
+    super::error::json_no_store(GatewayInitialConfig {
         gateway_id: gateway_id.clone(),
         control_center_endpoint: state.config.public_url.clone(),
         trust_bundle,
@@ -1129,7 +1290,6 @@ pub async fn admin_get_gateway_initial_config(
         protocol_version: state.config.protocol_version.clone(),
         enrollment_token_id,
     })
-    .into_response()
 }
 
 /// 创建灰度发布计划：`POST /api/v1/admin/rollout-plans`（模型 `AdminCreateUpgradePlan`）。
@@ -1140,16 +1300,16 @@ pub async fn admin_create_upgrade_plan(
     State(state): State<ApiState>,
     headers: HeaderMap,
     client: PeerConnectInfo,
-    Json(request): Json<rollout::CreateRolloutPlanRequest>,
+    ApiJson(request): ApiJson<rollout::CreateRolloutPlanRequest>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
         return response;
     }
-    // 阶段切分：服务端权威。目标为空 / 阶段数为 0 / 阶段数大于台数都在这里被拒。
+    // 阶段切分：服务端权威。目标为空 / 阶段数为 0 / 阶段数大于台数都在这里被拒（具体 error 自带 code）。
     let record = match rollout::build_plan(&request) {
         Ok(record) => record,
-        Err(reason) => return (StatusCode::BAD_REQUEST, reason).into_response(),
+        Err(error) => return error.into_response(),
     };
     // 目标存在性校验：与网关同款 —— 物化到不存在的网关只会静默落库、永不命中。
     let known = match state.store.list_gateways().await {
@@ -1158,11 +1318,12 @@ pub async fn admin_create_upgrade_plan(
             .map(|gateway| gateway.gateway_id)
             .collect::<std::collections::HashSet<_>>(),
         Err(err) => {
-            return (
+            return super::error::internal_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to list gateways: {err}"),
-            )
-                .into_response();
+                super::codes::GATEWAY_LIST_FAILED,
+                "failed to list gateways",
+                err.display_chain(),
+            );
         }
     };
     let unknown: Vec<&str> = record
@@ -1172,19 +1333,20 @@ pub async fn admin_create_upgrade_plan(
         .filter(|gateway_id| !known.contains(*gateway_id))
         .collect();
     if !unknown.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
+        return super::error::ApiError::bad_request(
+            super::codes::UNKNOWN_TARGETS,
             format!("unknown target(s): {}", unknown.join(", ")),
         )
-            .into_response();
+        .into_response();
     }
     match state.store.create_upgrade_plan(&record).await {
         Ok(plan) => (StatusCode::CREATED, Json(rollout::plan_view(&plan))).into_response(),
-        Err(err) => (
+        Err(err) => super::error::internal_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to create rollout plan: {err}"),
-        )
-            .into_response(),
+            super::codes::ROLLOUT_CREATE_FAILED,
+            "failed to create rollout plan",
+            err.display_chain(),
+        ),
     }
 }
 
@@ -1200,11 +1362,12 @@ pub async fn admin_list_upgrade_plans(
     }
     match state.store.list_upgrade_plans().await {
         Ok(plans) => Json(plans.iter().map(rollout::plan_view).collect::<Vec<_>>()).into_response(),
-        Err(err) => (
+        Err(err) => super::error::internal_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to load rollout plans: {err}"),
-        )
-            .into_response(),
+            super::codes::ROLLOUT_PLANS_LOAD_FAILED,
+            "failed to load rollout plans",
+            err.display_chain(),
+        ),
     }
 }
 
@@ -1214,7 +1377,7 @@ pub async fn admin_approve_upgrade_plan(
     State(state): State<ApiState>,
     headers: HeaderMap,
     client: PeerConnectInfo,
-    Json(request): Json<rollout::PlanRefRequest>,
+    ApiJson(request): ApiJson<rollout::PlanRefRequest>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
@@ -1224,44 +1387,46 @@ pub async fn admin_approve_upgrade_plan(
     let Some(mut plan) = (match state.store.get_upgrade_plan(&plan_id).await {
         Ok(value) => value,
         Err(err) => {
-            return (
+            return super::error::internal_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load rollout plan: {err}"),
-            )
-                .into_response();
+                super::codes::ROLLOUT_PLAN_LOAD_FAILED,
+                "failed to load rollout plan",
+                err.display_chain(),
+            );
         }
     }) else {
-        return (
-            StatusCode::NOT_FOUND,
+        return super::error::ApiError::not_found(
+            super::codes::ROLLOUT_PLAN_NOT_FOUND,
             format!("unknown rollout plan {plan_id}"),
         )
-            .into_response();
+        .into_response();
     };
     if plan.status != "draft" {
-        return (
-            StatusCode::CONFLICT,
+        return super::error::ApiError::conflict(
+            super::codes::PLAN_NOT_APPROVABLE,
             format!(
                 "rollout plan {plan_id} is {}, only draft can be approved",
                 plan.status
             ),
         )
-            .into_response();
+        .into_response();
     }
     if !rollout::approve_plan(&mut plan) {
-        return (
-            StatusCode::CONFLICT,
+        return super::error::ApiError::conflict(
+            super::codes::PLAN_NO_PHASE,
             format!("rollout plan {plan_id} has no phase"),
         )
-            .into_response();
+        .into_response();
     }
     plan.approved_by = Some("admin".to_string());
     plan.approved_at = Some(DateTime::now());
     if let Err(err) = state.store.save_upgrade_plan(&plan).await {
-        return (
+        return super::error::internal_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to store rollout plan: {err}"),
-        )
-            .into_response();
+            super::codes::ROLLOUT_PLAN_STORE_FAILED,
+            "failed to store rollout plan",
+            err.display_chain(),
+        );
     }
     Json(rollout::plan_view(&plan)).into_response()
 }
@@ -1271,7 +1436,7 @@ pub async fn admin_advance_upgrade_plan(
     State(state): State<ApiState>,
     headers: HeaderMap,
     client: PeerConnectInfo,
-    Json(request): Json<rollout::PlanRefRequest>,
+    ApiJson(request): ApiJson<rollout::PlanRefRequest>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
@@ -1281,36 +1446,154 @@ pub async fn admin_advance_upgrade_plan(
     let Some(mut plan) = (match state.store.get_upgrade_plan(&plan_id).await {
         Ok(value) => value,
         Err(err) => {
-            return (
+            return super::error::internal_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load rollout plan: {err}"),
-            )
-                .into_response();
+                super::codes::ROLLOUT_PLAN_LOAD_FAILED,
+                "failed to load rollout plan",
+                err.display_chain(),
+            );
         }
     }) else {
-        return (
-            StatusCode::NOT_FOUND,
+        return super::error::ApiError::not_found(
+            super::codes::ROLLOUT_PLAN_NOT_FOUND,
             format!("unknown rollout plan {plan_id}"),
         )
-            .into_response();
+        .into_response();
     };
     // 人工闸门：当前阶段须**已全部了结**（金丝雀确认无问题再推下一批）；与网关同一口径。
     if let Some(reason) = rollout::advance_gate_blocker(&plan) {
-        return (
-            StatusCode::CONFLICT,
+        return super::error::ApiError::conflict(
+            super::codes::PLAN_NOT_ADVANCABLE,
             format!("cannot advance rollout plan {plan_id}: {reason}"),
         )
-            .into_response();
+        .into_response();
     }
     rollout::advance_plan(&mut plan);
     if let Err(err) = state.store.save_upgrade_plan(&plan).await {
-        return (
+        return super::error::internal_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to store rollout plan: {err}"),
-        )
-            .into_response();
+            super::codes::ROLLOUT_PLAN_STORE_FAILED,
+            "failed to store rollout plan",
+            err.display_chain(),
+        );
     }
     Json(rollout::plan_view(&plan)).into_response()
+}
+
+/// 重派失败目标：`POST /api/v1/admin/rollout-plans/retry`（模型 `AdminRetryUpgradePlan`）。
+///
+/// body `{ plan_id, target_ids?: [...] }`；`target_ids` 省略 / 为空 = 该计划里**所有**失败目标。
+/// 落地方式是**新建一份补跑计划**（新 `plan_id`、单阶段、直接放行），理由见
+/// [`rollout::build_retry_plan`]：网关按 `plan_id` 去重（落盘游标 `last_plan_id`），
+/// 同一份计划改状态是假重试。原计划原样留作历史。
+///
+/// **只受理 `failed`（已终结且失败）的计划**：滚动中的计划若已被网关驱过，重派后它仍可能被网关
+/// 回头再驱一次 —— 滚动态请先用「推进」把当前阶段了结（失败也算了结），到终态再重试。
+pub async fn admin_retry_upgrade_plan(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    client: PeerConnectInfo,
+    ApiJson(request): ApiJson<rollout::RetryRolloutPlanRequest>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    let plan_id = request.plan_id.trim().to_string();
+    let Some(plan) = (match state.store.get_upgrade_plan(&plan_id).await {
+        Ok(value) => value,
+        Err(err) => {
+            return super::error::internal_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                super::codes::ROLLOUT_PLAN_LOAD_FAILED,
+                "failed to load rollout plan",
+                err.display_chain(),
+            );
+        }
+    }) else {
+        return super::error::ApiError::not_found(
+            super::codes::ROLLOUT_PLAN_NOT_FOUND,
+            format!("unknown rollout plan {plan_id}"),
+        )
+        .into_response();
+    };
+    if plan.status != "failed" {
+        return super::error::ApiError::conflict(
+            super::codes::PLAN_NOT_RETRYABLE,
+            format!(
+                "rollout plan {plan_id} is {}, only a failed plan can be retried（滚动态先「推进」把当前阶段了结）",
+                plan.status
+            ),
+        )
+        .into_response();
+    }
+    let requested: Option<std::collections::HashSet<String>> = {
+        let set: std::collections::HashSet<String> = request
+            .target_ids
+            .iter()
+            .map(|target| target.trim().to_string())
+            .filter(|target| !target.is_empty())
+            .collect();
+        (!set.is_empty()).then_some(set)
+    };
+    let failed: Vec<String> = plan
+        .entries
+        .iter()
+        .filter(|entry| entry.status == "failed")
+        .map(|entry| entry.gateway_id.clone())
+        .filter(|gateway_id| {
+            requested
+                .as_ref()
+                .is_none_or(|set| set.contains(gateway_id))
+        })
+        .collect();
+    if failed.is_empty() {
+        return super::error::ApiError::bad_request(
+            super::codes::NO_FAILED_TARGETS,
+            format!("rollout plan {plan_id} has no failed target to retry"),
+        )
+        .into_response();
+    }
+    // 目标存在性校验：与建计划同款 —— 物化到不存在的网关只会永不命中，把补跑计划挂在滚动里等不到了结。
+    let known = match state.store.list_gateways().await {
+        Ok(gateways) => gateways
+            .into_iter()
+            .map(|gateway| gateway.gateway_id)
+            .collect::<std::collections::HashSet<_>>(),
+        Err(err) => {
+            return super::error::internal_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                super::codes::GATEWAY_LIST_FAILED,
+                "failed to list gateways",
+                err.display_chain(),
+            );
+        }
+    };
+    let unknown: Vec<&str> = failed
+        .iter()
+        .map(String::as_str)
+        .filter(|gateway_id| !known.contains(*gateway_id))
+        .collect();
+    if !unknown.is_empty() {
+        return super::error::ApiError::bad_request(
+            super::codes::UNKNOWN_TARGETS,
+            format!("unknown target(s): {}", unknown.join(", ")),
+        )
+        .into_response();
+    }
+    let retry = match rollout::build_retry_plan(&plan, &failed) {
+        Ok(retry) => retry,
+        Err(error) => return error.into_response(),
+    };
+    match state.store.create_upgrade_plan(&retry).await {
+        Ok(plan) => (StatusCode::CREATED, Json(rollout::plan_view(&plan))).into_response(),
+        Err(err) => super::error::internal_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            super::codes::ROLLOUT_RETRY_CREATE_FAILED,
+            "failed to create retry rollout plan",
+            err.display_chain(),
+        ),
+    }
 }
 
 /// 查看某份计划及其逐目标进度：`GET /api/v1/admin/rollout-plans/{plan_id}`（模型 `AdminViewUpgradePlan`）。
@@ -1327,16 +1610,17 @@ pub async fn admin_view_upgrade_plan(
     let plan_id = plan_id.trim().to_string();
     match state.store.get_upgrade_plan(&plan_id).await {
         Ok(Some(plan)) => Json(rollout::detail_view(&plan)).into_response(),
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
+        Ok(None) => super::error::ApiError::not_found(
+            super::codes::ROLLOUT_PLAN_NOT_FOUND,
             format!("unknown rollout plan {plan_id}"),
         )
-            .into_response(),
-        Err(err) => (
+        .into_response(),
+        Err(err) => super::error::internal_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to load rollout plan: {err}"),
-        )
-            .into_response(),
+            super::codes::ROLLOUT_PLAN_LOAD_FAILED,
+            "failed to load rollout plan",
+            err.display_chain(),
+        ),
     }
 }
 
@@ -1354,11 +1638,12 @@ pub async fn admin_list_gateway_lifecycle(
     let events = match state.store.list_lifecycle_events(&gateway_id).await {
         Ok(events) => events,
         Err(err) => {
-            return (
+            return super::error::internal_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load gateway lifecycle: {err}"),
-            )
-                .into_response();
+                super::codes::GATEWAY_LIFECYCLE_LOAD_FAILED,
+                "failed to load gateway lifecycle",
+                err.display_chain(),
+            );
         }
     };
     Json(events).into_response()
@@ -1378,11 +1663,12 @@ pub async fn admin_list_gateway_agents(
     let agents = match state.store.list_agents_by_gateway(&gateway_id).await {
         Ok(agents) => agents,
         Err(err) => {
-            return (
+            return super::error::internal_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load gateway agents: {err}"),
-            )
-                .into_response();
+                super::codes::GATEWAY_AGENTS_LOAD_FAILED,
+                "failed to load gateway agents",
+                err.display_chain(),
+            );
         }
     };
     let views: Vec<AgentRuntimeStatus> = agents
@@ -1406,21 +1692,28 @@ pub async fn admin_view_gateway_list(
     State(state): State<ApiState>,
     headers: HeaderMap,
     client: PeerConnectInfo,
+    ApiQuery(query): ApiQuery<IncludeArchivedQuery>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
         return response;
     }
-    let gateways = match state.store.list_gateways().await {
+    let gateways: Vec<StoredGateway> = match state.store.list_gateways().await {
         Ok(gateways) => gateways,
         Err(err) => {
-            return (
+            return super::error::internal_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load gateway store: {err}"),
-            )
-                .into_response();
+                super::codes::GATEWAY_STORE_UNAVAILABLE,
+                "failed to load gateway store",
+                err.display_chain(),
+            );
         }
     };
+    // 计数与「默认视图可见的网关」同一口径：已归档的不计入（要看它们用 `include_archived=true`）。
+    let gateways: Vec<&StoredGateway> = gateways
+        .iter()
+        .filter(|stored| query.include_archived || stored.archived_at.is_none())
+        .collect();
     let (online_count, offline_count, degraded_count) = gateways.iter().fold(
         (0_i64, 0_i64, 0_i64),
         |(online, offline, degraded), stored| {
@@ -1450,6 +1743,7 @@ pub async fn admin_list_gateway_status(
     State(state): State<ApiState>,
     headers: HeaderMap,
     client: PeerConnectInfo,
+    ApiQuery(query): ApiQuery<IncludeArchivedQuery>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
@@ -1458,17 +1752,20 @@ pub async fn admin_list_gateway_status(
     let gateways = match state.store.list_gateways().await {
         Ok(gateways) => gateways,
         Err(err) => {
-            return (
+            return super::error::internal_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load gateway store: {err}"),
-            )
-                .into_response();
+                super::codes::GATEWAY_STORE_UNAVAILABLE,
+                "failed to load gateway store",
+                err.display_chain(),
+            );
         }
     };
     // 状态视图只展示「已上报过」的网关；从未上报的网关无状态可展示（聚合 gateway_count 仍计入）。
+    // 已归档的默认不展示（`?include_archived=true` 才带）—— 归档就是为了把它们从态势里收起来。
     let mut views: Vec<GatewayRuntimeStatus> = gateways
         .iter()
         .filter(|stored| stored.last_seen_at.is_some())
+        .filter(|stored| query.include_archived || stored.archived_at.is_none())
         .map(gateway_runtime_status)
         .collect();
     views.sort_by(|left, right| left.gateway_id.cmp(&right.gateway_id));
@@ -1488,27 +1785,28 @@ pub async fn admin_show_gateway_status(
     let stored = match state.store.get_gateway(&gateway_id).await {
         Ok(stored) => stored,
         Err(err) => {
-            return (
+            return super::error::internal_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load gateway store: {err}"),
-            )
-                .into_response();
+                super::codes::GATEWAY_STORE_UNAVAILABLE,
+                "failed to load gateway store",
+                err.display_chain(),
+            );
         }
     };
     let Some(stored) = stored else {
-        return (
-            StatusCode::NOT_FOUND,
+        return super::error::ApiError::not_found(
+            super::codes::GATEWAY_NOT_FOUND,
             format!("unknown gateway {gateway_id}"),
         )
-            .into_response();
+        .into_response();
     };
     if stored.last_seen_at.is_none() {
         // 已接入但从未上报：无状态可返回（与列表端点一致）。
-        return (
-            StatusCode::NOT_FOUND,
+        return super::error::ApiError::not_found(
+            super::codes::GATEWAY_NOT_REPORTED,
             format!("gateway {gateway_id} has not reported yet"),
         )
-            .into_response();
+        .into_response();
     }
     Json(AdminGatewayStatusReturned {
         status: gateway_runtime_status(&stored),
@@ -1584,7 +1882,7 @@ pub async fn admin_dispatch_global_policy(
     State(state): State<ApiState>,
     headers: HeaderMap,
     client: PeerConnectInfo,
-    Json(input): Json<AdminDispatchGlobalPolicy>,
+    ApiJson(input): ApiJson<AdminDispatchGlobalPolicy>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
@@ -1608,7 +1906,7 @@ pub async fn admin_dispatch_agent_fleet_command(
     State(state): State<ApiState>,
     headers: HeaderMap,
     client: PeerConnectInfo,
-    Json(input): Json<DispatchAgentFleetCommand>,
+    ApiJson(input): ApiJson<DispatchAgentFleetCommand>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
@@ -1706,6 +2004,7 @@ mod tests {
                 hmac_secret: "test-hmac-secret".to_string(),
                 credential_ttl_seconds: 3600,
                 link_ttl_seconds: 900,
+                log: Default::default(),
             },
             store: std::sync::Arc::new(store),
             artifact_store: std::sync::Arc::new(crate::infra::LocalArtifactStore::new(
@@ -2071,6 +2370,330 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(plan["current_phase"], 2);
+    }
+
+    /// 归档一台**离线**网关：默认视图（实例列表 / 态势 / 计数）不再有它，`include_archived=true`
+    /// 能看回来并恢复；**在线**网关拒绝归档（不能把活着的东西藏起来）；未知网关 404。
+    #[tokio::test]
+    async fn archive_hides_an_offline_gateway_from_the_default_views() {
+        let state = rollout_state(2);
+        // gw-001：刚上报过 → 在线；gw-002：上报过但**陈旧** → 掉线（在线判定看新鲜度，不看状态串）。
+        for (gateway_id, last_seen) in [
+            ("gw-001", DateTime::now()),
+            (
+                "gw-002",
+                DateTime::from_rfc3339("2020-01-01T00:00:00Z").expect("ts"),
+            ),
+        ] {
+            state
+                .store
+                .upsert_gateway_status(&crate::infra::GatewayStatusUpdate {
+                    gateway_id: gateway_id.to_string(),
+                    instance_id: format!("inst-{gateway_id}"),
+                    version: "0.6.0".to_string(),
+                    status: "online".to_string(),
+                    health: "ok".to_string(),
+                    memory_bytes: None,
+                    cpu_percent: None,
+                    public_base_url: None,
+                    last_seen_at: last_seen,
+                    uptime_seconds: None,
+                    agent_count: None,
+                    online_agents: None,
+                    offline_agents: None,
+                    last_seen_lag_seconds: None,
+                    store_bytes: None,
+                    ingest_accepted_total: None,
+                    ingest_rejected_total: None,
+                    last_ingest_at: None,
+                    memory_total_bytes: None,
+                    load_1m: None,
+                    load_5m: None,
+                    load_15m: None,
+                    disk_usage_percent: None,
+                    disk_total_bytes: None,
+                    disk_available_bytes: None,
+                })
+                .await
+                .expect("status");
+        }
+        let app = super::super::router_for(state.clone());
+
+        // 在线 → **409**（要停就先在网关上停掉）。
+        let (status, _) = post_json(
+            &app,
+            "/api/v1/admin/gateways/gw-001/archive",
+            serde_json::json!({ "archived": true }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "在线网关不可归档");
+
+        // 离线 → 200，回执带 archived_at。
+        let (status, view) = post_json(
+            &app,
+            "/api/v1/admin/gateways/gw-002/archive",
+            serde_json::json!({ "archived": true }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(view["archived_at"].is_string(), "回执要带归档时刻：{view}");
+
+        // 实例列表：默认没有 gw-002；带上 include_archived 才有。
+        let (_, list) = get_json(&app, "/api/v1/admin/gateways/instances").await;
+        assert_eq!(
+            gateway_ids(&list),
+            vec!["gw-001".to_string()],
+            "默认视图不该显示已归档实例"
+        );
+        let (_, list) = get_json(
+            &app,
+            "/api/v1/admin/gateways/instances?include_archived=true",
+        )
+        .await;
+        assert_eq!(
+            gateway_ids(&list),
+            vec!["gw-001".to_string(), "gw-002".to_string()]
+        );
+
+        // 态势（状态视图）：默认没有 gw-002。
+        let (_, statuses) = get_json(&app, "/api/v1/admin/gateways/status").await;
+        assert_eq!(
+            gateway_ids(&statuses["statuses"]),
+            vec!["gw-001".to_string()],
+            "态势默认不该显示已归档网关"
+        );
+        let (_, statuses) =
+            get_json(&app, "/api/v1/admin/gateways/status?include_archived=true").await;
+        assert_eq!(
+            gateway_ids(&statuses["statuses"]),
+            vec!["gw-001".to_string(), "gw-002".to_string()]
+        );
+
+        // 计数与可见集合同口径：归档后只剩 1 台。
+        let (_, list_view) = get_json(&app, "/api/v1/admin/gateways").await;
+        assert_eq!(list_view["list"]["gateway_count"], 1);
+        assert_eq!(list_view["list"]["offline_count"], 0);
+
+        // 取消归档 → 回到默认视图。
+        let (status, view) = post_json(
+            &app,
+            "/api/v1/admin/gateways/gw-002/archive",
+            serde_json::json!({ "archived": false }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(view["archived_at"].is_null());
+        let (_, list) = get_json(&app, "/api/v1/admin/gateways/instances").await;
+        assert_eq!(
+            gateway_ids(&list),
+            vec!["gw-001".to_string(), "gw-002".to_string()]
+        );
+        let (_, list_view) = get_json(&app, "/api/v1/admin/gateways").await;
+        assert_eq!(list_view["list"]["gateway_count"], 2);
+
+        // 未知网关 → 404（归档与取消归档都一样）。
+        for archived in [true, false] {
+            let (status, _) = post_json(
+                &app,
+                "/api/v1/admin/gateways/gw-404/archive",
+                serde_json::json!({ "archived": archived }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        }
+    }
+
+    /// 从实例 / 态势列表里取 gateway_id（顺序按响应原样，用来断言可见集合）。
+    fn gateway_ids(list: &serde_json::Value) -> Vec<String> {
+        list.as_array()
+            .expect("list")
+            .iter()
+            .map(|item| item["gateway_id"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// 重试 = **重派补跑计划**：只带失败目标、新 `plan_id`、单阶段直接放行；原计划原样留作历史。
+    ///
+    /// 「新 id」是这套东西的关键：gwlinkd 只记住 `last_plan_id`，同一份计划改状态会被静默跳过
+    /// （看着成功、其实没重跑）。
+    #[tokio::test]
+    async fn retry_redispatches_failed_targets_as_a_new_plan() {
+        let (state, app, plan_id) = create_plan(3, 1).await;
+        let (status, _) = post_json(
+            &app,
+            "/api/v1/admin/rollout-plans/approve",
+            serde_json::json!({ "plan_id": plan_id }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // 造出「一段三台：一成一败一待派，计划已终结为 failed」的现场（绕过网关回执）。
+        {
+            let mut plan = state
+                .store
+                .get_upgrade_plan(&plan_id)
+                .await
+                .expect("load plan")
+                .expect("plan exists");
+            plan.status = "failed".to_string();
+            for entry in plan.entries.iter_mut() {
+                entry.status = match entry.gateway_id.as_str() {
+                    "gw-002" => "failed",
+                    "gw-003" => "succeeded",
+                    _ => "pending",
+                }
+                .to_string();
+                if entry.gateway_id == "gw-002" {
+                    entry.detail = "agent-package 失败（502 Bad Gateway）".to_string();
+                }
+            }
+            state.store.save_upgrade_plan(&plan).await.expect("save");
+        }
+
+        // 不带 target_ids = 重试**所有**失败目标。
+        let (status, retry) = post_json(
+            &app,
+            "/api/v1/admin/rollout-plans/retry",
+            serde_json::json!({ "plan_id": plan_id }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let retry_id = retry["plan_id"]
+            .as_str()
+            .expect("retry plan id")
+            .to_string();
+        assert_ne!(retry_id, plan_id, "补跑计划必须是新 id");
+        assert!(
+            retry_id.ends_with("-retry"),
+            "补跑计划 id 要可辨：{retry_id}"
+        );
+        assert_eq!(retry["status"], "rolling");
+        assert_eq!(retry["current_phase"], 1);
+        assert_eq!(retry["phases"].as_array().expect("phases").len(), 1);
+        assert_eq!(
+            retry["phases"][0]["target_ids"],
+            serde_json::json!(["gw-002"])
+        );
+        assert_eq!(retry["action"], "upgrade", "同一动作面");
+        assert!(retry["approved_at"].is_string());
+
+        // 条目只有失败那台，且回到 pending（网关下次轮询即可取走）。
+        let (status, detail) =
+            get_json(&app, &format!("/api/v1/admin/rollout-plans/{retry_id}")).await;
+        assert_eq!(status, StatusCode::OK);
+        let entries = detail["entries"].as_array().expect("entries");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["target_id"], "gw-002");
+        assert_eq!(entries[0]["status"], "pending");
+        assert_eq!(entries[0]["detail"], "");
+
+        // 原计划**不动**：那个失败原因就是那次尝试的记录。
+        let (_, original) = get_json(&app, &format!("/api/v1/admin/rollout-plans/{plan_id}")).await;
+        assert_eq!(original["plan"]["status"], "failed");
+        assert_eq!(
+            original["entries"].as_array().expect("entries")[1]["detail"],
+            "agent-package 失败（502 Bad Gateway）"
+        );
+
+        // 再点一次：每次点击都是一次重派，得到又一份新计划（两次重派各自可被网关重驱）。
+        let (status, again) = post_json(
+            &app,
+            "/api/v1/admin/rollout-plans/retry",
+            serde_json::json!({ "plan_id": plan_id }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_ne!(again["plan_id"], retry_id, "两次重派不能撞 id");
+    }
+
+    /// 重试的门槛与筛选：滚动态 / 已完成不受理（**409**），没有失败目标（**400**），未知计划（**404**）。
+    #[tokio::test]
+    async fn retry_only_accepts_a_failed_plan_and_needs_a_failed_target() {
+        let (state, app, plan_id) = create_plan(2, 1).await;
+        // 还没批准（draft）/ 批准后（rolling）都不受理 —— 滚动态先「推进」把当前阶段了结。
+        let (status, _) = post_json(
+            &app,
+            "/api/v1/admin/rollout-plans/retry",
+            serde_json::json!({ "plan_id": plan_id }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "draft 不受理");
+        let (status, _) = post_json(
+            &app,
+            "/api/v1/admin/rollout-plans/approve",
+            serde_json::json!({ "plan_id": plan_id }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = post_json(
+            &app,
+            "/api/v1/admin/rollout-plans/retry",
+            serde_json::json!({ "plan_id": plan_id }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "rolling 不受理");
+
+        // `failed` 但**没有**失败条目（条目全成）→ 400。
+        {
+            let mut plan = state
+                .store
+                .get_upgrade_plan(&plan_id)
+                .await
+                .expect("load plan")
+                .expect("plan exists");
+            plan.status = "failed".to_string();
+            for entry in plan.entries.iter_mut() {
+                entry.status = "succeeded".to_string();
+            }
+            state.store.save_upgrade_plan(&plan).await.expect("save");
+        }
+        let (status, _) = post_json(
+            &app,
+            "/api/v1/admin/rollout-plans/retry",
+            serde_json::json!({ "plan_id": plan_id }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "没有失败目标");
+
+        // 有失败目标，但 `target_ids` 点了一台没失败/不存在的 → 同样 400。
+        {
+            let mut plan = state
+                .store
+                .get_upgrade_plan(&plan_id)
+                .await
+                .expect("load plan")
+                .expect("plan exists");
+            plan.entries[0].status = "failed".to_string();
+            state.store.save_upgrade_plan(&plan).await.expect("save");
+        }
+        let (status, _) = post_json(
+            &app,
+            "/api/v1/admin/rollout-plans/retry",
+            serde_json::json!({ "plan_id": plan_id, "target_ids": ["gw-002", "gw-ghost"] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "指名的目标里没有失败项");
+
+        // 只重试指名的失败目标 → 201，且补跑计划里只有它。
+        let (status, retry) = post_json(
+            &app,
+            "/api/v1/admin/rollout-plans/retry",
+            serde_json::json!({ "plan_id": plan_id, "target_ids": ["gw-001"] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(
+            retry["phases"][0]["target_ids"],
+            serde_json::json!(["gw-001"])
+        );
+
+        // 未知计划 → 404。
+        let (status, _) = post_json(
+            &app,
+            "/api/v1/admin/rollout-plans/retry",
+            serde_json::json!({ "plan_id": "plan-nope" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     /// 查看：返回计划 + 逐目标条目（建计划时按全量目标落 `pending`）。
@@ -2587,6 +3210,91 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// agentd 与 galaxy-ops / galaxy-flow 共用同一份发布矩阵（macOS-ARM + Linux x86_64 / ARM64 的
+    /// musl 版）—— 网关按平台分别托管 agent 安装包，少一个平台就有主机装不上。
+    /// 批量录入时缺平台即整体拒绝，齐备则一次落三条（同版本）。
+    #[tokio::test]
+    async fn batch_publish_requires_all_three_platforms_for_agentd() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("wic-batch-agentd-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        // agentd 包名带 target-triple：`wist-agentd-<version>-<triple>.tar.gz`，顶层一层同名目录。
+        let mk = |triple: &str, payload: &[u8]| -> (String, String) {
+            let bytes =
+                tar_gz_with_entry(&format!("wist-agentd-0.2.1-{triple}/wist-agentd"), payload);
+            let path = dir.join(format!("wist-agentd-0.2.1-{triple}.tar.gz"));
+            std::fs::write(&path, &bytes).expect("write");
+            (
+                path.to_string_lossy().to_string(),
+                crate::infra::sha256_hex_bytes(&bytes),
+            )
+        };
+        let (macos, macos_sha) = mk("aarch64-apple-darwin", b"agentd-mac");
+        let (linux_x86, lx_sha) = mk("x86_64-unknown-linux-musl", b"agentd-lx");
+        let (linux_arm, la_sha) = mk("aarch64-unknown-linux-musl", b"agentd-la");
+
+        let app = super::super::router_for(test_state());
+
+        // 只给两个平台 → 400，且不落记录（拒绝原因是纯文本，故只看状态码与落库结果）。
+        let (status, _) = post_json(
+            &app,
+            "/api/v1/admin/releases/wist-agentd/batch",
+            serde_json::json!({
+                "requested_by": "tester",
+                "artifacts": [
+                    { "artifact_url": macos, "expected_sha256": macos_sha },
+                    { "artifact_url": linux_x86, "expected_sha256": lx_sha },
+                ],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (_, none_yet) = get_json(&app, "/api/v1/admin/releases/wist-agentd").await;
+        assert_eq!(none_yet, serde_json::json!([]));
+
+        // 三平台齐备 → 200，回一个包（同版本、三个平台制品各一）。
+        let (status, package) = post_json(
+            &app,
+            "/api/v1/admin/releases/wist-agentd/batch",
+            serde_json::json!({
+                "requested_by": "tester",
+                "artifacts": [
+                    { "artifact_url": macos, "expected_sha256": macos_sha },
+                    { "artifact_url": linux_x86, "expected_sha256": lx_sha },
+                    { "artifact_url": linux_arm, "expected_sha256": la_sha },
+                ],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(package["version"], "0.2.1");
+        let mut platforms: Vec<String> = package["artifacts"]
+            .as_array()
+            .expect("artifacts")
+            .iter()
+            .map(|artifact| {
+                artifact["platform"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        platforms.sort();
+        assert_eq!(
+            platforms,
+            vec![
+                "aarch64-apple-darwin",
+                "aarch64-unknown-linux-musl",
+                "x86_64-unknown-linux-musl",
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// gateway-stack 包（顶层 `sys/…`，无包装目录）：身份来自**文件名**，版本核对同样生效。
     #[tokio::test]
     async fn publish_release_reads_gateway_stack_identity_from_the_filename() {
@@ -2964,6 +3672,7 @@ mod tests {
                 hmac_secret: "test-hmac-secret".to_string(),
                 credential_ttl_seconds: 3600,
                 link_ttl_seconds: 900,
+                log: Default::default(),
             },
             store: std::sync::Arc::new(store),
             artifact_store: std::sync::Arc::new(crate::infra::LocalArtifactStore::new(
@@ -3169,6 +3878,7 @@ mod tests {
                 hmac_secret: "test-hmac-secret".to_string(),
                 credential_ttl_seconds: 3600,
                 link_ttl_seconds: 900,
+                log: Default::default(),
             },
             store: std::sync::Arc::new(store),
             artifact_store: std::sync::Arc::new(crate::infra::LocalArtifactStore::new(
@@ -3481,6 +4191,7 @@ mod tests {
                 hmac_secret: "test-hmac-secret".to_string(),
                 credential_ttl_seconds: 3600,
                 link_ttl_seconds: 900,
+                log: Default::default(),
             },
             store: std::sync::Arc::new(store),
             artifact_store: std::sync::Arc::new(crate::infra::LocalArtifactStore::new(
@@ -3558,5 +4269,330 @@ mod tests {
                 "uri {uri} should require admin token"
             );
         }
+    }
+
+    /// 脚本安装：一次性接入券有效 → 返回 shell 脚本（含 gops/gx/gateway-stack 地址与六步流程）；
+    /// 券无效 → 401。
+    #[tokio::test]
+    async fn install_script_serves_script_for_a_valid_one_time_token() {
+        use axum::{body::Body, http::Request};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("wic-install-script-{nanos}.json"));
+        let state = create_state_with_store(FileStore::new(&path));
+
+        // 预置三个组件的最新「已发布」制品（脚本会据此填下载地址）。
+        let base = "http://127.0.0.1:3100/api/v1/releases/artifact";
+        state
+            .store
+            .publish_release(
+                "galaxy-ops",
+                "1.2.3",
+                &format!("{base}/galaxy-ops/1.2.3/gops-aarch64-apple-darwin.tar.gz"),
+                Some("deadbeef"),
+                Some("aarch64-apple-darwin"),
+            )
+            .await
+            .expect("publish gops");
+        state
+            .store
+            .publish_release(
+                "galaxy-flow",
+                "0.14.0",
+                &format!("{base}/galaxy-flow/0.14.0/gx-aarch64-apple-darwin.tar.gz"),
+                Some("deadbeef"),
+                Some("aarch64-apple-darwin"),
+            )
+            .await
+            .expect("publish gx");
+        state
+            .store
+            .publish_release(
+                "wist-gateway-stack",
+                "0.1.17",
+                &format!("{base}/wist-gateway-stack/0.1.17/wist-gateway-stack-0.1.17.tar.gz"),
+                Some("deadbeef"),
+                None,
+            )
+            .await
+            .expect("publish stack");
+        state
+            .store
+            .publish_release(
+                "wist-gwlinkd",
+                "0.6.1",
+                &format!(
+                    "{base}/wist-gwlinkd/0.6.1/wist-gwlinkd-0.6.1-aarch64-apple-darwin.tar.gz"
+                ),
+                Some("cafe"),
+                Some("aarch64-apple-darwin"),
+            )
+            .await
+            .expect("publish gwlinkd");
+
+        let app = super::super::router_for(state);
+
+        // 建实例（Provisioned）。
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/admin/gateways/instances")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer admin-tok")
+                    .body(Body::from(create_payload("gw-script")))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        // 生成/轮换接入券：回执里带脚本安装命令（curl ... | bash）。
+        let rotated = rotate_link_token(&app, "gw-script").await;
+        let token = rotated.install.link_token.clone();
+        assert!(
+            rotated
+                .install
+                .install_script_command
+                .contains("curl -fsSLk"),
+            "command: {}",
+            rotated.install.install_script_command
+        );
+        assert!(
+            rotated
+                .install
+                .install_script_command
+                .contains("/api/v1/gateway/install-script"),
+            "command: {}",
+            rotated.install.install_script_command
+        );
+        assert!(rotated.install.install_script_command.contains("token="));
+
+        // 取脚本（正确 token）→ 200 + shell 脚本。
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/gateway/install-script?gateway_id=gw-script&token={token}&domain=gw.example.com"
+                    ))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(content_type.contains("shellscript"), "ct: {content_type}");
+        let body = String::from_utf8(
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes()
+                .to_vec(),
+        )
+        .expect("utf8");
+        for needle in [
+            "gops prj new",
+            "gops prj import",
+            "gops sys localize",
+            "gops run download",
+            "gops run start",
+            "aarch64-apple-darwin",
+            "gw-script",
+            "WEB_DOMAIN",
+            "gw.example.com",
+            // 宿主侧接入器：安装段 + 系统服务托管。
+            "wist-gwlinkd",
+            "service install --system",
+            "control_center_endpoint",
+            "gwlinkd.toml",
+        ] {
+            assert!(body.contains(needle), "script missing `{needle}`:\n{body}");
+        }
+
+        // 券无效 → 401。
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/gateway/install-script?gateway_id=gw-script&token=wrong")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ── 错误信封的 wire 契约：所有错误都应是 `{ "error": { code, message } }` ──────────
+
+    async fn read_json(response: axum::response::Response) -> (StatusCode, serde_json::Value) {
+        use http_body_util::BodyExt;
+        let status = response.status();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// 冲突（409）也走信封，`code` 用词表常量（两边都钉死，防漂移）。
+    #[tokio::test]
+    async fn conflict_errors_carry_the_error_envelope() {
+        let app = super::super::router_for(test_state());
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/admin/gateways/instances",
+            serde_json::json!({ "gateway_name": "gw-001", "requested_by": "tester" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body["error"]["code"],
+            super::super::codes::GATEWAY_ALREADY_EXISTS
+        );
+        assert!(body["error"]["message"].is_string());
+        assert!(body["error"]["severity"].is_string());
+    }
+
+    /// 未命中路由 → 404 也折成信封（默认 axum 是空体）。
+    #[tokio::test]
+    async fn unknown_route_returns_the_error_envelope() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let app = super::super::router_for(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/does-not-exist")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let (status, body) = read_json(response).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], super::super::codes::ROUTE_NOT_FOUND);
+    }
+
+    /// 方法不允许 → 405 也折成信封。
+    #[tokio::test]
+    async fn wrong_method_returns_the_error_envelope() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let app = super::super::router_for(test_state());
+        // `/register` 只收 POST。
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/gateway/register")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let (status, body) = read_json(response).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            body["error"]["code"],
+            super::super::codes::METHOD_NOT_ALLOWED
+        );
+    }
+
+    /// 请求体不是合法 JSON → `invalid_request_body`（ApiJson 折成的信封，而不是 axum 纯文本）。
+    #[tokio::test]
+    async fn malformed_body_returns_the_error_envelope() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let app = super::super::router_for(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/admin/gateways/instances")
+                    .header("authorization", "Bearer admin-tok")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{ not valid json"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let (status, body) = read_json(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["error"]["code"],
+            super::super::codes::INVALID_REQUEST_BODY
+        );
+    }
+
+    /// 查询参数非法 → `invalid_query`（ApiQuery 折成的信封）。
+    #[tokio::test]
+    async fn malformed_query_returns_the_error_envelope() {
+        let app = super::super::router_for(test_state());
+        let (status, body) =
+            get_json(&app, "/api/v1/admin/gateways?include_archived=not-a-bool").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], super::super::codes::INVALID_QUERY);
+    }
+
+    /// 一次性接入券响应必须 `Cache-Control: no-store`（含明文凭据，不得被缓存）。
+    #[tokio::test]
+    async fn link_token_response_is_not_cacheable() {
+        use axum::{body::Body, http::Request, http::header};
+        use tower::ServiceExt;
+
+        let app = super::super::router_for(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/admin/gateways/gw-001/link-token")
+                    .header("authorization", "Bearer admin-tok")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "requested_by": "tester" }).to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        let (_, body) = read_json(response).await;
+        assert!(
+            body["install"]["link_token"]
+                .as_str()
+                .is_some_and(|token| !token.is_empty()),
+            "响应应含一次性明文接入券：{body}"
+        );
     }
 }

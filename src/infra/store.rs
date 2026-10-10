@@ -133,7 +133,8 @@ pub struct UpgradePlanEntryRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpgradePlanRecord {
     pub plan_id: String,
-    /// 动作：今天只有 `upgrade`。
+    /// 动作：`upgrade`（升级安装）/ `push-agent-package`（Agent 包下发，见
+    /// `api::rollout::PUSH_AGENT_PACKAGE_ACTION`）。
     #[serde(default = "default_upgrade_action")]
     pub action: String,
     /// 动作参数（JSON）：`{"targets":[{"component","target_version"}]}`。
@@ -172,7 +173,7 @@ pub struct UpgradePlanRecord {
 }
 
 fn default_upgrade_action() -> String {
-    "upgrade".to_string()
+    wist_control::ACTION_UPGRADE.to_string()
 }
 
 /// **迁移用**：旧记录的执行步骤（`step_index` / `gateway_ids` / `status`）。
@@ -415,6 +416,13 @@ pub struct StoredGateway {
     pub created_at: Option<DateTime>,
     #[serde(default)]
     pub last_seen_at: Option<DateTime>,
+    /// **归档**时刻；`None` = 未归档。
+    ///
+    /// 归档是**标记**，不是删除：默认视图（网关态势 / 实例总览）不再显示它，状态、历史、生命周期
+    /// 记录全都留着；只允许归档**离线**的网关（在线的不该被藏起来）。网关重新上线（换证注册，或
+    /// 重新上报 online）时自动清空 —— 「回来了就回到正常」，不用人工记得取消归档。
+    #[serde(default)]
+    pub archived_at: Option<DateTime>,
 }
 
 impl StoredGateway {
@@ -458,6 +466,7 @@ impl StoredGateway {
             initialized_at: None,
             created_at: None,
             last_seen_at: None,
+            archived_at: None,
         }
     }
 }
@@ -529,6 +538,16 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     async fn get_gateway(&self, gateway_id: &str) -> Result<Option<StoredGateway>, StoreError>;
     /// 落库最新上报状态（仅更新已接入网关，与 FileStore 的 update 语义一致）。
     async fn upsert_gateway_status(&self, update: &GatewayStatusUpdate) -> Result<(), StoreError>;
+
+    /// 标记 / 清除**归档**（`None` = 取消归档）。返回是否命中了这台网关。
+    ///
+    /// 只落一个时刻，不做删除 —— 默认视图按它过滤，历史全留。调用方负责「只归档离线网关」那条
+    /// 业务约束（存储层不判定在线）。
+    async fn set_gateway_archived(
+        &self,
+        gateway_id: &str,
+        archived_at: Option<DateTime>,
+    ) -> Result<bool, StoreError>;
 
     /// 记下/刷新网关的**对外域名**（注册时即落，早于第一拍状态上报）。
     async fn set_gateway_public_base_url(
@@ -967,6 +986,24 @@ impl FileStore {
             gateway.credential_token_hash = token_hash.to_string();
             gateway.credential_status = StoredGatewayCredentialStatus::Active;
             gateway.credential_expires_at = expires_at;
+            // 换证 = 这台网关**又活了一次**（重装后再注册，或在跑的周期性轮换）：归档自动解除，
+            // 免得「回来了」的网关继续被默认视图藏着。
+            gateway.archived_at = None;
+            true
+        })
+    }
+
+    /// 标记 / 清除归档（同步，供测试与 trait 委托）。命中返回 `true`；未接入的网关 `false`。
+    pub fn set_gateway_archived(
+        &self,
+        gateway_id: &str,
+        archived_at: Option<DateTime>,
+    ) -> Result<bool, StoreError> {
+        self.update(|snapshot| {
+            let Some(gateway) = snapshot.gateways.get_mut(gateway_id) else {
+                return false;
+            };
+            gateway.archived_at = archived_at;
             true
         })
     }
@@ -1347,6 +1384,12 @@ impl Store for FileStore {
                     stored.disk_total_bytes = update.disk_total_bytes;
                     stored.disk_available_bytes = update.disk_available_bytes;
                     stored.last_seen_at = Some(update.last_seen_at.clone());
+                    // 「回来了」就解除归档：还在上报 online 说明这台网关又活着了，不该继续被默认
+                    // 视图藏着。（归档只允许离线网关，所以这里清掉的基本都是真回归；死掉的网关
+                    // 不会上报，也就不会误清。）
+                    if update.status == "online" {
+                        stored.archived_at = None;
+                    }
                     // 首次上报 → Running（初始化完成，记录 initialized_at + 转变事件）。
                     if stored.lifecycle_state != Some(GatewayInstanceLifecycleState::Running) {
                         let prev = stored.lifecycle_state;
@@ -1388,6 +1431,14 @@ impl Store for FileStore {
             }
         })?;
         Ok(())
+    }
+
+    async fn set_gateway_archived(
+        &self,
+        gateway_id: &str,
+        archived_at: Option<DateTime>,
+    ) -> Result<bool, StoreError> {
+        FileStore::set_gateway_archived(self, gateway_id, archived_at)
     }
 
     async fn create_enrollment_token(
@@ -1823,6 +1874,143 @@ mod tests {
             .expect("create no credential");
         assert_eq!(stored.link_token_hash, "");
         assert_eq!(stored.credential_token_hash, "");
+
+        let _ = fs::remove_file(path);
+    }
+
+    /// 归档是**标记**：落 `archived_at`、可就地清掉；网关**回来了**（换证注册，或重新上报 online）
+    /// 时自动解除 —— 不用人工记得取消归档；只是掉线的那种上报（offline）不会自己冒回来。
+    #[tokio::test]
+    async fn archive_is_a_marker_and_clears_when_the_gateway_comes_back() {
+        fn status_update(gateway_id: &str, status: &str) -> GatewayStatusUpdate {
+            GatewayStatusUpdate {
+                gateway_id: gateway_id.to_string(),
+                instance_id: "i".to_string(),
+                version: "0.1.26".to_string(),
+                status: status.to_string(),
+                health: "ok".to_string(),
+                memory_bytes: None,
+                cpu_percent: None,
+                public_base_url: None,
+                last_seen_at: DateTime::now(),
+                uptime_seconds: None,
+                agent_count: None,
+                online_agents: None,
+                offline_agents: None,
+                last_seen_lag_seconds: None,
+                store_bytes: None,
+                ingest_accepted_total: None,
+                ingest_rejected_total: None,
+                last_ingest_at: None,
+                memory_total_bytes: None,
+                load_1m: None,
+                load_5m: None,
+                load_15m: None,
+                disk_usage_percent: None,
+                disk_total_bytes: None,
+                disk_available_bytes: None,
+            }
+        }
+
+        let path = test_store_path();
+        let store = FileStore::new(&path);
+        store
+            .seed(&[GatewayCredentialSeed {
+                gateway_id: "gw-001".to_string(),
+                token: "tok-a".to_string(),
+                expires_at: None,
+            }])
+            .expect("seed");
+
+        // 归档：落时刻，历史别的不动。
+        assert!(
+            store
+                .set_gateway_archived("gw-001", Some(DateTime::now()))
+                .expect("archive"),
+            "命中已接入的网关"
+        );
+        assert!(
+            store
+                .get_gateway("gw-001")
+                .await
+                .expect("get")
+                .expect("exists")
+                .archived_at
+                .is_some()
+        );
+        // 未接入的网关：没命中（调用方折 404）。
+        assert!(
+            !store
+                .set_gateway_archived("gw-404", Some(DateTime::now()))
+                .expect("archive unknown")
+        );
+
+        // 只在掉线时上报 offline：**不**解除（否则一台半死的网关会把归档刷掉）。
+        store
+            .upsert_gateway_status(&status_update("gw-001", "offline"))
+            .await
+            .expect("status offline");
+        assert!(
+            store
+                .get_gateway("gw-001")
+                .await
+                .expect("get")
+                .expect("exists")
+                .archived_at
+                .is_some(),
+            "offline 上报不该解除归档"
+        );
+
+        // 重新上报 online = 它又活着了 → 自动解除。
+        store
+            .upsert_gateway_status(&status_update("gw-001", "online"))
+            .await
+            .expect("status online");
+        assert!(
+            store
+                .get_gateway("gw-001")
+                .await
+                .expect("get")
+                .expect("exists")
+                .archived_at
+                .is_none(),
+            "重新 online 应自动解除归档"
+        );
+
+        // 换证（重装后再注册 / 周期性轮换）同样解除。
+        store
+            .set_gateway_archived("gw-001", Some(DateTime::now()))
+            .expect("archive again");
+        store
+            .update_gateway_credential("gw-001", "hash-new", None)
+            .expect("credential");
+        assert!(
+            store
+                .get_gateway("gw-001")
+                .await
+                .expect("get")
+                .expect("exists")
+                .archived_at
+                .is_none(),
+            "换证应自动解除归档"
+        );
+
+        // 取消归档：清成 None。
+        store
+            .set_gateway_archived("gw-001", Some(DateTime::now()))
+            .expect("archive once more");
+        store
+            .set_gateway_archived("gw-001", None)
+            .expect("unarchive");
+        assert!(
+            store
+                .get_gateway("gw-001")
+                .await
+                .expect("get")
+                .expect("exists")
+                .archived_at
+                .is_none()
+        );
 
         let _ = fs::remove_file(path);
     }

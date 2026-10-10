@@ -1,7 +1,7 @@
 // @jumo generated
 // WarpInsightCenter 上级聚合控制中心服务（crate: wist-center）：接收 WarpGateway 状态上报。
 
-use std::{error::Error, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{error::Error, net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc};
 
 use axum::extract::{ConnectInfo, Request, State};
 use axum::middleware::{Next, from_fn_with_state};
@@ -14,7 +14,43 @@ use tokio_rustls::TlsAcceptor;
 use wist_center::infra::{FileStore, PgStore, Store, VerifiedGatewayIdentity};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn main() -> ExitCode {
+    match run_main().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            let chain = render_error_chain(err.as_ref());
+            if log::log_enabled!(log::Level::Error) {
+                log::error!("wist-center failed: {chain}");
+            } else {
+                // 日志还没起来（配置就读不了）→ 退 stderr，别让启动失败静默。
+                eprintln!("wist-center failed: {chain}");
+            }
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// 把 error 的 `source` 链折成多行文本（`orion-error` 的 `Caused by` 因果链在 source 里，
+/// 直接 `{err}` / `Err` 默认 Debug 都看不到）。
+fn render_error_chain(err: &(dyn Error + Send + Sync + 'static)) -> String {
+    // 深度上限：正常因果链很短；设上限只为防病态 / 成环的 `source()` 实现把日志打爆。
+    const MAX_DEPTH: usize = 16;
+    let mut out = err.to_string();
+    let mut source = err.source();
+    let mut index = 1;
+    while let Some(cause) = source {
+        if index > MAX_DEPTH {
+            out.push_str("\n  -> Caused by ... (chain truncated)");
+            break;
+        }
+        out.push_str(&format!("\n  -> Caused by {index}: {cause}"));
+        source = cause.source();
+        index += 1;
+    }
+    out
+}
+
+async fn run_main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("init-config") {
         return init_config_command(args.get(1).map(String::as_str));
@@ -22,6 +58,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let config_path = wist_center::config::resolved_config_path();
     let config =
         wist_center::config::CenterConfig::load_from_env().map_err(|err| err.into_boxed_std())?;
+    // 运行日志在**读到配置之后**初始化：级别 / 格式 / 落点由 `[log]` 段决定（`RUST_LOG` 优先）。
+    wist_center::logging::init(&config.log);
+    log::info!("wist-center config: {}", config_path.display());
     // 配置了 database_url → PostgreSQL；未配置 → JSON 文件回退。
     let store: Arc<dyn Store> = match &config.database_url {
         Some(database_url) => Arc::new(
@@ -50,7 +89,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let gateway_ca_pem = gateway_ca.ca_certificate_pem().to_string();
     let app = wist_center::api::router(config, store, gateway_ca);
     let listener = TcpListener::bind(&addr).await?;
-    println!("wist-center config: {}", config_path.display());
     match server_tls {
         Some((cert_path, key_path)) => {
             let tls_config = wist_center::infra::load_gateway_mtls_server_config(
@@ -59,11 +97,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 &gateway_ca_pem,
             )
             .map_err(|err| -> Box<dyn Error + Send + Sync> { err.into() })?;
-            println!("wist-center listening on https://{addr}");
+            log::info!("wist-center listening on https://{addr}");
             serve_tls(listener, app, tls_config).await?;
         }
         None => {
-            println!("wist-center listening on http://{addr}");
+            log::info!("wist-center listening on http://{addr}");
             // 注入真实 peer 地址供限流按 IP 分桶（忽略可伪造的 x-real-ip / x-forwarded-for）。
             axum::serve(
                 listener,
@@ -153,7 +191,7 @@ async fn serve_tls(
             let tls_stream = match acceptor.accept(stream).await {
                 Ok(stream) => stream,
                 Err(err) => {
-                    eprintln!("failed TLS handshake from {peer_addr}: {err}");
+                    log::warn!("failed TLS handshake from {peer_addr}: {err}");
                     return;
                 }
             };
@@ -165,7 +203,7 @@ async fn serve_tls(
                 Some(der) => match VerifiedGatewayIdentity::from_certificate_der(&der) {
                     Ok(identity) => Some(identity),
                     Err(err) => {
-                        eprintln!(
+                        log::warn!(
                             "mTLS client certificate from {peer_addr} has no usable gateway identity: {err}"
                         );
                         None
@@ -183,7 +221,7 @@ async fn serve_tls(
             let service = TowerToHyperService::new(service);
             let builder = Builder::new(TokioExecutor::new());
             if let Err(err) = builder.serve_connection(io, service).await {
-                eprintln!("failed to serve HTTPS connection from {peer_addr}: {err}");
+                log::warn!("failed to serve HTTPS connection from {peer_addr}: {err}");
             }
         });
     }

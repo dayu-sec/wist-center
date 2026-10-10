@@ -54,15 +54,18 @@ pub fn check_rate_limit(state: &ApiState, client_key: &str, scope: &str) -> Opti
                 .max(1)
                 .to_string();
             return Some(
-                (
+                super::error::ApiError::new(
                     StatusCode::TOO_MANY_REQUESTS,
-                    [
-                        (header::RETRY_AFTER, retry_after),
-                        (header::CACHE_CONTROL, "no-store".to_string()),
-                    ],
+                    super::codes::RATE_LIMITED,
                     "too many failed authentication attempts",
                 )
-                    .into_response(),
+                .with_header(
+                    header::RETRY_AFTER,
+                    axum::http::HeaderValue::from_str(&retry_after)
+                        .unwrap_or_else(|_| axum::http::HeaderValue::from_static("60")),
+                )
+                .with_no_store()
+                .into_response(),
             );
         }
         limits.buckets.remove(&key);

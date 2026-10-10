@@ -5,6 +5,47 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.9.0-alpha] - 2026-10-10
+
+### 新增
+
+- **网关归档 / 取消归档**：`POST /api/v1/admin/gateways/{gateway_id}/archive` —— 归档是**标记**
+  （默认视图隐藏、历史保留、可一键恢复），仅允许归档**离线**网关；在线网关拒绝（要停先在网关上停）。
+- **重派失败的升级目标**：`POST /api/v1/admin/rollout-plans/retry` —— 把一份失败计划里的失败目标
+  重派成**一份新计划**（新 `plan_id`、单阶段、直接放行）。必须新建而非改回原计划：网关按 `plan_id`
+  去重，改状态是「假重试」（网关永不重跑）；原计划原样留作历史。
+- **前置环境准备脚本**：`GET /api/v1/gateway/prepare-script` —— 公开、无令牌的 `curl ... | bash`，
+  补齐 `tar` / `docker` / `docker compose` 等依赖，可先于安装单独跑。
+
+> 本版**实际随包**包含 0.8.0 变更记录中已宣告、但未随 0.8.0 制品一起发布的安装脚本能力
+> （`GET /api/v1/gateway/install-script` + 宿主侧 `wist-gwlinkd` + 制品 sha256 校验）。
+
+### 变更
+
+- **运行日志配置化（`[log]` 段）+ 全量接入 `log` facade**：新增 `[log]`（`level` 过滤器指令、
+  `format` `text`|`json`、`file` 写文件、`max_bytes`/`keep_files`/`max_age_seconds` 自轮转；相对路径
+  按配置目录解析），优先级 **`RUST_LOG` > `[log] level` > 缺省 `info`**。启动 / 监听 / TLS 握手与
+  连接失败 / 各面诊断从 `println!` / `eprintln!` 改走 `log`（缺省 stderr，交给容器 / journald；
+  配了 `file` 就写文件并自轮转，**不要再挂 logrotate**）。日志在读到配置之后初始化；配置读不了
+  时退 stderr，并打印**完整因果链**（不再只出 `Debug`）。
+- **5xx 不再回内部细节**：500 / 502 的响应体只出通用话术，SQL / 路径 / 上游报错等移进 `log::error!`
+  （完整因果链），避免把库内细节暴露给调用方；4xx 仍是明确的客户端错误文案。
+- **错误响应统一为 `{ "error": { code, message, … } }` 信封 + 稳定错误码词表**：中心这一层
+  此前是裸 `(StatusCode, String)`。现全部走 `api::error::ApiError`，`code` 来自唯一词表 `api::codes`
+  （网关面 / 发布 / 灰度 / 安装脚本 / 鉴权 / 限流各域）；`severity` / `retryable` 按 status 默认填。
+  **破坏性（wire）**：错误体不再是纯文本 —— 消费方（网关 / gwlinkd / 管理前端）改按 `error.message`
+  / `error.code` 解析（网关侧按子串判 401 子原因仍兼容）。
+- **非 handler 错误也走同一信封**：未命中路由（`404` `route_not_found`）、方法不允许（`405`
+  `method_not_allowed`）、请求体 / 查询参数反序列化失败（`invalid_request_body` / `invalid_query`）
+  此前绕过信封（axum 默认空体 / 纯文本且不落日志）—— 现统一折成 `ApiError`，并落 `log::warn!`。
+- **灰度建计划的校验错误按具体原因给码**：`invalid_action` / `invalid_spec` / `invalid_deadline` /
+  `invalid_timeout` / `invalid_phase_plan` / `no_failed_targets`（此前一律 `invalid_rollout_plan`，
+  消费方无法按原因分支）。
+- **一次性凭据 / 配置类响应加 `Cache-Control: no-store`**：`regist_token` / `link_token` / 客户端证书
+  bundle / 初始化配置等只应交付一次的内容，以及相关 401（网关身份 / 接入券 / 管理 token）均不得被缓存。
+- **瞬时上游故障的日志降噪**：`502` / `503` / `504`（依赖不可用 / 超时，接收方重试即可）改记
+  `log::warn!`，不再与真 `500` 同级。
+
 ## [0.8.0-alpha] - 2026-10-09
 
 ### 新增

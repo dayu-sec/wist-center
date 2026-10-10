@@ -66,8 +66,11 @@ cargo run
 ```
 
 The credentials in `docker-compose.yml` (`demo` / `demo`) are demo-only. The PostgreSQL schema is
-applied automatically from [`docker/initdb/01_schema.sql`](docker/initdb/01_schema.sql) on first
-start.
+applied automatically from [`docker/initdb/01_schema.sql`](docker/initdb/01_schema.sql): the compose
+`initdb` runs it on the **first** start of the data volume, and the center re-applies the same
+(idempotent) file on **every** start — so a schema change (a new column) also lands on databases
+that already exist. Re-applying is best-effort: a database user without DDL rights only gets a
+startup warning, and the operator applies the file by hand.
 
 Exported variables only last for that shell, so the admin token changes on every launch. To keep one
 around, use a config file instead:
