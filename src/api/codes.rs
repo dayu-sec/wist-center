@@ -19,6 +19,7 @@ macro_rules! codes {
 
 codes! {
     AGENT_STATUS_UPDATE_FAILED => "agent_status_update_failed",
+    ARTIFACT_COMPONENT_MISMATCH => "artifact_component_mismatch",
     ARTIFACT_FETCH_FAILED => "artifact_fetch_failed",
     ARTIFACT_FIELDS_REQUIRED => "artifact_fields_required",
     ARTIFACT_INVALID => "artifact_invalid",

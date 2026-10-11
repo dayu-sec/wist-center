@@ -59,7 +59,10 @@ async fn run_main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let config =
         wist_center::config::CenterConfig::load_from_env().map_err(|err| err.into_boxed_std())?;
     // 运行日志在**读到配置之后**初始化：级别 / 格式 / 落点由 `[log]` 段决定（`RUST_LOG` 优先）。
-    wist_center::logging::init(&config.log);
+    wist_log::init(
+        &config.log,
+        &wist_log::Identity::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
+    );
     log::info!("wist-center config: {}", config_path.display());
     // 配置了 database_url → PostgreSQL；未配置 → JSON 文件回退。
     let store: Arc<dyn Store> = match &config.database_url {

@@ -5,6 +5,29 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.10.0-alpha] - 2026-10-11
+
+### 变更
+
+- **运行日志改用共享 crate `wist-log`**：删掉本仓 `logging.rs`，`[log]` 段统一由 `wist_log::init`
+  装配（级别 / 格式 / 落点 / 轮转），与 gateway / gwlinkd / agentd 同口径；键名规范为 `max_seconds`
+  （旧名 `max_age_seconds` 以 alias 继续接受）。依赖同时收 `wist-release 0.6`（新增安装包**包名**
+  解析，本仓发布校验的「组件 ↔ 包」一致性用它）。
+- **配置支持从密钥文件解析 `${SEC_...}`**：引入 `orion-sec` / `orion-variate`，配置文件里的
+  `${VAR}` / `${VAR:default}` 由 `secret_dict()`（进程环境变量优先，其次密钥文件）解析；密钥类值
+  推荐写 `${SEC_...}`，从 `WIST_CENTER_SEC_FILE` 指向的密钥文件（YAML，键自动规范成 `SEC_<UPPER>`）
+  取，默认 `./.galaxy/sec_value.yml` / `~/.galaxy/sec_value.yml`。**未解析的占位符 fail-closed**
+  （拒绝启动，不把 `${SEC_...}` 当字面值用）；显式指定的密钥文件缺失 → 明确报错。
+  如此 `admin_token` / `hmac_secret` 不再以明文写进配置文件。
+
+### 移除
+
+- **移除环境变量 `WARP_INSIGHT_CENTER_ADMIN_TOKEN`**：管理 token（`server.admin_token`）不再有
+  env 覆盖，**唯一来源是配置文件**（生产/栈里写 `${SEC_CENTER_ADMIN_TOKEN}`，由密钥文件解析）。
+  避免“文件与 env 两份值不一致、到底哪份生效”的踩坑。注：配置文件里的 `${VAR}` 仍可按名字
+  从**进程环境变量**展开（orion-sec 机制），但不再有专门的 admin token env 覆盖。
+  **破坏性**：依赖该 env 的部署/脚本需改为写配置文件。
+
 ## [0.9.0-alpha] - 2026-10-10
 
 ### 新增

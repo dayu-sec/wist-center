@@ -24,12 +24,16 @@ pub(super) fn require_admin_bearer(
         return Err(response);
     }
     let Some(expected_hash) = &state.config.admin_token_hash else {
-        // dev 模式：未配置 WARP_INSIGHT_CENTER_ADMIN_TOKEN 时不要求鉴权，
+        // dev 模式：未配置 admin token（`server.admin_token` 为空）时不要求鉴权，
         // 便于前端/联调直接查看真实数据；生产必须配置 token。
         return Ok(());
     };
     let Some(token) = bearer_token(headers) else {
         // 缺 token 属未认证请求，不计入暴力尝试（否则无 token 的轮询会锁死客户端）。
+        log::warn!(
+            "event=AdminAuthMissingBearer scope={} client={client_key}",
+            ADMIN_AUTH_SCOPE
+        );
         return Err(super::error::ApiError::unauthorized(
             super::codes::MISSING_ADMIN_BEARER_TOKEN,
             "missing admin bearer token",
@@ -38,6 +42,7 @@ pub(super) fn require_admin_bearer(
         .into_response());
     };
     if !constant_time_eq(sha256_hex(token).as_bytes(), expected_hash.as_bytes()) {
+        // 错 token：计入暴力尝试（`record_auth_failure` 会记 `event=AuthFailure` / `event=AuthBlocked`）。
         rate_limit::record_auth_failure(state, client_key, ADMIN_AUTH_SCOPE);
         return Err(super::error::ApiError::unauthorized(
             super::codes::INVALID_ADMIN_BEARER_TOKEN,

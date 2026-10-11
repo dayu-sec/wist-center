@@ -12,6 +12,6 @@ pub use wist_release::package::{
     MAX_PACKAGE_BYTES, PackageError, PlatformFamily, ReleaseArtifact, ReleasePackage,
     artifact_filename, is_safe_path_segment, missing_platforms, normalize_platform,
     normalize_version, package_id_for_sha256, platform_family, read_package_identity,
-    read_source as read_package_source, read_verified_source as read_verified_package,
-    validate_platforms,
+    read_package_name, read_source as read_package_source, read_source_package_name,
+    read_verified_source as read_verified_package, validate_platforms,
 };

@@ -60,7 +60,8 @@ docker compose up -d          # PostgreSQL :55432, VictoriaMetrics :8428
 
 export WARP_INSIGHT_CENTER_DATABASE_URL=postgres://demo:demo@127.0.0.1:55432/insight_demo
 export WARP_INSIGHT_CENTER_VICTORIAMETRICS_URL=http://127.0.0.1:8428
-export WARP_INSIGHT_CENTER_ADMIN_TOKEN=dev-admin-token
+# Admin token is NOT an env var: set `server.admin_token` in the config file
+# (e.g. ~/.wist-center/wist-center.toml). Leave it empty → local dev runs with no auth.
 
 cargo run
 ```
@@ -136,7 +137,6 @@ In the file:
 | --- | --- | --- |
 | `WARP_INSIGHT_CENTER_LISTEN` | `127.0.0.1:3100` | HTTP listen address. |
 | `WARP_INSIGHT_CENTER_PUBLIC_URL` | `https://center.warpinsight.example` | Externally reachable base URL, used to build the gateway init URL. Must fall inside the control-center certificate SANs. |
-| `WARP_INSIGHT_CENTER_ADMIN_TOKEN` | *(unset)* | Admin bearer token. Unset → the admin API requires no authentication (development only). Overrides `server.admin_token` from the file. |
 | `WARP_INSIGHT_CENTER_HMAC_SECRET` | dev placeholder | HMAC-SHA256 key used to derive RegistTokens. **Must be set in production.** Rotating it does not invalidate existing credentials, since only the derived hashes are stored. |
 | `WARP_INSIGHT_CENTER_DATABASE_URL` | *(unset)* | PostgreSQL DSN. Unset or empty → JSON file store. |
 | `WARP_INSIGHT_CENTER_STORE_PATH` | `state/warp-insight-center-store.json` (under the config-file directory) | JSON store path. |

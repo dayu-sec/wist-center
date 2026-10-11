@@ -682,6 +682,15 @@ pub async fn admin_publish_release(
         )
         .into_response();
     }
+    // 「组件 ↔ 包」的来源侧预检：来源文件名就能看出是别的组件 → 立刻拒，**不下载**。
+    // （把 gwlinkd 包录成 wist-agentd 这类录入，不该等下载完、落库前才报。）
+    if let Some(detail) = source_component_mismatch(&component, &request.artifact_url) {
+        return super::error::ApiError::bad_request(
+            super::codes::ARTIFACT_COMPONENT_MISMATCH,
+            detail,
+        )
+        .into_response();
+    }
     // 读来源（本机绝对路径 / https URL）+ **必须**核对期望摘要（不符即 502，不落记录）。
     let (bytes, package_sha256) =
         match crate::infra::read_verified_package(&request.artifact_url, Some(expected_sha256))
@@ -810,6 +819,44 @@ fn required_platforms(component: &str) -> Option<&'static [&'static str]> {
 /// - 否则镜像到制品存储并写一条 `published` 记录。
 ///
 /// `platform` 为目标平台（target-triple），无平台概念的包传 `None`。
+/// 「组件 ↔ 包」一致性校验（**fail-closed**）：解析包名（包内顶层目录名 / 来源文件名），
+/// **必须与组件一致**。取不出包名（`pkg-<hash>`、临时名）**也拒** —— 否则「发错组件」的包会一路
+/// 被派发，直到网关取到、agentd 解包时才报 `artifact_invalid`。
+///
+/// 拦的就是「把 gwlinkd 包录成 wist-agentd」这类录入。
+fn component_package_mismatch(component: &str, source: &str, bytes: &[u8]) -> Option<String> {
+    let name = crate::infra::read_package_name(source, bytes);
+    if name == component {
+        return None;
+    }
+    if name.is_empty() {
+        return Some(format!(
+            "cannot tell which component this package belongs to (source: {source}); \
+             expected a package named `{component}-<version>[-<platform>]`"
+        ));
+    }
+    Some(component_mismatch_detail(component, source, &name))
+}
+
+/// 「组件 ↔ 包」不一致的**统一措辞**（来源能读出包名时用）；指出该发到哪个组件。
+fn component_mismatch_detail(component: &str, source: &str, name: &str) -> String {
+    format!(
+        "package looks like `{name}`, not `{component}` (source: {source}); \
+         publish it under the `{name}` component"
+    )
+}
+
+/// 「组件 ↔ 包」一致性的**来源侧预检**：**只看来源文件名、不下载**。
+///
+/// 来源能读出包名且与组件不符 → 当场拒（省下一次注定失败的下载）；读不出包名
+/// （`pkg-<hash>` / 临时名）→ 放行，交给下载后的 [`component_package_mismatch`]
+/// 用包内顶层目录名做权威判定。
+fn source_component_mismatch(component: &str, source: &str) -> Option<String> {
+    let name = crate::infra::read_source_package_name(source);
+    (!name.is_empty() && name != component)
+        .then(|| component_mismatch_detail(component, source, &name))
+}
+
 #[allow(clippy::result_large_err)]
 async fn record_verified_release(
     state: &ApiState,
@@ -820,6 +867,14 @@ async fn record_verified_release(
     package_sha256: &str,
     platform: Option<&str>,
 ) -> Result<crate::infra::ReleaseRecord, Response> {
+    // 「组件 ↔ 包」校验（fail-closed）：包名必须与组件一致，否则在落盘 / 记库**之前**拒。
+    if let Some(detail) = component_package_mismatch(component, artifact_url, &bytes) {
+        return Err(super::error::ApiError::bad_request(
+            super::codes::ARTIFACT_COMPONENT_MISMATCH,
+            detail,
+        )
+        .into_response());
+    }
     // 同一 (component, version) 已镜像过**同一份内容** → 幂等返回，不重复下副本。
     if let Ok(existing) = state.store.list_releases(component).await
         && let Some(record) = existing.iter().find(|record| {
@@ -926,6 +981,18 @@ pub async fn admin_publish_release_batch(
             "artifacts must not be empty",
         )
         .into_response();
+    }
+
+    // 下载前先按**来源文件名**扫一遍「组件 ↔ 包」：任一个明显是别的组件即整体拒，**不下载任何制品**。
+    // （灌 gwlinkd 的三平台地址到 wist-agentd 页这类录入，过去要等全部下载完才报。）
+    for artifact in &request.artifacts {
+        if let Some(detail) = source_component_mismatch(&component, &artifact.artifact_url) {
+            return super::error::ApiError::bad_request(
+                super::codes::ARTIFACT_COMPONENT_MISMATCH,
+                detail,
+            )
+            .into_response();
+        }
     }
 
     // 单个制品的校验结果（下载 / 摘要 / 身份都在此步完成）。
@@ -2824,7 +2891,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("time")
             .as_nanos();
-        let pkg = std::env::temp_dir().join(format!("wic-rel-{nanos}.tar.gz"));
+        let dir = std::env::temp_dir().join(format!("wic-rel-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("dir");
+        // 包名要与组件一致（`wist-gateway-stack-…`），否则会被 `artifact_component_mismatch` 拒。
+        let pkg = dir.join("wist-gateway-stack-0.1.27.tar.gz");
         std::fs::write(&pkg, b"artifact-bytes").expect("write");
         let source = pkg.to_string_lossy().to_string();
         let sha = crate::infra::sha256_hex_bytes(b"artifact-bytes");
@@ -2884,7 +2954,145 @@ mod tests {
             .expect("response");
         assert_eq!(bad.status(), StatusCode::BAD_GATEWAY);
 
-        let _ = std::fs::remove_file(pkg);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 单条录入：来源文件名就能看出是别的组件 → **下载前**即拒（不碰网络 / 磁盘）。
+    ///
+    /// 用**不存在**的本地路径：若走到取件步会得到 502；预检在下载前拦下 → 必是 400。
+    #[tokio::test]
+    async fn publish_release_rejects_a_wrong_component_before_downloading() {
+        let app = super::super::router_for(test_state());
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/admin/releases/wist-agentd",
+            serde_json::json!({
+                "version": "0.7.1",
+                "artifact_url":
+                    "/nonexistent/wist-gwlinkd-v0.7.1-alpha-aarch64-apple-darwin.tar.gz",
+                "expected_sha256": "0".repeat(64),
+                "requested_by": "tester",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["error"]["code"],
+            super::super::codes::ARTIFACT_COMPONENT_MISMATCH
+        );
+        // 不落记录。
+        let (_, none_yet) = get_json(&app, "/api/v1/admin/releases/wist-agentd").await;
+        assert_eq!(none_yet, serde_json::json!([]));
+    }
+
+    /// 单条录入：来源**读不出包名**（哈希名 / 临时名）→ 预检放行，权威判定仍在下载之后。
+    ///
+    /// 同样用不存在的路径：既然放行到取件步，就会得到 502（取件失败）而**不是** 400 ——
+    /// 证明预检没有误拒。
+    #[tokio::test]
+    async fn publish_release_defers_the_component_check_when_the_source_has_no_name() {
+        let app = super::super::router_for(test_state());
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/admin/releases/wist-agentd",
+            serde_json::json!({
+                "version": "0.1.0",
+                "artifact_url": "/nonexistent/pkg-955e0dc75215c3a6",
+                "expected_sha256": "0".repeat(64),
+                "requested_by": "tester",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            body["error"]["code"],
+            super::super::codes::ARTIFACT_FETCH_FAILED
+        );
+    }
+
+    #[test]
+    fn component_package_mismatch_rejects_a_package_of_another_component() {
+        // 把 gwlinkd 包录成 wist-agentd → 拒，并指出该发到哪个组件。
+        let detail = component_package_mismatch(
+            "wist-agentd",
+            "wist-gwlinkd-v0.7.1-alpha-aarch64-apple-darwin.tar.gz",
+            b"not-a-tarball",
+        )
+        .expect("must flag the mismatch");
+        assert!(detail.contains("wist-gwlinkd"), "{detail}");
+        // 组件对得上 → 放行。
+        assert!(
+            component_package_mismatch(
+                "wist-agentd",
+                "wist-agentd-v0.2.1-alpha-aarch64-apple-darwin.tar.gz",
+                b"x"
+            )
+            .is_none()
+        );
+        // 部署栈包（包内顶层是 `sys/…`）：包名回落文件名 → 仍能对上组件。
+        assert!(
+            component_package_mismatch(
+                "wist-gateway-stack",
+                "wist-gateway-stack-v0.1.26-alpha.tar.gz",
+                b"x"
+            )
+            .is_none()
+        );
+        // 取不出包名（`pkg-<hash>` / 临时名）→ 也拒（fail-closed）。
+        assert!(component_package_mismatch("wist-agentd", "pkg-955e0dc75215c3a6", b"x").is_some());
+        // 包名是别的（哪怕不是「已知组件」）→ 拒。
+        assert!(
+            component_package_mismatch("galaxy-ops", "some-tool-v1.2.3-linux.tar.gz", b"x")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn source_component_mismatch_flags_a_wrong_component_before_any_download() {
+        // 来源文件名就能看出是别的组件 → 预检直接拒（**不需下载字节**）。
+        let detail = source_component_mismatch(
+            "wist-agentd",
+            "https://github.com/dayu-sec/wist-gwlinkd/releases/download/v0.7.1-alpha/wist-gwlinkd-v0.7.1-alpha-aarch64-apple-darwin.tar.gz",
+        )
+        .expect("must flag the mismatch from the source name alone");
+        assert!(detail.contains("wist-gwlinkd"), "{detail}");
+        // 组件对得上 → 放行。
+        assert!(
+            source_component_mismatch(
+                "wist-agentd",
+                "https://github.com/dayu-sec/wist-agentd/releases/download/v0.2.1-alpha/wist-agentd-v0.2.1-alpha-aarch64-apple-darwin.tar.gz",
+            )
+            .is_none()
+        );
+        // 来源读不出包名（只有版本 / 哈希名 / 临时名）→ 放行，交给下载后的完整校验定夺。
+        for source in [
+            "https://artifacts.example.com/wist-agentd/v2.4.1-aarch64-apple-darwin.tar.gz",
+            "pkg-955e0dc75215c3a6",
+            "/tmp/wic-rel-1728.tar.gz",
+        ] {
+            assert!(
+                source_component_mismatch("wist-agentd", source).is_none(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_component_mismatch_ignores_query_and_fragment() {
+        // GitHub Release / 对象存储签名链常带查询串、fragment：只取末段，不受影响。
+        assert!(
+            source_component_mismatch(
+                "wist-agentd",
+                "https://x.example/wist-agentd-v0.2.1-alpha-aarch64-apple-darwin.tar.gz?token=abc#frag",
+            )
+            .is_none()
+        );
+        let detail = source_component_mismatch(
+            "wist-agentd",
+            "https://x.example/wist-gwlinkd-v0.7.1-alpha-x86_64-unknown-linux-musl.tar.gz?token=abc",
+        )
+        .expect("must flag the mismatch despite the query string");
+        assert!(detail.contains("wist-gwlinkd"), "{detail}");
     }
 
     /// 平台落库（二进制包从顶层目录名切 target-triple）+ 托管状态管理（published ↔ expired）。
@@ -3295,6 +3503,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// 批量录入时若某个制品的**来源文件名**明显是别的组件 → 下载前就整体拒。
+    ///
+    /// 用**不存在**的本地路径做锯齿：若走到取件步会得到 502（取件失败）；预检在下载前拦下 →
+    /// 必是 400 且错误码为 `artifact_component_mismatch`（而非缺平台的 `artifact_invalid`）。
+    #[tokio::test]
+    async fn batch_publish_rejects_a_wrong_component_before_downloading() {
+        let app = super::super::router_for(test_state());
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/admin/releases/wist-agentd/batch",
+            serde_json::json!({
+                "requested_by": "tester",
+                "artifacts": [
+                    {
+                        "artifact_url":
+                            "/nonexistent/wist-gwlinkd-v0.7.1-alpha-aarch64-apple-darwin.tar.gz",
+                        "expected_sha256": "0".repeat(64),
+                    },
+                ],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["error"]["code"],
+            super::super::codes::ARTIFACT_COMPONENT_MISMATCH
+        );
+        // 不落记录。
+        let (_, none_yet) = get_json(&app, "/api/v1/admin/releases/wist-agentd").await;
+        assert_eq!(none_yet, serde_json::json!([]));
+    }
+
     /// gateway-stack 包（顶层 `sys/…`，无包装目录）：身份来自**文件名**，版本核对同样生效。
     #[tokio::test]
     async fn publish_release_reads_gateway_stack_identity_from_the_filename() {
@@ -3447,9 +3687,11 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("time")
             .as_nanos();
-        let dir = std::env::temp_dir();
-        let first = dir.join(format!("wic-rel-a-{nanos}.bin"));
-        let second = dir.join(format!("wic-rel-b-{nanos}.bin"));
+        let dir = std::env::temp_dir().join(format!("wic-rel-dedup-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("dir");
+        // 包名要与组件一致（`wist-agentd-…`）：两条来源文件名不同、但同组件同版本、同内容。
+        let first = dir.join("wist-agentd-0.1.32-aarch64-apple-darwin.tar.gz");
+        let second = dir.join("wist-agentd-0.1.32-x86_64-unknown-linux-musl.tar.gz");
         std::fs::write(&first, b"same-content").expect("write a");
         std::fs::write(&second, b"same-content").expect("write b");
 
@@ -3511,8 +3753,7 @@ mod tests {
             "同内容同版本 → 幂等，不落第二份"
         );
 
-        let _ = std::fs::remove_file(first);
-        let _ = std::fs::remove_file(second);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// 包内自报版本与声明版本不符 → 400 拒录；归一化后一致（带 `v`）→ 放行。

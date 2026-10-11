@@ -6,8 +6,9 @@
 //   2. 环境变量 WARP_INSIGHT_CENTER_*（沿用既有契约）。
 //   3. 代码内置默认值。
 //
-// 配置文件里可以写 ${VAR} 从环境变量取值（该变量未设置会报错）；相对路径
-// （store.store_path / artifacts.dir / security.ca_cert_path）按配置文件所在目录解析。
+// 配置文件里可以写 ${VAR} / ${VAR:default} 从环境变量取值（该变量未设置且无默认值会报错）；密钥类
+// 值（admin_token / hmac_secret）推荐写 ${SEC_...}，由 orion-sec 从密钥文件解析（见 SEC_FILE_ENV）。
+// 相对路径（store.store_path / artifacts.dir / security.ca_cert_path）按配置文件所在目录解析。
 
 use std::{
     env, fs,
@@ -15,6 +16,9 @@ use std::{
 };
 
 use orion_error::conversion::ToStructError;
+use orion_sec::sec::NoSecConv;
+use orion_sec::{SecFileFmt, load_sec_dict, load_secfile_by};
+use orion_variate::vars::{EnvChecker, EnvDict, EnvEvaluable, ValueType};
 use serde::Deserialize;
 use wist_error::{ConfigError, ConfigReason};
 
@@ -24,13 +28,15 @@ use crate::infra::sha256_hex;
 const CONFIG_FILE: &str = "wist-center.toml";
 /// 指向配置文件的 env（未设置/为空 → 用 default_config_path）。
 const CONFIG_ENV: &str = "WIST_CENTER_CONFIG";
+/// 显式指定密钥文件（**绝对路径**）；未设则用 orion 默认
+/// `./.galaxy/sec_value.yml` → `~/.galaxy/sec_value.yml`。
+const SEC_FILE_ENV: &str = "WIST_CENTER_SEC_FILE";
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:3100";
 const DEFAULT_STORE_PATH: &str = "state/warp-insight-center-store.json";
 const ENV_LISTEN: &str = "WARP_INSIGHT_CENTER_LISTEN";
 const ENV_STORE_PATH: &str = "WARP_INSIGHT_CENTER_STORE_PATH";
 const ENV_GATEWAY_CREDENTIALS: &str = "WARP_INSIGHT_CENTER_GATEWAY_CREDENTIALS";
-const ENV_ADMIN_TOKEN: &str = "WARP_INSIGHT_CENTER_ADMIN_TOKEN";
 const ENV_DATABASE_URL: &str = "WARP_INSIGHT_CENTER_DATABASE_URL";
 const ENV_VICTORIAMETRICS_URL: &str = "WARP_INSIGHT_CENTER_VICTORIAMETRICS_URL";
 const ENV_PUBLIC_URL: &str = "WARP_INSIGHT_CENTER_PUBLIC_URL";
@@ -111,7 +117,7 @@ pub struct CenterConfig {
     /// env：`WARP_INSIGHT_CENTER_LINK_TTL_SECONDS`。默认 15 分钟。
     pub link_ttl_seconds: i64,
     /// `[log]` 段：本进程运行日志（级别 / 格式 / 落点 / 轮转）。
-    pub log: crate::logging::LogSection,
+    pub log: wist_log::LogSection,
 }
 
 /// S3 兼容对象存储配置（MinIO 等）。
@@ -153,7 +159,7 @@ struct RawCenterConfig {
     security: RawSecurityConfig,
     artifacts: RawArtifactsConfig,
     enrollment: RawEnrollmentConfig,
-    log: crate::logging::LogSection,
+    log: wist_log::LogSection,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -254,8 +260,9 @@ impl CenterConfig {
                 )));
             }
         };
-        // 先展开文件里的 ${VAR}，再让 env 覆盖（env 的值是字面量，不再二次展开）。
-        expand_raw_env(&mut raw)?;
+        // 先展开文件里的 ${VAR}（含密钥文件里的 ${SEC_...}），再让 env 覆盖（env 的值是字面量，不再二次展开）。
+        let env = secret_dict()?;
+        expand_raw_env(&mut raw, &env)?;
         apply_env_overrides(&mut raw);
         let config_dir = config_path
             .parent()
@@ -427,8 +434,8 @@ pub fn resolved_gateway_client_ca_paths() -> (PathBuf, PathBuf) {
     (cert, key)
 }
 
-/// 展开文件里所有 `${VAR}`。
-fn expand_raw_env(raw: &mut RawCenterConfig) -> Result<(), ConfigError> {
+/// 展开文件里所有 `${VAR}` / `${VAR:default}`（查 [`secret_dict`] 变量表：env 优先，其次密钥文件）。
+fn expand_raw_env(raw: &mut RawCenterConfig, env: &EnvDict) -> Result<(), ConfigError> {
     for value in [
         &mut raw.server.listen_addr,
         &mut raw.server.public_url,
@@ -447,19 +454,20 @@ fn expand_raw_env(raw: &mut RawCenterConfig) -> Result<(), ConfigError> {
         &mut raw.artifacts.object_storage_secret_key,
     ] {
         if let Some(text) = value.as_ref() {
-            *value = Some(expand_env(text)?);
+            *value = Some(expand(env, text)?);
         }
     }
     Ok(())
 }
 
-/// 环境变量覆盖文件值（沿用 17 个既有 WARP_INSIGHT_CENTER_* 契约）。
+/// 环境变量覆盖文件值（沿用既有 `WARP_INSIGHT_CENTER_*` 契约）。
+/// 注：管理 token（`server.admin_token`）**不在**此列 —— 它只有一个来源：配置文件
+/// （生产/栈里写 `${SEC_CENTER_ADMIN_TOKEN}`，由密钥文件解析），避免“文件与 env 两份值”不一致。
 fn apply_env_overrides(raw: &mut RawCenterConfig) {
     // 标量：env 有值（非空白）才覆盖；env 置空视为"没给"，保留文件值。
     override_scalar(&mut raw.server.listen_addr, ENV_LISTEN);
     override_scalar(&mut raw.server.public_url, ENV_PUBLIC_URL);
     override_scalar(&mut raw.server.protocol_version, ENV_PROTOCOL_VERSION);
-    override_scalar(&mut raw.server.admin_token, ENV_ADMIN_TOKEN);
     override_scalar(&mut raw.artifacts.gateway_image, ENV_GATEWAY_IMAGE);
     override_scalar(&mut raw.security.hmac_secret, ENV_HMAC_SECRET);
     override_scalar(&mut raw.security.ca_cert_path, ENV_CA_CERT_PATH);
@@ -548,29 +556,52 @@ fn absolutize_path(base_dir: &Path, path: &Path) -> PathBuf {
     base_dir.join(path)
 }
 
-/// 展开 `${VAR}`（变量未设置 → 报错；未闭合/空名 → 报错）。
-fn expand_env(value: &str) -> Result<String, ConfigError> {
-    let mut output = String::with_capacity(value.len());
-    let mut rest = value;
-    while let Some(start) = rest.find("${") {
-        output.push_str(&rest[..start]);
-        let after_start = &rest[start + 2..];
-        let Some(end) = after_start.find('}') else {
-            return Err(config_validation(format!(
-                "invalid environment placeholder in {value:?}"
-            )));
-        };
-        let key = &after_start[..end];
-        if key.is_empty() {
-            return Err(config_validation("empty environment placeholder"));
-        }
-        let replacement = env::var(key)
-            .map_err(|_| config_validation(format!("missing environment variable {key}")))?;
-        output.push_str(&replacement);
-        rest = &after_start[end + 1..];
+/// 构建 `${VAR}` 展开用的变量表：**进程环境变量优先**，其下是密钥文件里的 `SEC_*`
+/// （`WIST_CENTER_SEC_FILE` 指定，或 orion 默认 `.galaxy/sec_value.yml`）。变量表里查不到时
+/// [`expand`] 再回落到系统环境变量（orion 内建）。
+fn secret_dict() -> Result<EnvDict, ConfigError> {
+    let mut dict = match env::var_os(SEC_FILE_ENV).filter(|path| !path.is_empty()) {
+        Some(path) => load_sec_file(Path::new(&path))?,
+        None => load_sec_dict()
+            .map_err(|err| config_validation(format!("failed to load secrets: {err}")))?,
+    };
+    // 环境变量后写入 = 优先（`EnvDict` 查表优先于系统 env，故把 env 盖进去实现 env-first）。
+    for (key, value) in env::vars() {
+        dict.insert(key, ValueType::from(value.as_str()));
     }
-    output.push_str(rest);
-    Ok(output)
+    Ok(dict)
+}
+
+/// 从指定文件载入密钥表（`WIST_CENTER_SEC_FILE`，YAML；键自动规范成 `SEC_<UPPER>`）。
+/// **显式指定的文件必须存在** —— 缺了就报清楚，别让下游只报「`SEC_xxx` 未解析」。
+fn load_sec_file(path: &Path) -> Result<EnvDict, ConfigError> {
+    if !path.exists() {
+        return Err(config_validation(format!(
+            "secrets file not found: {}（WIST_CENTER_SEC_FILE）",
+            path.display()
+        )));
+    }
+    let space = load_secfile_by(path.to_path_buf(), SecFileFmt::Yaml).map_err(|err| {
+        config_validation(format!("failed to load secrets {}: {err}", path.display()))
+    })?;
+    let mut dict = EnvDict::new();
+    for (key, value) in space.no_sec() {
+        dict.insert(key, value);
+    }
+    Ok(dict)
+}
+
+/// 展开 `${VAR}` / `${VAR:default}`：先查 [`secret_dict`] 的变量表（env 优先），再回落系统环境变量。
+/// **展开后仍含占位符 → 报错**（fail-closed）—— 绝不把未解析的 `${SEC_...}` 当字面值用。
+fn expand(env: &EnvDict, value: &str) -> Result<String, ConfigError> {
+    let expanded: String = value.to_string().env_eval(env);
+    if expanded.needs_env_eval() {
+        return Err(config_validation(format!(
+            "unresolved environment variable(s) in {value:?}: {}",
+            expanded.list_env_vars().join(", ")
+        )));
+    }
+    Ok(expanded)
 }
 
 fn trim_trailing_slash(value: String) -> String {
@@ -777,7 +808,6 @@ victoriametrics_url = "http://file-vm:8428"
         );
         unsafe {
             env::set_var("WARP_INSIGHT_CENTER_LISTEN", "127.0.0.1:4111");
-            env::set_var("WARP_INSIGHT_CENTER_ADMIN_TOKEN", "env-admin-token");
             // 显式置空 = 明确关闭（文件里的 DSN 被清掉 → 退回本地文件存储）。
             env::set_var("WARP_INSIGHT_CENTER_DATABASE_URL", "");
             env::set_var(
@@ -790,9 +820,10 @@ victoriametrics_url = "http://file-vm:8428"
         let config = CenterConfig::load_from_path(&path).expect("config loads");
 
         assert_eq!(config.listen_addr, "127.0.0.1:4111");
+        // 管理 token 只从配置文件来（不再有 env 覆盖）：这里就是文件里的值。
         assert_eq!(
             config.admin_token_hash.as_deref(),
-            Some(sha256_hex("env-admin-token").as_str())
+            Some(sha256_hex("file-admin-token").as_str())
         );
         assert_eq!(config.database_url, None);
         assert_eq!(
@@ -804,7 +835,6 @@ victoriametrics_url = "http://file-vm:8428"
         // 归还环境，别影响同进程其它测试。
         unsafe {
             env::remove_var("WARP_INSIGHT_CENTER_LISTEN");
-            env::remove_var("WARP_INSIGHT_CENTER_ADMIN_TOKEN");
             env::remove_var("WARP_INSIGHT_CENTER_DATABASE_URL");
             env::remove_var("WARP_INSIGHT_CENTER_VICTORIAMETRICS_URL");
             env::remove_var("WARP_INSIGHT_CENTER_LINK_TTL_SECONDS");
@@ -853,11 +883,14 @@ listen_addr = ""
     /// （示例用它表达默认 CA 路径），因此要求运行环境有 HOME。
     #[test]
     fn bundled_example_config_loads() {
+        // 与设环境的测试串行：secret_dict() 会读 SEC_FILE_ENV，避免踩到并发测试的临时值。
+        let _guard = env_guard();
         let mut raw: RawCenterConfig =
             toml::from_str(include_str!("../examples/local-dev.toml")).expect("示例应能解析");
         // 示例要能直接跑：其中的 ${VAR} 必须是正常会话下一定存在的（目前只有 ${HOME}）；
-        // 变量缺失时 expand_env 会直接报错，这里就拦住。
-        expand_raw_env(&mut raw).expect("示例里的占位符必须能在正常环境下展开");
+        // 变量缺失时 expand 会直接报错，这里就拦住。
+        let env = secret_dict().expect("构建密钥表");
+        expand_raw_env(&mut raw, &env).expect("示例里的占位符必须能在正常环境下展开");
         let config_dir = Path::new("/tmp/wist-center-example");
         let config = CenterConfig::from_raw(raw, config_dir).expect("示例应能解析成配置");
         config.validate().expect("示例应通过校验");
@@ -946,6 +979,8 @@ listen_addr = ""
 
     #[test]
     fn log_section_parses_and_absolutizes_file() {
+        // load_from_path → secret_dict() 会读 SEC_FILE_ENV，与设环境的测试串行。
+        let _guard = env_guard();
         let path = write_temp_config(
             r#"
 [server]
@@ -962,7 +997,7 @@ max_bytes = 1048576
         );
         let config = CenterConfig::load_from_path(&path).expect("config loads");
         assert_eq!(config.log.level.as_deref(), Some("warn"));
-        assert_eq!(config.log.format, crate::logging::LogFormat::Json);
+        assert_eq!(config.log.format, wist_log::LogFormat::Json);
         let file = config.log.file.expect("log file resolved");
         assert!(
             file.is_absolute(),
@@ -970,5 +1005,81 @@ max_bytes = 1048576
         );
         assert!(file.ends_with("logs/center.log"), "{file:?}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn write_temp_file(content: &str, ext: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("wist-center-sec-{}", unique_suffix()));
+        fs::create_dir_all(&dir).expect("create temp sec dir");
+        let path = dir.join(format!("sec-value.{ext}"));
+        fs::write(&path, content).expect("write temp sec file");
+        path
+    }
+
+    /// 未解析的占位符（且无默认值）→ 拒绝启动（fail-closed），且报出缺哪个变量。
+    #[test]
+    fn unresolved_placeholder_fails_closed() {
+        let _guard = env_guard();
+        let path = write_temp_config(
+            "[security]\nhmac_secret = \"${WIST_CENTER_TEST_MISSING_VAR_XYZ}\"\n",
+        );
+        let err = CenterConfig::load_from_path(&path).expect_err("unresolved secret must fail");
+        assert!(
+            err.to_string().contains("WIST_CENTER_TEST_MISSING_VAR_XYZ"),
+            "{err}"
+        );
+    }
+
+    /// 支持 `${VAR:default}`：查不到变量时用默认值。
+    #[test]
+    fn env_default_syntax_is_supported() {
+        let _guard = env_guard();
+        let path = write_temp_config(
+            "[security]\nhmac_secret = \"${WIST_CENTER_TEST_MISSING_VAR:fallback-secret}\"\n",
+        );
+        let config = CenterConfig::load_from_path(&path).expect("default used");
+        assert_eq!(config.hmac_secret, "fallback-secret");
+    }
+
+    /// 自定义密钥文件（`WIST_CENTER_SEC_FILE` 指向的那个）：按键规范成 `SEC_<UPPER>` 载入。
+    #[test]
+    fn custom_sec_file_loads_and_prefixes_keys() {
+        let path = write_temp_file(
+            "center_admin_token: custom-secret-token-1234567890\n",
+            "yml",
+        );
+        let dict = load_sec_file(&path).expect("load sec file");
+        assert!(
+            dict.get_case_insensitive("SEC_CENTER_ADMIN_TOKEN")
+                .is_some()
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    /// 显式指定的密钥文件**缺失** → 明确报错（而不是含糊的「SEC_xxx 未解析」）。
+    #[test]
+    fn missing_explicit_sec_file_is_an_error() {
+        let missing = env::temp_dir().join("wist-center-sec-file-that-does-not-exist.yml");
+        let err = load_sec_file(&missing).expect_err("missing explicit sec file must fail");
+        assert!(err.to_string().contains("secrets file not found"), "{err}");
+    }
+
+    /// 配置里的 `${SEC_...}` 由 `WIST_CENTER_SEC_FILE` 指向的密钥文件解析（值不落明文配置）。
+    #[test]
+    fn config_resolves_sec_placeholders_from_sec_file() {
+        let _guard = env_guard();
+        let sec = write_temp_file("center_admin_token: sec-file-admin-token\n", "yml");
+        let path = write_temp_config("[server]\nadmin_token = \"${SEC_CENTER_ADMIN_TOKEN}\"\n");
+        unsafe {
+            env::set_var(SEC_FILE_ENV, &sec);
+        }
+        let config = CenterConfig::load_from_path(&path).expect("config loads");
+        unsafe {
+            env::remove_var(SEC_FILE_ENV);
+        }
+        assert_eq!(
+            config.admin_token_hash.as_deref(),
+            Some(sha256_hex("sec-file-admin-token").as_str())
+        );
+        let _ = fs::remove_file(sec);
     }
 }
