@@ -279,7 +279,7 @@ fn url_encode(value: &str) -> String {
 
 /// 脚本模板：用占位符替换（避免 `format!` 与 shell 花括号打架）。
 const SCRIPT_TEMPLATE: &str = r#"#!/usr/bin/env bash
-# WarpInsightCenter · 网关脚本安装（gateway_id=__GATEWAY_ID__）
+# WistCenter · 网关脚本安装（gateway_id=__GATEWAY_ID__）
 #
 # 由中心自动生成：装 gops / gx（取中心最新发布制品）→ gops prj new → prj import gateway-stack
 # → sys localize → run download → run start → 装宿主侧 wist-gwlinkd（把本网关接入中心）。
@@ -443,18 +443,48 @@ if [ -z "$GATEWAY_DOMAIN" ]; then
   exit 1
 fi
 log "网关对外域名：$GATEWAY_DOMAIN"
+STACK_DIR="$PROJECT_ROOT/wist-gateway-stack"
 VALUES_FILE="values/wist-gateway-stack/sys_value.yml"
-mkdir -p "$(dirname "$VALUES_FILE")"
-if grep -qE '^WEB_DOMAIN:' "$VALUES_FILE" 2>/dev/null; then
-  sed -E "s|^WEB_DOMAIN:.*|WEB_DOMAIN: ${GATEWAY_DOMAIN}|" "$VALUES_FILE" > "$VALUES_FILE.tmp"
-  mv "$VALUES_FILE.tmp" "$VALUES_FILE"
-else
-  printf 'WEB_DOMAIN: %s\n' "$GATEWAY_DOMAIN" >> "$VALUES_FILE"
+
+# 现场值统一写进 values（gops 的覆盖机制）：一份值，localize 时一致地烘进 .env / 配置 / 证书 SAN。
+set_value() {
+  local file="$1" key="$2" value="$3"
+  mkdir -p "$(dirname "$file")"
+  if grep -qE "^${key}:" "$file" 2>/dev/null; then
+    sed -E "s|^${key}:.*|${key}: ${value}|" "$file" > "$file.tmp"
+    mv "$file.tmp" "$file"
+  else
+    printf '%s: %s\n' "$key" "$value" >> "$file"
+  fi
+}
+set_value "$VALUES_FILE" WEB_DOMAIN "$GATEWAY_DOMAIN"
+
+# gwlinkd（宿主接入器）的接入面走同一份现场值 —— localize 会渲染进主配置（交付物），
+# 而**现场选择**（中心地址 / 网关标识 / 中心信任锚）由 scripts/init-gwlinkd-pub.sh 按缺补齐到
+# identity/gwlinkd/pub.toml（现场态，**升级/重渲永不覆盖**）。
+# 路径一律**绝对**：gwlinkd 是系统服务，启动时 cwd 不确定（相对的 ./configs/... 会指错）。
+GATEWAY_PORT_VALUE="$(sed -n 's/^GATEWAY_PORT:[[:space:]]*//p' "$VALUES_FILE" 2>/dev/null | head -n1)"
+[ -n "$GATEWAY_PORT_VALUE" ] || GATEWAY_PORT_VALUE=443
+if [ -z "${GATEWAY_SELF_ENDPOINT:-}" ]; then
+  if [ "$GATEWAY_PORT_VALUE" = "443" ]; then GATEWAY_SELF_ENDPOINT="https://127.0.0.1"
+  else GATEWAY_SELF_ENDPOINT="https://127.0.0.1:$GATEWAY_PORT_VALUE"; fi
 fi
+set_value "$VALUES_FILE" CENTER_ENDPOINT "$CENTER_URL"
+set_value "$VALUES_FILE" GWLINKD_GATEWAY_ID "$GATEWAY_ID"
+set_value "$VALUES_FILE" GWLINKD_TRUST_BUNDLE "$STACK_DIR/identity/gwlinkd/control-center.pem"
+# 身份材料（客户端证书 + 私钥、中心信任锚）落 identity/：不可再生 ⇒ 进 contract（不进交付包）。
+set_value "$VALUES_FILE" GWLINKD_IDENTITY_DIR "$STACK_DIR/identity/gwlinkd"
+# 运行态（单实例锁 / 升级簿记 / 临时注册券）：可删可重建，与身份分开。
+set_value "$VALUES_FILE" GWLINKD_STATE_DIR "$STACK_DIR/configs/gwlinkd/state"
+set_value "$VALUES_FILE" GATEWAY_SELF_ENDPOINT "$GATEWAY_SELF_ENDPOINT"
+set_value "$VALUES_FILE" GATEWAY_SELF_CA "$STACK_DIR/identity/gateway/public/gateway-ca.crt.pem"
+# gwlinkd 驱动升级：gops 工程根（含 ops-prj.yml，**绝对路径**）——gops 从 cwd 解析工程。
+set_value "$VALUES_FILE" GWLINKD_UPGRADER_PROGRAM "gops"
+set_value "$VALUES_FILE" GWLINKD_UPGRADE_PROJECT_DIR "$PROJECT_ROOT"
 
 # d) 变量解析 + 本地化（把域名等现场值烘进 .env 与渲染配置）
 log "gops sys localize"
-cd "$PROJECT_ROOT/wist-gateway-stack"
+cd "$STACK_DIR"
 gops sys localize
 
 # e) 拉取制品
@@ -469,8 +499,10 @@ gops run status
 
 # g) 宿主侧 wist-gwlinkd：把本网关接入上级控制中心（系统服务常驻，开机自启 / 崩溃拉起）。
 #    来源与 gops/gx 一致（中心最新发布制品），按宿主平台取件。
-#    以**部署用户**身份常驻（非 root）：身份回写 / gops 升级都落在部署用户属主下；
-#    配置与 state 就放该用户家目录（gwlinkd 要能回写 gwlinkd.toml）。
+#    配置**分两份**：主配置（交付物）由 localize 渲染成 configs/gwlinkd/gwlinkd.toml；
+#    现场态（中心地址 / 网关标识 / 信任锚 / 临时券）在 identity/gwlinkd/pub.toml ——
+#    升级 / 重渲**永不覆盖**它，所以装服务时要把这条路径（--pub-config）显式告诉进程。
+#    以**部署用户**身份常驻（非 root）：身份回写落在部署用户属主下。
 GWLINKD_URL="$(gwlinkd_url || true)"
 if [ -z "$GWLINKD_URL" ]; then
   log "跳过 wist-gwlinkd：中心未发布本平台制品（发布后重跑安装即可补装）"
@@ -485,54 +517,35 @@ else
   fi
 
   GWLINKD_BIN="/usr/local/bin/wist-gwlinkd"
-  GWLINKD_HOME="$HOME/.wist-gwlinkd"
-  GWLINKD_STATE="$GWLINKD_HOME/state"
-  GWLINKD_CA="$GWLINKD_HOME/ca/control-center.pem"
-  GWLINKD_TOML="$GWLINKD_HOME/gwlinkd.toml"
+  GWLINKD_TOML="$STACK_DIR/configs/gwlinkd/gwlinkd.toml"
+  # 现场态（中心地址 / 网关标识 / 信任锚 / 临时券）与主配置**分文件**：它**不在**同目录，
+  # 所以必须经 WIST_GWLINKD_PUB_CONFIG 显式告诉进程（见 wist-gwlinkd 的 service install）。
+  GWLINKD_PUB="$STACK_DIR/identity/gwlinkd/gwlinkd-pub.toml"
+  GWLINKD_CA="$STACK_DIR/identity/gwlinkd/control-center.pem"
 
-  # 配置 / state / CA 都归部署用户（gwlinkd 会回写 gwlinkd.toml、落客户端证书），无需 sudo。
-  mkdir -p "$GWLINKD_HOME/ca" "$GWLINKD_STATE"
   install_component wist-gwlinkd "$GWLINKD_URL" "$(gwlinkd_sha || true)" /usr/local/bin "$SUDO"
 
-  # 中心 CA 信任锚：gwlinkd 校验中心 TLS 用（自签中心必需）。
+  # 中心 CA 信任锚：写到渲染配置里 GWLINKD_TRUST_BUNDLE 指向的路径（自签中心必需）。
   if grep -q 'BEGIN CERTIFICATE' "$CA_CENTER" 2>/dev/null; then
+    mkdir -p "$(dirname "$GWLINKD_CA")"
     install -m 0644 "$CA_CENTER" "$GWLINKD_CA"
   fi
 
-  # 网关环回自述面：页面路「链接上级」需要。端口取栈 .env 的 GATEWAY_PORT（缺省 443）。
-  GATEWAY_PORT_VALUE=""
-  for f in "$PROJECT_ROOT/wist-gateway-stack/.env" "$PROJECT_ROOT/wist-gateway-stack/sys/.env"; do
-    if [ -f "$f" ]; then
-      GATEWAY_PORT_VALUE="$(sed -n 's/^GATEWAY_PORT=//p' "$f" | head -n1)"
-      if [ -n "$GATEWAY_PORT_VALUE" ]; then break; fi
-    fi
-  done
-  [ -n "$GATEWAY_PORT_VALUE" ] || GATEWAY_PORT_VALUE=443
-  if [ -z "${GATEWAY_SELF_ENDPOINT:-}" ]; then
-    if [ "$GATEWAY_PORT_VALUE" = "443" ]; then GATEWAY_SELF_ENDPOINT="https://127.0.0.1"
-    else GATEWAY_SELF_ENDPOINT="https://127.0.0.1:$GATEWAY_PORT_VALUE"; fi
+  if [ ! -f "$GWLINKD_TOML" ]; then
+    echo "未找到渲染后的 $GWLINKD_TOML（localize 没跑成？）—— 无法安装 wist-gwlinkd。" >&2
+    exit 1
   fi
-  GATEWAY_SELF_CA="$PROJECT_ROOT/wist-gateway-stack/configs/gateway/state/gateway-ca.crt.pem"
-
-  # 渲染 gwlinkd.toml（服务启动 cwd 不定，路径必须绝对）。以部署用户写，gwlinkd 才能回写。
-  {
-    printf '# 由 WarpInsightCenter 安装脚本生成（gateway_id=%s）\n' "$GATEWAY_ID"
-    printf 'control_center_endpoint = "%s"\n' "$CENTER_URL"
-    printf 'trust_bundle = "%s"\n' "$GWLINKD_CA"
-    printf 'state_dir = "%s"\n' "$GWLINKD_STATE"
-    printf 'gateway_id = "%s"\n' "$GATEWAY_ID"
-    printf 'gateway_self_endpoint = "%s"\n' "$GATEWAY_SELF_ENDPOINT"
-    if [ -f "$GATEWAY_SELF_CA" ]; then printf 'gateway_self_ca = "%s"\n' "$GATEWAY_SELF_CA"; fi
-    printf 'upgrader_program = "gops"\n'
-    printf 'upgrade_project_dir = "%s"\n' "$PROJECT_ROOT"
-  } > "$GWLINKD_TOML"
+  if [ ! -f "$GWLINKD_PUB" ]; then
+    echo "未找到现场态配置 $GWLINKD_PUB（localize 没跑成？）—— 无法安装 wist-gwlinkd。" >&2
+    exit 1
+  fi
 
   # 装成**系统级服务、非 root 运行**（--run-as）：开机自启 / 崩溃拉起，进程属主 = 部署用户。
   RUN_AS_OPT=""
   if [ "$(id -u)" != "0" ]; then RUN_AS_OPT="--run-as $DEPLOY_USER"; fi
-  $SUDO "$GWLINKD_BIN" service install --system $RUN_AS_OPT --bin "$GWLINKD_BIN" --config "$GWLINKD_TOML" --force
+  $SUDO "$GWLINKD_BIN" service install --system $RUN_AS_OPT --bin "$GWLINKD_BIN" --config "$GWLINKD_TOML" --pub-config "$GWLINKD_PUB" --force
   $SUDO "$GWLINKD_BIN" service status --system || true
-  log "wist-gwlinkd 已安装并常驻（user=$DEPLOY_USER）；到网关页「链接上级」完成接入（gateway_id=$GATEWAY_ID）"
+  log "wist-gwlinkd 已安装并常驻（user=$DEPLOY_USER，config=$GWLINKD_TOML，pub=$GWLINKD_PUB）；到网关页「链接上级」完成接入（gateway_id=$GATEWAY_ID）"
 fi
 
 log "完成：工程 $PROJECT_ROOT（gateway_id=$GATEWAY_ID）"
@@ -595,7 +608,7 @@ fn render_install_script(
 
 /// 前置环境准备脚本模板（**独立于安装脚本**）：补齐 tar/curl/gzip/python3/docker/docker compose。
 const PREPARE_SCRIPT_TEMPLATE: &str = r#"#!/usr/bin/env bash
-# WarpInsightCenter · 网关前置环境准备
+# WistCenter · 网关前置环境准备
 # 补齐 tar / curl / gzip / python3 / docker / docker compose（缺则装），可重复执行。
 set -euo pipefail
 

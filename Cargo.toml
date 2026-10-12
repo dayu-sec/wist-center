@@ -3,7 +3,7 @@
 
 [package]
 name = "wist-center"
-version = "0.10.0" #@gxl:set(version)
+version = "0.11.0" #@gxl:set(version)
 edition = "2024"
 
 [dependencies]
@@ -41,6 +41,10 @@ wist-release = { version = "0.6" }
 # 本地联调切 path。
 wist-log = { version = "0.1" }
 #wist-log = { version = "0.1", path = "../wist-log" }
+
+# 分层配置（主配置 + 现场态声明 `${VAR}` + 同目录 .env），与 gateway / gwlinkd 共用。
+wist-config = { version = "0.1" }
+#wist-config = { version = "0.1", path = "../wist-config" }
 
 # 中心服务端 TLS/mTLS：服务器证书（CA-S）+ 校网关客户端证书（CA-G）。
 # 与网关侧 infra/tls.rs 同构（WebPkiClientVerifier + allow_unauthenticated、握手后取客户端叶证书）。

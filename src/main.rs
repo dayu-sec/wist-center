@@ -1,5 +1,5 @@
 // @jumo generated
-// WarpInsightCenter 上级聚合控制中心服务（crate: wist-center）：接收 WarpGateway 状态上报。
+// WistCenter 上级聚合控制中心服务（crate: wist-center）：接收 WarpGateway 状态上报。
 
 use std::{error::Error, net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc};
 
@@ -146,6 +146,21 @@ fn init_config_command(out_arg: Option<&str>) -> Result<(), Box<dyn Error + Send
         &out_path,
         wist_center::config::default_config_text(&admin_token, &hmac_secret),
     )?;
+    // 一并写出**现场态**（声明 + 值骶架）：声明只写 `${VAR}`、值留空 ——
+    // 现场就有一个明确要填的文件，而不会「一启动就报未定义」。两者缺失才写。
+    let pub_path = wist_center::config::pub_config_path(&out_path);
+    let env_path = wist_center::config::pub_env_path(&out_path);
+    if let Some(parent) = pub_path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    if !pub_path.exists() {
+        std::fs::write(&pub_path, wist_center::config::default_pub_config_text())?;
+        println!("generated site (pub) declaration: {}", pub_path.display());
+    }
+    if !env_path.exists() {
+        std::fs::write(&env_path, wist_center::config::default_env_text())?;
+        println!("generated site (pub) values: {}", env_path.display());
+    }
     println!("generated center config: {}", out_path.display());
     println!("admin token: {admin_token}");
     println!("  —— 管理页面登录 token，请妥善保存（生产环境别写进仓库/工单）");

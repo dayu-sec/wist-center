@@ -1,4 +1,4 @@
-// WarpInsightCenter 状态存储：PostgreSQL 实现（开发期）。
+// WistCenter 状态存储：PostgreSQL 实现（开发期）。
 // 连接 compose 提供的 postgres:16（127.0.0.1:55432，demo/demo，库 insight_demo），
 // schema 由 docker/initdb/01_schema.sql 在首次启动时建表。
 

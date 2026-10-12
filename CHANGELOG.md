@@ -5,6 +5,31 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.11.0-alpha] - 2026-10-13
+
+### 新增
+
+- **公开版本端点 `GET /api/v1/version`**（**无鉴权**）：返回编译期版本（`CARGO_PKG_VERSION`），
+  供页面左下角常驻显示「前端 + 后端」两个版本号（未登录也要能看）。与网关侧同口径。
+
+### 变更
+
+- **网关安装脚本（`curl … | bash`）适配 gwlinkd 配置分层**（需 `wist-gwlinkd >= 0.9.0`）：
+  现场选择写进 values 后由 `scripts/init-gwlinkd-pub.sh` 按缺写入 `identity/gwlinkd/pub.env`
+  （**`.env` 形态**的现场态，升级 / 重渲**永不覆盖**）；新增 `GWLINKD_IDENTITY_DIR`，中心信任锚路径改为
+  `identity/gwlinkd/control-center.pem`；网关环回面信任锚 `GATEWAY_SELF_CA` 随身份归位改指
+  `identity/gateway/public/gateway-ca.crt.pem`（旧值指向已废弃的 `configs/gateway/state/gateway-ca.crt.pem`，
+  会让 gwlinkd 启动即报「读取信任锚失败」）；`service install` 追加 `--pub-config`（否则进程拿不到现场态路径，
+  会报“未接入上级”）。
+- **配置分层（三文件 recipe，对齐 `foundation/layered-config-recipe.md`）**：站点事实
+  `[server] public_url` 从主配置改成**现场态**，按「声明 / 值」分开：声明 `wist-center-pub.toml`
+  只写 `${VAR}` 引用、不含值（可随版本重渲）；真值在同目录 `.env`（唯一写者，绝不重渲）。
+  加载改用共享 crate **`wist-config`**（`LayerSpec` + `load_layered_toml`）：「进程环境 > 同目录 `.env`」
+  插值 `${VAR}` → 与主配置**无重复叶子**合并；未定义且无默认 → 拒启。
+  `init-config` 一并写出声明 + `.env` 骨架；`wist-center.toml` 模板与 `examples/local-dev.toml` 去掉
+  `public_url`。注：旧现场若主配置仍带 `public_url`，与声明撞键会**拒启** —— 重渲一次主配置即可。
+  env `WARP_INSIGHT_CENTER_PUBLIC_URL` 仍可覆盖。
+
 ## [0.10.0-alpha] - 2026-10-11
 
 ### 变更

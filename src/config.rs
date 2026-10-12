@@ -1,8 +1,10 @@
-// WarpInsightCenter 运行配置（配置文件 + 环境变量，参考 wist-gateway）。
+// WistCenter 运行配置（配置文件 + 环境变量，参考 wist-gateway）。
 //
 // 加载顺序（后者覆盖前者）：
 //   1. 配置文件（默认 ~/.wist-center/wist-center.toml，可用 WIST_CENTER_CONFIG 指定）；
 //      文件不存在则跳过这一层 —— 零配置也能跑（纯 env + 内置默认值）。
+//      它是**可重渲的交付物**；站点现场事实（`[server] public_url`）另在**现场态**配置里
+//      （`wist-center-pub.toml`，或 WIST_CENTER_PUB_CONFIG 指定），两份合并、**叶子键重复即拒**。
 //   2. 环境变量 WARP_INSIGHT_CENTER_*（沿用既有契约）。
 //   3. 代码内置默认值。
 //
@@ -31,6 +33,25 @@ const CONFIG_ENV: &str = "WIST_CENTER_CONFIG";
 /// 显式指定密钥文件（**绝对路径**）；未设则用 orion 默认
 /// `./.galaxy/sec_value.yml` → `~/.galaxy/sec_value.yml`。
 const SEC_FILE_ENV: &str = "WIST_CENTER_SEC_FILE";
+
+/// 指向**现场态声明**的 env：显式设了就用它（相对路径按主配置目录解析）；
+/// 未设则取**主配置同目录**的约定文件名（存在才用）。
+const PUB_CONFIG_ENV: &str = "WIST_CENTER_PUB_CONFIG";
+/// 现场态**声明**的约定文件名：只写 `${VAR}` 引用，**不含现场值**（⇒ 可入库、可重渲）。
+const PUB_CONFIG_FILE_NAME: &str = "wist-center-pub.toml";
+/// 现场态**值**文件名：与声明同目录（docker-compose 的 `.env` 口径）。
+const PUB_ENV_FILE_NAME: &str = ".env";
+/// 指向现场态 `.env` 的 env（`--env-file` 对应物，相对声明目录）。
+const PUB_ENV_FILE_ENV: &str = "WIST_CENTER_ENV_FILE";
+
+/// 本组件的「分层配置」约定 —— 交给共享 crate `wist-config` 干活
+/// （主配置 + 现场态声明 `${VAR}` 插值 + 同目录 `.env`）。
+const LAYER: wist_config::LayerSpec = wist_config::LayerSpec {
+    overlay_file: PUB_CONFIG_FILE_NAME,
+    overlay_env: PUB_CONFIG_ENV,
+    values_file: PUB_ENV_FILE_NAME,
+    values_env: PUB_ENV_FILE_ENV,
+};
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:3100";
 const DEFAULT_STORE_PATH: &str = "state/warp-insight-center-store.json";
@@ -86,9 +107,10 @@ pub struct CenterConfig {
     /// 时序历史 VictoriaMetrics 基地址（如 compose 的 `http://127.0.0.1:8428`）。
     /// 有值 → 每次状态上报额外推送指标；未设置/为空 → 不启用（仅存快照）。
     pub victoriametrics_url: Option<String>,
-    /// center 对外地址（生成网关初始化 URL），默认 `https://center.warpinsight.example`，
-    /// 部署时通过配置文件的 `server.public_url` 或 `WARP_INSIGHT_CENTER_PUBLIC_URL` 配置
-    /// 真实域名或 IP。
+    /// center 对外地址（生成网关初始化 URL），默认 `https://center.warpinsight.example`。
+    /// **现场态**：声明在 `<主配置同目录>/wist-center-pub.toml`（或 `WIST_CENTER_PUB_CONFIG` 指定的
+    /// 路径）的 `[server] public_url`，它是一个 `${VAR}` 引用；真值来自「进程环境 > 同目录 `.env`」
+    /// （`.env` 落点可用 `WIST_CENTER_ENV_FILE` 指定）。`WARP_INSIGHT_CENTER_PUBLIC_URL`（env）优先。
     /// 注意：该主机名/IP 必须落在控制中心服务器证书的 SAN 内，否则 server_tls_required=true 时
     /// 网关对 init_url 的 TLS 主机名校验会失败。
     pub public_url: String,
@@ -227,6 +249,16 @@ pub fn resolved_config_path() -> PathBuf {
     }
 }
 
+/// 现场态**声明**的落点（供 `init-config` / 诊断定位）。
+pub fn pub_config_path(config_path: &Path) -> PathBuf {
+    wist_config::overlay_path(config_path, &LAYER)
+}
+
+/// 现场态**值**（`.env`）的落点（供 `init-config` 定位）。
+pub fn pub_env_path(config_path: &Path) -> PathBuf {
+    wist_config::values_path(&pub_config_path(config_path), &LAYER)
+}
+
 /// 由仓库内模板（wist-center.toml）渲染默认配置文本：把两个 ${...} 占位符替换成
 /// 新生成的随机值，保证 `init-config` 产出的配置不含可预测/共享的默认凭据。
 /// 模板是生成配置形状的唯一来源 —— 改模板即改生成结果。
@@ -236,6 +268,40 @@ pub fn default_config_text(admin_token: &str, hmac_secret: &str) -> String {
         .replace("${WIST_CENTER_HMAC_SECRET}", hmac_secret)
 }
 
+/// `wist-center init-config` 一并写出的默认**现场态声明**文本（`wist-center-pub.toml` 骶架）：
+/// 只有 `${VAR}` 引用、**不含现场值**（真值在同目录 `.env`）。
+pub fn default_pub_config_text() -> String {
+    DEFAULT_PUB_CONFIG_TEMPLATE.to_string()
+}
+
+/// `wist-center init-config` 一并写出的默认**现场态值**文本（`.env` 骶架）。
+///
+/// 声明里的 `${VAR}` 是 fail-closed 的（未定义即拒启）—— 先把变量名摆上、值留空，
+/// 现场就有一个明确要填的文件，而不会「一启动就报未定义」。
+pub fn default_env_text() -> String {
+    DEFAULT_ENV_TEMPLATE.to_string()
+}
+
+/// 默认**现场态声明**骶架（由 [`default_pub_config_text`] 返回）。
+const DEFAULT_PUB_CONFIG_TEMPLATE: &str = r#"# wist-center 现场态**声明** —— 只写 `${VAR}` 引用，**不含现场值**。
+#
+# 本文件是**模板**：由栈侧 tpl 机制（或 `init-config`）生成到 `wist-center-pub.toml`；
+# 与其它交付物同一套渲染（重渲 / 升级动不到现场，因为值不在这里）。
+# 真值在同目录的 `.env`（docker-compose 口径：`.env` 挨着本文件；**进程环境优先**）。
+# `${VAR}` 未定义且没给 `:-默认值` → 中心拒启（fail-closed）。
+
+[server]
+# 中心对外地址：用于生成网关初始化 URL，必须落在控制中心服务器证书的 SAN 内。
+public_url = "${CENTER_PUBLIC_URL:-https://center.warpinsight.example}"
+"#;
+
+/// 默认**现场态值**骶架（由 [`default_env_text`] 返回）。
+const DEFAULT_ENV_TEMPLATE: &str = r#"# wist-center 现场态**值** —— 与同目录 wist-center-pub.toml 里的 ${VAR} 一一对应。
+# 由 `init-config` / 栈侧 `scripts/init-center-pub.sh` 按缺写入；升级 / 重渲不动它。
+
+CENTER_PUBLIC_URL=
+"#;
+
 impl CenterConfig {
     /// 读 resolved_config_path()：文件缺失/字段缺失时回落到环境变量与内置默认值。
     pub fn load_from_env() -> Result<Self, ConfigError> {
@@ -244,22 +310,20 @@ impl CenterConfig {
 
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let config_path = absolutize_config_path(path.as_ref())?;
-        let mut raw = match fs::read_to_string(&config_path) {
-            Ok(content) => toml::from_str::<RawCenterConfig>(&content).map_err(|err| {
-                config_parse(format!(
-                    "failed to parse config {}: {err}",
-                    config_path.display()
-                ))
-            })?,
-            // 没有配置文件也能跑：纯 env + 默认值（开发态/`cargo test` 常用）。
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => RawCenterConfig::default(),
-            Err(err) => {
-                return Err(config_io(format!(
-                    "failed to read config {}: {err}",
-                    config_path.display()
-                )));
-            }
+        // 主配置 + 现场态**声明**（`${VAR}` 插值自「进程环境 > 同目录 `.env`」）+ 无重复叶子合并，
+        // 全部交给共享 crate `wist-config`（与 gateway / gwlinkd 同一套口径）。
+        // 主配置缺失仍可跑（零配置：纯 env + 内置默认值）。
+        let doc: toml::Value = if config_path.is_file() {
+            wist_config::load_layered_toml(&config_path, &LAYER)?
+        } else {
+            toml::Value::Table(Default::default())
         };
+        let mut raw: RawCenterConfig = doc.try_into().map_err(|err| {
+            config_parse(format!(
+                "failed to parse config {}: {err}",
+                config_path.display()
+            ))
+        })?;
         // 先展开文件里的 ${VAR}（含密钥文件里的 ${SEC_...}），再让 env 覆盖（env 的值是字面量，不再二次展开）。
         let env = secret_dict()?;
         expand_raw_env(&mut raw, &env)?;
@@ -875,6 +939,85 @@ listen_addr = ""
         assert!(text.contains("hmac_secret = \"hmac_test\""));
         assert!(!text.contains("${WIST_CENTER_ADMIN_TOKEN}"));
         assert!(!text.contains("${WIST_CENTER_HMAC_SECRET}"));
+    }
+
+    // ─────────── 主配置 + 现场态声明 / 值（三文件） ───────────
+
+    /// 写一份主配置到唯一临时目录，返回主配置路径（现场态声明 / `.env` 由调用方按需写）。
+    fn write_main_config(content: &str) -> PathBuf {
+        write_temp_config(content)
+    }
+
+    /// 在 `dir` 里写现场态**声明**（`${VAR}`）与**值**（`.env`）——模拟栈侧 tpl + 脚本的产物。
+    fn write_overlay(dir: &Path, declaration: &str, env_text: &str) {
+        fs::write(dir.join(PUB_CONFIG_FILE_NAME), declaration).expect("write overlay");
+        fs::write(dir.join(PUB_ENV_FILE_NAME), env_text).expect("write .env");
+    }
+
+    #[test]
+    fn loads_the_public_url_through_the_overlay_and_env_file() {
+        let _guard = env_guard();
+        let path = write_main_config("[server]\nlisten_addr = \"127.0.0.1:3100\"\n");
+        let dir = path.parent().unwrap();
+        write_overlay(
+            dir,
+            "[server]\npublic_url = \"${WIST_CENTER_TEST_URL}\"\n",
+            "WIST_CENTER_TEST_URL=https://center.example.test\n",
+        );
+        let config = CenterConfig::load_from_path(&path).expect("load");
+        assert_eq!(config.public_url, "https://center.example.test");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_absent_overlay_leaves_public_url_defaulted() {
+        let _guard = env_guard();
+        let path = write_main_config("[server]\nlisten_addr = \"127.0.0.1:3100\"\n");
+        let config = CenterConfig::load_from_path(&path).expect("load");
+        assert_eq!(config.public_url, DEFAULT_PUBLIC_URL);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn the_same_leaf_key_in_both_files_is_rejected() {
+        let _guard = env_guard();
+        let path = write_main_config(
+            "[server]\nlisten_addr = \"127.0.0.1:3100\"\npublic_url = \"https://a\"\n",
+        );
+        let dir = path.parent().unwrap();
+        write_overlay(
+            dir,
+            "[server]\npublic_url = \"${WIST_CENTER_TEST_URL}\"\n",
+            "WIST_CENTER_TEST_URL=https://b\n",
+        );
+        let err = CenterConfig::load_from_path(&path).expect_err("同一叶子键出现在两份里必须报错");
+        assert!(format!("{err}").contains("同一个键只能有一处"), "{err}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_unset_overlay_var_fails_closed() {
+        let _guard = env_guard();
+        let path = write_main_config("[server]\nlisten_addr = \"127.0.0.1:3100\"\n");
+        let dir = path.parent().unwrap();
+        // 声明引用了变量，但 `.env` 没给它、也没 `:-默认值` → 拒启（不静默变空）。
+        write_overlay(
+            dir,
+            "[server]\npublic_url = \"${WIST_CENTER_TEST_URL}\"\n",
+            "",
+        );
+        let err = CenterConfig::load_from_path(&path).expect_err("未定义变量必须拒启");
+        assert!(format!("{err}").contains("WIST_CENTER_TEST_URL"), "{err}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn default_pub_config_text_declares_the_site_key() {
+        let text = default_pub_config_text();
+        assert!(text.contains("public_url"), "{text}");
+        assert!(text.contains("${CENTER_PUBLIC_URL"), "{text}");
+        let paths = config_key_paths(&text);
+        assert!(paths.iter().any(|p| p == "server.public_url"), "{paths:?}");
     }
 
     /// 示例配置必须始终可加载：它给人复制粘贴用，键名一漂移就会误导使用者。

@@ -130,16 +130,27 @@ In the file:
 - every key maps to the environment variable of the same meaning in the table below, so the file is
   simply a place to put the values that should outlive a shell. (`enrollment.gateway_credentials`
   is a TOML array of `gateway_id:token` entries; the variable takes the same entries comma-joined.)
+- the file is the **rendered / deliverable** half. The site fact `server.public_url` lives in the
+  **site layer**, split into a **declaration** and its **values**: the declaration
+  (`wist-center-pub.toml`, next to this one, or the path given by `WARP_INSIGHT_CENTER_PUB_CONFIG`)
+  holds only the `${VAR}` reference; the value comes from the process environment or the sibling
+  `.env` (next to the declaration, or the path given by `WARP_INSIGHT_CENTER_ENV_FILE`). The
+  declaration is loaded **alongside** the main file: sections may overlap, but a **leaf key in both
+  files is refused at startup** (a key has exactly one owner). Re-rendering the main file therefore
+  never clobbers the site's public URL, and re-rendering the declaration never clobbers the value
+  (the value is not in there).
 
 ### Environment variables
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `WARP_INSIGHT_CENTER_LISTEN` | `127.0.0.1:3100` | HTTP listen address. |
-| `WARP_INSIGHT_CENTER_PUBLIC_URL` | `https://center.warpinsight.example` | Externally reachable base URL, used to build the gateway init URL. Must fall inside the control-center certificate SANs. |
+| `WARP_INSIGHT_CENTER_PUBLIC_URL` | `https://center.warpinsight.example` | Externally reachable base URL, used to build the gateway init URL. Must fall inside the control-center certificate SANs. Overrides the site layer. |
 | `WARP_INSIGHT_CENTER_HMAC_SECRET` | dev placeholder | HMAC-SHA256 key used to derive RegistTokens. **Must be set in production.** Rotating it does not invalidate existing credentials, since only the derived hashes are stored. |
 | `WARP_INSIGHT_CENTER_DATABASE_URL` | *(unset)* | PostgreSQL DSN. Unset or empty → JSON file store. |
 | `WARP_INSIGHT_CENTER_STORE_PATH` | `state/warp-insight-center-store.json` (under the config-file directory) | JSON store path. |
+| `WARP_INSIGHT_CENTER_PUB_CONFIG` | `wist-center-pub.toml` (next to the config file) | Path to the site-layer **declaration** (only `${VAR}` references, no values). Loaded alongside the main file; the same leaf key in both → startup refused. `init-config` writes a skeleton. |
+| `WARP_INSIGHT_CENTER_ENV_FILE` | `.env` (next to the declaration) | Path to the site-layer **values** file interpolated into the declaration's `${VAR}` (process environment wins over it). `init-config` writes a skeleton. |
 | `WARP_INSIGHT_CENTER_VICTORIAMETRICS_URL` | *(unset)* | VictoriaMetrics base URL. Unset or empty → no time-series push. |
 | `WARP_INSIGHT_CENTER_GATEWAY_CREDENTIALS` | *(unset)* | `gateway_id:token,...` seeds written into the store at boot when missing. |
 | `WARP_INSIGHT_CENTER_CREDENTIAL_TTL_SECONDS` | `2592000` (30 days) | Gateway **client-certificate** lifetime (register/renew). |

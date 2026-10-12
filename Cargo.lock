@@ -4201,7 +4201,7 @@ dependencies = [
 
 [[package]]
 name = "wist-center"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "async-trait",
  "aws-sdk-s3",
@@ -4231,12 +4231,24 @@ dependencies = [
  "tokio-rustls 0.26.5",
  "toml",
  "tower",
+ "wist-config",
  "wist-control",
  "wist-error",
  "wist-log",
  "wist-release",
  "wist-shared",
  "x509-parser",
+]
+
+[[package]]
+name = "wist-config"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5142e160e51e452c633df571b7f30a334823530afabff340cb0cf923ef43353"
+dependencies = [
+ "orion-error",
+ "toml",
+ "wist-error",
 ]
 
 [[package]]

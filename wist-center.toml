@@ -15,8 +15,9 @@
 
 [server]
 listen_addr = "127.0.0.1:3100"
-# 中心对外地址：用于生成网关初始化 URL，必须落在控制中心服务器证书的 SAN 内。
-public_url = "https://center.warpinsight.example"
+# 中心对外地址（public_url）**不在这里**：它是站点现场事实，写在**现场态**里，且分「声明 / 值」：
+# 声明 `wist-center-pub.toml` 只写 `${VAR}`（可随版本重渲；落点用 WIST_CENTER_PUB_CONFIG 指定），
+# 真值在同目录 `.env`（永不重渲；落点用 WIST_CENTER_ENV_FILE 指定）。
 # 网关 ↔ 中心 wire 协议版本（写入网关 config.toml 的 [protocol] version）。
 protocol_version = "1.0"
 # 管理面 token。留空 = 不要求鉴权（仅开发态）；生产必须设置。

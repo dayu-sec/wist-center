@@ -4656,11 +4656,14 @@ mod tests {
             "gw-script",
             "WEB_DOMAIN",
             "gw.example.com",
-            // 宿主侧接入器：安装段 + 系统服务托管。
+            // 宿主侧接入器：安装段 + 系统服务托管（主配置 + **现场态**两条路径都要显式给）。
             "wist-gwlinkd",
             "service install --system",
-            "control_center_endpoint",
-            "gwlinkd.toml",
+            "GWLINKD_GATEWAY_ID",
+            "GWLINKD_IDENTITY_DIR",
+            "configs/gwlinkd/gwlinkd.toml",
+            "identity/gwlinkd/gwlinkd-pub.toml",
+            "--pub-config",
         ] {
             assert!(body.contains(needle), "script missing `{needle}`:\n{body}");
         }

@@ -17,9 +17,14 @@
 # 监听地址。只绑回环 = 仅本机可访问；对外提供服务时要改。
 listen_addr = "127.0.0.1:3100"
 
-# 中心对外基地址：用来拼网关的初始化 URL，必须落在控制中心服务器证书的 SAN 内，
-# 否则网关在 server_tls_required=true 时对 init_url 的 TLS 主机名校验会失败。
-public_url = "https://center.warpinsight.example"
+# 中心对外基地址（public_url）**不在这里**：它是站点现场事实，写在同目录的**现场态**里，
+# 且分「声明 / 值」—— 声明 `wist-center-pub.toml` 只写 `${VAR}` 引用（可随版本重渲），
+# 真值在同目录 `.env`（永不重渲）。例如声明：
+#   [server]
+#   public_url = "${CENTER_PUBLIC_URL}"
+# 对应 `.env`：CENTER_PUBLIC_URL=https://center.example
+# 必须落在控制中心服务器证书的 SAN 内，否则网关在 server_tls_required=true 时
+# 对 init_url 的 TLS 主机名校验会失败。
 
 # 网关 ↔ 中心 wire 协议版本（写进网关 config.toml 的 [protocol] version，两侧要一致）。
 protocol_version = "1.0"

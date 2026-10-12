@@ -1,4 +1,4 @@
-// WarpInsightCenter 状态存储：Store trait + 双实现。
+// WistCenter 状态存储：Store trait + 双实现。
 // - FileStore：JSON 文件快照（镜像 wist-gateway AdminStore），测试/无 PG 回退路径。
 // - PgStore：PostgreSQL（开发期，见 pg_store.rs）。
 // 持有每网关的凭证（sha256 hash）与最新上报状态（version/status/health/last_seen_at），

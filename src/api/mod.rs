@@ -1,4 +1,4 @@
-// WarpInsightCenter 管理面 / 网关面 HTTP API。
+// WistCenter 管理面 / 网关面 HTTP API。
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -27,6 +27,7 @@ mod gateway_ops;
 mod install_script;
 mod rate_limit;
 mod rollout;
+mod version;
 
 use admin_ops::{
     admin_advance_upgrade_plan, admin_approve_upgrade_plan, admin_bind_gateway_customer,
@@ -150,6 +151,8 @@ pub fn router(
 /// 以给定 state 构建路由（测试与运行共用）。
 pub fn router_for(state: ApiState) -> Router {
     Router::new()
+        // 中心版本（**公开、无鉴权**）：页面左下角常驻显示前后端版本，未登录也要答。见 api/version.rs。
+        .route("/api/v1/version", get(version::center_version))
         // 网关面：ReceiveGatewayStatusReport
         .route("/api/v1/gateway/status", post(submit_gateway_status))
         // 网关面：Gateway 上报其下 Agent 状态
