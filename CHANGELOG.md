@@ -5,6 +5,25 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.12.0-alpha] - 2026-10-13
+
+### 变更
+
+- **去掉 `~/.wist-center/` 这个隐藏默认落点**：中心配置与 CA 路径不再依赖 `$HOME/.wist-center/`。
+  - 默认配置文件：`~/.wist-center/wist-center.toml` → **当前目录的 `wist-center.toml`**（与 gateway 同口径）；
+  - 控制中心 CA（`security.ca_cert_path` 的默认）→ **`<配置目录>/ca/control-center.pem`**；
+  - 网关客户端 CA（**CA-G** 的默认）→ **`<配置目录>/ca/gateway-client-ca.{pem,key.pem}`**。
+  于是发布态只需把站点身份目录只读挂到 `<配置目录>/ca` 即可 —— CA-G **存在就只读加载、不写盘**。
+  模板 / 示例的 `ca_cert_path` 改为相对写法 `ca/control-center.pem`。
+- **网关安装脚本**：目标机侧存中心 CA 的 `$HOME/.wist-center/ca` → **`$HOME/.wist/ca`**。
+
+### 修复
+
+- **容器内 `$HOME` 不可写导致启动崩溃**：中心默认在 `$HOME/.wist-center/ca` 生成 CA-G，而镜像里
+  `wist` 是系统用户、`/home/wist` 不存在且 `/home` 属 root → `failed to create /home/wist/.wist-center/ca:
+  Permission denied`（容器反复重启、`/api` 拿不到）。改为「配置目录」基准后，只要把 CA-G 放进
+  `<配置目录>/ca`（发布态 = 只读挂载的 `identity/center/`）就不再尝试写盘，崩溃从根上消失。
+
 ## [0.11.0-alpha] - 2026-10-13
 
 ### 新增

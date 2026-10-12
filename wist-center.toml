@@ -1,7 +1,7 @@
 # wist-center 运行配置。
 #
 # 加载顺序（后者覆盖前者）：
-#   1. 本文件（默认 ~/.wist-center/wist-center.toml；可用 WIST_CENTER_CONFIG 指向别处。
+#   1. 本文件（默认**当前目录**的 wist-center.toml；可用 WIST_CENTER_CONFIG 指向别处。
 #      文件不存在则跳过这一层 —— 零配置也能跑，用默认值 + 环境变量）
 #   2. 环境变量 WARP_INSIGHT_CENTER_*（沿用既有契约，覆盖同名项）
 #   3. 代码内置默认值
@@ -44,9 +44,9 @@ hmac_secret = "${WIST_CENTER_HMAC_SECRET}"
 credential_ttl_seconds = 2592000
 # 一次性接入券（link）的**短 TTL** 秒数：过期即不可用，需重新「生成/轮换」；900 = 15 分钟。
 link_ttl_seconds = 900
-# 控制中心 CA 证书（分发给网关作 control_center.trust_bundle）。
-# ${HOME} 由加载时展开（HOME 未设置会直接报错）；文件不存在 → 不提供信任根。
-ca_cert_path = "${HOME}/.wist-center/ca/control-center.pem"
+# 控制中心 CA 证书（分发给网关作 control_center.trust_bundle）。相对路径按本文件所在目录解析；
+# 文件不存在 → 不提供信任根。
+ca_cert_path = "ca/control-center.pem"
 
 [artifacts]
 # 版本发布制品落盘目录（未启用对象存储时）。

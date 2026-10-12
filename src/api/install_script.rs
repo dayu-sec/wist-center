@@ -289,7 +289,7 @@ CENTER_URL='__CENTER_URL__'
 GATEWAY_ID='__GATEWAY_ID__'
 PROJECT_NAME='__PROJECT_NAME__'
 INSTALL_DIR="${HOME}/bin"
-CA_DIR="$HOME/.wist-center/ca"
+CA_DIR="$HOME/.wist/ca"
 CA_CENTER="$CA_DIR/control-center.pem"
 CA_BUNDLE="$CA_DIR/ca-bundle.pem"
 

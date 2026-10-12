@@ -49,9 +49,9 @@ This produces the `wist-center` binary in `target/release/`.
 cargo run
 ```
 
-With no configuration at all, the service listens on `127.0.0.1:3100`, keeps state under
-`~/.wist-center/state/`, and runs *without* admin authentication — that mode is for local
-development only.
+With no configuration at all, the service listens on `127.0.0.1:3100`, keeps its state under the
+config file's directory (`<config dir>/state/`; with no config file, that is the working
+directory), and runs *without* admin authentication — that mode is for local development only.
 
 To bring up PostgreSQL and VictoriaMetrics as well:
 
@@ -61,7 +61,7 @@ docker compose up -d          # PostgreSQL :55432, VictoriaMetrics :8428
 export WARP_INSIGHT_CENTER_DATABASE_URL=postgres://demo:demo@127.0.0.1:55432/insight_demo
 export WARP_INSIGHT_CENTER_VICTORIAMETRICS_URL=http://127.0.0.1:8428
 # Admin token is NOT an env var: set `server.admin_token` in the config file
-# (e.g. ~/.wist-center/wist-center.toml). Leave it empty → local dev runs with no auth.
+# (e.g. ./wist-center.toml). Leave it empty → local dev runs with no auth.
 
 cargo run
 ```
@@ -77,7 +77,7 @@ Exported variables only last for that shell, so the admin token changes on every
 around, use a config file instead:
 
 ```bash
-wist-center init-config          # ~/.wist-center/wist-center.toml, random admin token + HMAC secret
+wist-center init-config          # ./wist-center.toml, random admin token + HMAC secret
 cargo run
 ```
 
@@ -89,9 +89,9 @@ See [Configuration](#configuration).
 Settings are resolved in three layers, each overriding the one before it; see
 [`src/config.rs`](src/config.rs) for the full definition.
 
-1. the TOML file at `~/.wist-center/wist-center.toml` (point `WIST_CENTER_CONFIG` elsewhere to
-   change that; a missing file is simply skipped, so the binary also runs on environment variables
-   alone),
+1. the TOML file at `./wist-center.toml` (relative to the working directory; point
+   `WIST_CENTER_CONFIG` elsewhere to change that; a missing file is simply skipped, so the binary
+   also runs on environment variables alone),
 2. `WARP_INSIGHT_CENTER_*` environment variables,
 3. built-in defaults.
 
@@ -100,7 +100,7 @@ Settings are resolved in three layers, each overriding the one before it; see
 Generate a file rather than hand-editing one — `init-config` fills in freshly random credentials:
 
 ```bash
-wist-center init-config                      # ~/.wist-center/wist-center.toml
+wist-center init-config                      # ./wist-center.toml
 wist-center init-config /etc/wist-center.toml
 ```
 
@@ -113,8 +113,7 @@ A ready-to-run example, with every key spelled out and the production caveats in
 [`examples/local-dev.toml`](examples/local-dev.toml):
 
 ```bash
-mkdir -p ~/.wist-center
-cp examples/local-dev.toml ~/.wist-center/wist-center.toml
+cp examples/local-dev.toml ./wist-center.toml
 ```
 
 Its values are the built-in defaults (`admin_token = "dev-admin-token"` is a weak dev-only value),
@@ -160,7 +159,8 @@ In the file:
 | `WARP_INSIGHT_CENTER_OBJECT_STORAGE_BUCKET` | *(unset)* | Bucket that holds release artifacts. |
 | `WARP_INSIGHT_CENTER_OBJECT_STORAGE_ACCESS_KEY` | *(unset)* | Object-storage access key. |
 | `WARP_INSIGHT_CENTER_OBJECT_STORAGE_SECRET_KEY` | *(unset)* | Object-storage secret key. |
-| `WARP_INSIGHT_CENTER_CA_CERT_PATH` | `~/.wist-center/ca/control-center.pem` | Trust root handed to gateways as their trust bundle. Missing file → no trust bundle. |
+| `WARP_INSIGHT_CENTER_CA_CERT_PATH` | `<config dir>/ca/control-center.pem` | Trust root handed to gateways as their trust bundle. Missing file → no trust bundle. |
+| `WARP_INSIGHT_CENTER_GATEWAY_CLIENT_CA_CERT_PATH` / `..._KEY_PATH` | `<config dir>/ca/gateway-client-ca.{pem,key.pem}` | The **gateway client-certificate CA (CA-G)**, separate from the server CA. Read if present; generated in place only when **both** are missing. |
 | `WARP_INSIGHT_CENTER_SERVER_CERT_PATH` | *(unset)* | Server TLS certificate (PEM). Set **together with** the key → the center serves HTTPS and verifies gateway client certificates (CA-G); unset → plain HTTP. |
 | `WARP_INSIGHT_CENTER_SERVER_KEY_PATH` | *(unset)* | Server TLS private key (PEM). |
 | `WARP_INSIGHT_CENTER_PROTOCOL_VERSION` | `1.0` | Gateway ↔ center wire protocol version. |

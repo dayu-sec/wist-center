@@ -1,7 +1,7 @@
 // WistCenter 运行配置（配置文件 + 环境变量，参考 wist-gateway）。
 //
 // 加载顺序（后者覆盖前者）：
-//   1. 配置文件（默认 ~/.wist-center/wist-center.toml，可用 WIST_CENTER_CONFIG 指定）；
+//   1. 配置文件（默认**当前目录**的 wist-center.toml，可用 WIST_CENTER_CONFIG 指定）；
 //      文件不存在则跳过这一层 —— 零配置也能跑（纯 env + 内置默认值）。
 //      它是**可重渲的交付物**；站点现场事实（`[server] public_url`）另在**现场态**配置里
 //      （`wist-center-pub.toml`，或 WIST_CENTER_PUB_CONFIG 指定），两份合并、**叶子键重复即拒**。
@@ -26,7 +26,7 @@ use wist_error::{ConfigError, ConfigReason};
 
 use crate::infra::sha256_hex;
 
-/// 默认配置文件名（放在默认配置目录 ~/.wist-center/ 下）。
+/// 默认配置文件名（相对**当前工作目录**；不再有 `~/.wist-center/` 这个隐藏默认）。
 const CONFIG_FILE: &str = "wist-center.toml";
 /// 指向配置文件的 env（未设置/为空 → 用 default_config_path）。
 const CONFIG_ENV: &str = "WIST_CENTER_CONFIG";
@@ -122,7 +122,7 @@ pub struct CenterConfig {
     pub object_storage: Option<ObjectStorageConfig>,
     /// 控制中心 CA 证书内容（control-center.pem，信任根）——分发给 Gateway 作为
     /// control_center.trust_bundle。来源：配置文件的 `security.ca_cert_path` 或
-    /// `WARP_INSIGHT_CENTER_CA_CERT_PATH`，默认 `~/.wist-center/ca/control-center.pem`；
+    /// `WARP_INSIGHT_CENTER_CA_CERT_PATH`，默认 `<配置目录>/ca/control-center.pem`；
     /// 文件不存在 → None。
     pub ca_cert: Option<String>,
     /// 网关↔中心 wire 协议版本（config.toml [protocol] version）。
@@ -229,15 +229,10 @@ struct RawEnrollmentConfig {
     gateway_credentials: Vec<String>,
 }
 
-/// 默认配置文件路径：`~/.wist-center/wist-center.toml`。
-/// HOME 缺失/为空 → 退化为当前工作目录下的同名文件。
+/// 默认配置文件路径：**当前工作目录**下的 `wist-center.toml`（与 gateway 同口径）。
+/// 不再有 `~/.wist-center/` 这个隐藏默认 —— 路径一律由调用方 / `WIST_CENTER_CONFIG` 显式给出。
 pub fn default_config_path() -> PathBuf {
-    match env::var("HOME") {
-        Ok(home) if !home.trim().is_empty() => {
-            PathBuf::from(home).join(".wist-center").join(CONFIG_FILE)
-        }
-        _ => PathBuf::from(CONFIG_FILE),
-    }
+    PathBuf::from(CONFIG_FILE)
 }
 
 /// 本次启动实际读取的配置文件路径（`WIST_CENTER_CONFIG` 优先，否则默认路径）。
@@ -361,11 +356,11 @@ impl CenterConfig {
             }
             _ => None,
         };
-        // 信任根：显式配置的证书路径（按配置目录解析）→ 默认 ~/.wist-center/ca/；
+        // 信任根：显式配置的证书路径（按配置目录解析）→ 默认 <配置目录>/ca/control-center.pem；
         // 文件读不到 → None（不阻断启动，只是不向网关分发信任根）。
         let ca_cert_path = normalize_optional(security.ca_cert_path)
             .map(|path| absolutize_path(config_dir, Path::new(&path)))
-            .unwrap_or_else(default_ca_cert_path);
+            .unwrap_or_else(|| default_ca_cert_path(config_dir));
         // 运行日志：`[log] file` 的相对路径按**配置文件所在目录**解析（与 wist-gateway / wist-gwlinkd 同口径）。
         let mut log = raw.log;
         if let Some(file) = log.file.take() {
@@ -468,22 +463,26 @@ impl CenterConfig {
     }
 }
 
-/// 默认控制中心 CA 证书路径（信任根，分发给网关作 control_center.trust_bundle）。
-fn default_ca_cert_path() -> PathBuf {
-    PathBuf::from(env::var("HOME").unwrap_or_default())
-        .join(".wist-center")
-        .join("ca")
-        .join("control-center.pem")
+/// 默认控制中心 CA 证书路径（信任根，分发给网关作 control_center.trust_bundle）：
+/// **配置目录**下的 `ca/control-center.pem`（相对配置目录解析，与其它相对路径同口径）。
+fn default_ca_cert_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("ca").join("control-center.pem")
 }
 
 /// 网关客户端证书 CA（**CA-G**）私钥/证书路径。
 ///
-/// 默认 `~/.wist-center/ca/gateway-client-ca.{pem,key.pem}`；可用
-/// `WARP_INSIGHT_CENTER_GATEWAY_CLIENT_CA_CERT_PATH` / `..._KEY_PATH` 覆盖。
+/// 默认 **配置目录**下的 `ca/gateway-client-ca.{pem,key.pem}`（与 `control-center.pem` 同处）；
+/// 可用 `WARP_INSIGHT_CENTER_GATEWAY_CLIENT_CA_CERT_PATH` / `..._KEY_PATH` 覆盖。
 /// 与服务器证书的 CA（control-center.pem）**单开**。
-pub fn resolved_gateway_client_ca_paths() -> (PathBuf, PathBuf) {
-    let dir = PathBuf::from(env::var("HOME").unwrap_or_default())
-        .join(".wist-center")
+///
+/// `gateway_ca::load_or_create` 的语义：两文件都在 → **只读加载**；**都缺**才生成并写盘
+/// （缺一不重生，以免换 CA 使已签证书失效）。所以把这对文件放进**只读**挂载（发布态
+/// `identity/center/`）即可 —— 存在就读，不写。
+pub fn resolved_gateway_client_ca_paths(config_path: &Path) -> (PathBuf, PathBuf) {
+    let dir = config_path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
         .join("ca");
     let cert = env::var("WARP_INSIGHT_CENTER_GATEWAY_CLIENT_CA_CERT_PATH")
         .ok()
@@ -1022,16 +1021,14 @@ listen_addr = ""
 
     /// 示例配置必须始终可加载：它给人复制粘贴用，键名一漂移就会误导使用者。
     /// 这里刻意不走 load_from_path 的 env 覆盖（那条路径由 env_overrides_file_values 覆盖），
-    /// 断言只反映示例文件本身，不读外层 shell 导出的变量；唯一依赖是 ${HOME}
-    /// （示例用它表达默认 CA 路径），因此要求运行环境有 HOME。
+    /// 断言只反映示例文件本身，不读外层 shell 导出的变量（示例里已无 `${VAR}` 占位）。
     #[test]
     fn bundled_example_config_loads() {
         // 与设环境的测试串行：secret_dict() 会读 SEC_FILE_ENV，避免踩到并发测试的临时值。
         let _guard = env_guard();
         let mut raw: RawCenterConfig =
             toml::from_str(include_str!("../examples/local-dev.toml")).expect("示例应能解析");
-        // 示例要能直接跑：其中的 ${VAR} 必须是正常会话下一定存在的（目前只有 ${HOME}）；
-        // 变量缺失时 expand 会直接报错，这里就拦住。
+        // 示例里的 ${VAR}（如果有）必须能在正常环境下展开；缺失时 expand 会直接报错，这里就拦住。
         let env = secret_dict().expect("构建密钥表");
         expand_raw_env(&mut raw, &env).expect("示例里的占位符必须能在正常环境下展开");
         let config_dir = Path::new("/tmp/wist-center-example");

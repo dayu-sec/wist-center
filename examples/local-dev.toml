@@ -1,6 +1,6 @@
 # wist-center 示例配置：本地开发可直接用。
 #
-#   mkdir -p ~/.wist-center && cp examples/local-dev.toml ~/.wist-center/wist-center.toml
+#   cp examples/local-dev.toml wist-center.toml     #（或用 WIST_CENTER_CONFIG 指向它）
 #
 # 这里是"手写配置"的路子：每个键都摊开写清楚，值就是代码里的内置默认值
 # （只有 admin_token 是额外给本地开发用的弱值），所以删掉任何一行都不影响启动。
@@ -65,8 +65,8 @@ credential_ttl_seconds = 2592000
 link_ttl_seconds = 900
 
 # 控制中心 CA 证书（信任根，分发给网关作 control_center.trust_bundle）。
-# ${HOME} 由加载时展开（HOME 未设置会直接报错）；留空 → 用代码内置默认（同一路径）。
-ca_cert_path = "${HOME}/.wist-center/ca/control-center.pem"
+# 相对路径按本文件所在目录解析；留空 → 用代码内置默认（同一路径）。
+ca_cert_path = "ca/control-center.pem"
 
 [artifacts]
 # 版本发布制品落盘目录（未启用对象存储时）。

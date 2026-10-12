@@ -84,7 +84,7 @@ async fn run_main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .clone()
         .zip(config.server_key_path.clone());
     let (gateway_ca_cert_path, gateway_ca_key_path) =
-        wist_center::config::resolved_gateway_client_ca_paths();
+        wist_center::config::resolved_gateway_client_ca_paths(&config_path);
     let gateway_ca = Arc::new(
         wist_center::infra::gateway_ca::load_or_create(&gateway_ca_cert_path, &gateway_ca_key_path)
             .map_err(|err| -> Box<dyn Error + Send + Sync> { err.into() })?,
