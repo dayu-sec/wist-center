@@ -34,6 +34,8 @@ codes! {
     CERTIFICATE_NOT_REGISTERED => "certificate_not_registered",
     CERTIFICATE_REQUIRED => "certificate_required",
     CLIENT_CERTIFICATE_PERSIST_FAILED => "client_certificate_persist_failed",
+    COS_PATH_REQUIRED => "cos_path_required",
+    COS_RESOLVE_FAILED => "cos_resolve_failed",
     CREDENTIAL_ID_GENERATION_FAILED => "credential_id_generation_failed",
     ENROLLMENT_TOKEN_CONSUME_FAILED => "enrollment_token_consume_failed",
     ENROLLMENT_TOKEN_REJECTED => "enrollment_token_rejected",
@@ -57,7 +59,7 @@ codes! {
     GATEWAY_ONLINE_CANNOT_ARCHIVE => "gateway_online_cannot_archive",
     GATEWAY_STATUS_UPDATE_FAILED => "gateway_status_update_failed",
     GATEWAY_STORE_UNAVAILABLE => "gateway_store_unavailable",
-    INSTALL_SCRIPT_UNAVAILABLE => "install_script_unavailable",
+    INSTALL_ALL_UNAVAILABLE => "install_all_unavailable",
     INSTALL_TOKEN_EXPIRED => "install_token_expired",
     INVALID_ACTION => "invalid_action",
     INVALID_ADMIN_BEARER_TOKEN => "invalid_admin_bearer_token",
@@ -127,7 +129,7 @@ mod tests {
         assert_eq!(RELEASE_NOT_FOUND, "release_not_found");
         assert_eq!(INVALID_LINK_TOKEN, "invalid_link_token");
         assert_eq!(GATEWAY_STORE_UNAVAILABLE, "gateway_store_unavailable");
-        assert_eq!(INSTALL_SCRIPT_UNAVAILABLE, "install_script_unavailable");
+        assert_eq!(INSTALL_ALL_UNAVAILABLE, "install_all_unavailable");
     }
 
     /// 词表自身：全是非空 `snake_case` 且取值互不重复。

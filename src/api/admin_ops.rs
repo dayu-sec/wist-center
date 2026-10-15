@@ -48,11 +48,14 @@ pub struct GatewayInstallInfo {
     pub trust_bundle_pem: Option<String>,
     /// 服务端生成的 curl 验证命令：Bearer 用接入 token + 网关自生成身份调 init_url。
     pub init_curl: String,
-    /// 脚本安装命令（`curl ... | bash`）：在目标主机上装 gops/gx 并拉起 gateway-stack。
+    /// 全量安装命令（`curl ... | bash`）：在目标主机上装 gops/gx 并拉起 gateway-stack。
     /// URL 里带同一张一次性接入券（回执交付后 s 刷新即丢，可随时重新生成/轮换）。
-    pub install_script_command: String,
+    pub install_all_command: String,
     /// 前置环境准备命令（`curl ... | bash`）：补 tar/docker/docker compose 等；无需令牌，可先于安装单独跑。
     pub prepare_command: String,
+    /// 「只装 gwlinkd」命令（`curl ... | bash`）：**网关已部署**时只补装宿主侧 `wist-gwlinkd`
+    /// （不装 gops/gx/gateway-stack）。URL 里带同一张一次性接入券（短命，刷新即丢）。
+    pub install_linkd_command: String,
 }
 
 /// 创建网关实例返回：**仅实例视图**。接入凭据不在 create 响应里交付（设计 §6/§8），
@@ -199,13 +202,16 @@ fn build_install_info(state: &ApiState, gateway_id: &str, link_token: &str) -> G
         link_token: link_token.to_string(),
         trust_bundle_pem: state.config.ca_cert.clone(),
         init_curl,
-        install_script_command: super::install_script::build_install_script_command(
+        install_all_command: super::install::build_install_all_command(
             &state.config.public_url,
             gateway_id,
             link_token,
         ),
-        prepare_command: super::install_script::build_prepare_script_command(
+        prepare_command: super::install::build_prepare_script_command(&state.config.public_url),
+        install_linkd_command: super::install::build_install_linkd_command(
             &state.config.public_url,
+            gateway_id,
+            link_token,
         ),
     }
 }
@@ -1165,6 +1171,45 @@ pub async fn admin_resolve_github_release(
             StatusCode::BAD_GATEWAY,
             super::codes::RELEASE_RESOLVE_FAILED,
             "failed to resolve release",
+            err,
+        ),
+    }
+}
+
+/// 腾讯 COS 路径解析请求体。
+#[derive(serde::Deserialize)]
+pub struct ResolveCosRequest {
+    pub cos_path: String,
+}
+
+/// 解析腾讯 COS 路径：POST /api/v1/admin/cos/resolve。
+/// 从 `wist-1347593047/wist-gwlinkd/v0.9.3-alpha`（bucket + `component/version` 前缀）列出对象，
+/// 返回每个制品的下载地址 / sha256 / 平台；镜像 GitHub resolver，供录入页一键填充多平台制品。
+pub async fn admin_resolve_cos(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    client: PeerConnectInfo,
+    ApiJson(request): ApiJson<ResolveCosRequest>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    let cos_path = request.cos_path.trim();
+    if cos_path.is_empty() {
+        return super::error::ApiError::bad_request(
+            super::codes::COS_PATH_REQUIRED,
+            "cos_path must not be empty",
+        )
+        .into_response();
+    }
+    // 制品桶公有读：解析不需凭据，也不依赖中心的对象存储配置（见 `infra::cos`）。
+    match crate::infra::resolve_cos_path(cos_path).await {
+        Ok(resolved) => Json(resolved).into_response(),
+        Err(err) => super::error::internal_response(
+            StatusCode::BAD_GATEWAY,
+            super::codes::COS_RESOLVE_FAILED,
+            "failed to resolve cos path",
             err,
         ),
     }
@@ -4512,10 +4557,10 @@ mod tests {
         }
     }
 
-    /// 脚本安装：一次性接入券有效 → 返回 shell 脚本（含 gops/gx/gateway-stack 地址与六步流程）；
+    /// 全量安装：一次性接入券有效 → 返回 shell 脚本（含 gops/gx/gateway-stack 地址与六步流程）；
     /// 券无效 → 401。
     #[tokio::test]
-    async fn install_script_serves_script_for_a_valid_one_time_token() {
+    async fn install_all_serves_script_for_a_valid_one_time_token() {
         use axum::{body::Body, http::Request};
         use http_body_util::BodyExt;
         use tower::ServiceExt;
@@ -4524,7 +4569,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("time")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("wic-install-script-{nanos}.json"));
+        let path = std::env::temp_dir().join(format!("wic-install-all-{nanos}.json"));
         let state = create_state_with_store(FileStore::new(&path));
 
         // 预置三个组件的最新「已发布」制品（脚本会据此填下载地址）。
@@ -4598,22 +4643,19 @@ mod tests {
         let rotated = rotate_link_token(&app, "gw-script").await;
         let token = rotated.install.link_token.clone();
         assert!(
-            rotated
-                .install
-                .install_script_command
-                .contains("curl -fsSLk"),
+            rotated.install.install_all_command.contains("curl -fsSLk"),
             "command: {}",
-            rotated.install.install_script_command
+            rotated.install.install_all_command
         );
         assert!(
             rotated
                 .install
-                .install_script_command
-                .contains("/api/v1/gateway/install-script"),
+                .install_all_command
+                .contains("/api/v1/gateway/install-all"),
             "command: {}",
-            rotated.install.install_script_command
+            rotated.install.install_all_command
         );
-        assert!(rotated.install.install_script_command.contains("token="));
+        assert!(rotated.install.install_all_command.contains("token="));
 
         // 取脚本（正确 token）→ 200 + shell 脚本。
         let response = app
@@ -4621,7 +4663,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/api/v1/gateway/install-script?gateway_id=gw-script&token={token}&domain=gw.example.com"
+                        "/api/v1/gateway/install-all?gateway_id=gw-script&token={token}&domain=gw.example.com"
                     ))
                     .body(Body::empty())
                     .expect("request"),
@@ -4673,7 +4715,123 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/gateway/install-script?gateway_id=gw-script&token=wrong")
+                    .uri("/api/v1/gateway/install-all?gateway_id=gw-script&token=wrong")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// 「只装 gwlinkd」：一次性接入券有效 → 返回只装宿主接入器的 shell 脚本；
+    /// 该端点**只**需 wist-gwlinkd 已发布（不依赖 gops/gx/gateway-stack）；券无效 → 401。
+    #[tokio::test]
+    async fn install_linkd_serves_script_without_gateway_packages() {
+        use axum::{body::Body, http::Request};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("wic-install-linkd-{nanos}.json"));
+        let state = create_state_with_store(FileStore::new(&path));
+
+        // 只发布宿主接入器：install-linkd 不应依赖 gops/gx/gateway-stack。
+        let base = "http://127.0.0.1:3100/api/v1/releases/artifact";
+        state
+            .store
+            .publish_release(
+                "wist-gwlinkd",
+                "0.9.3",
+                &format!(
+                    "{base}/wist-gwlinkd/0.9.3/wist-gwlinkd-0.9.3-aarch64-apple-darwin.tar.gz"
+                ),
+                Some("cafe"),
+                Some("aarch64-apple-darwin"),
+            )
+            .await
+            .expect("publish gwlinkd");
+
+        let app = super::super::router_for(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/admin/gateways/instances")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer admin-tok")
+                    .body(Body::from(create_payload("gw-linkd")))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let rotated = rotate_link_token(&app, "gw-linkd").await;
+        let token = rotated.install.link_token.clone();
+        assert!(
+            rotated
+                .install
+                .install_linkd_command
+                .contains("curl -fsSLk")
+                && rotated
+                    .install
+                    .install_linkd_command
+                    .contains("/api/v1/gateway/install-linkd")
+                && rotated.install.install_linkd_command.contains("token="),
+            "command: {}",
+            rotated.install.install_linkd_command
+        );
+
+        // 取脚本（正确 token）→ 200 + shell 脚本。
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/gateway/install-linkd?gateway_id=gw-linkd&token={token}"
+                    ))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes()
+                .to_vec(),
+        )
+        .expect("utf8");
+        for needle in [
+            "gops sys localize",
+            "wist-gwlinkd",
+            "service install --system",
+            "--pub-config",
+            "configs/gwlinkd/gwlinkd.toml",
+            "identity/gwlinkd/gwlinkd-pub.toml",
+            "STACK_DIR",
+            "gw-linkd",
+            "aarch64-apple-darwin",
+        ] {
+            assert!(body.contains(needle), "script missing `{needle}`:\n{body}");
+        }
+
+        // 券无效 → 401。
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/gateway/install-linkd?gateway_id=gw-linkd&token=wrong")
                     .body(Body::empty())
                     .expect("request"),
             )

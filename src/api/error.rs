@@ -297,7 +297,7 @@ mod tests {
     /// 默认严重度 / 可重试性由 `status` 推出。
     #[test]
     fn severity_and_retryable_default_from_status() {
-        let unavailable = ApiError::unavailable(codes::INSTALL_SCRIPT_UNAVAILABLE, "down");
+        let unavailable = ApiError::unavailable(codes::INSTALL_ALL_UNAVAILABLE, "down");
         let value = serde_json::to_value(ProtocolErrorEnvelope::new(unavailable.body)).unwrap();
         assert_eq!(value["error"]["severity"], serde_json::json!("error"));
         assert_eq!(value["error"]["retryable"], serde_json::json!(true));

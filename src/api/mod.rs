@@ -24,7 +24,7 @@ pub mod error;
 pub use error::{ApiError, ProtocolError, ProtocolErrorEnvelope, Severity};
 mod extract;
 mod gateway_ops;
-mod install_script;
+mod install;
 mod rate_limit;
 mod rollout;
 mod version;
@@ -36,9 +36,10 @@ use admin_ops::{
     admin_get_gateway_initial_config, admin_get_gateway_uptime, admin_list_gateway_agents,
     admin_list_gateway_instances, admin_list_gateway_lifecycle, admin_list_gateway_status,
     admin_list_releases, admin_list_upgrade_plans, admin_publish_release,
-    admin_publish_release_batch, admin_resolve_github_release, admin_retry_upgrade_plan,
-    admin_rotate_gateway_link_token, admin_set_gateway_archived, admin_set_release_status,
-    admin_show_gateway_status, admin_view_gateway_list, admin_view_upgrade_plan,
+    admin_publish_release_batch, admin_resolve_cos, admin_resolve_github_release,
+    admin_retry_upgrade_plan, admin_rotate_gateway_link_token, admin_set_gateway_archived,
+    admin_set_release_status, admin_show_gateway_status, admin_view_gateway_list,
+    admin_view_upgrade_plan,
 };
 use gateway_ops::{
     download_release_artifact, get_gateway_initial_config, get_gateway_upgrade_plan,
@@ -162,12 +163,17 @@ pub fn router_for(state: ApiState) -> Router {
         // 网关面：前置环境准备脚本（curl ... | bash）——公开、无令牌（补 tar/docker/compose）
         .route(
             "/api/v1/gateway/prepare-script",
-            get(install_script::get_gateway_prepare_script),
+            get(install::get_gateway_prepare_script),
         )
-        // 网关面：脚本安装（curl ... | bash）——一次性接入券鉴权，返回 shell 脚本
+        // 网关面：全量安装（curl ... | bash）——一次性接入券鉴权，返回 shell 脚本
         .route(
-            "/api/v1/gateway/install-script",
-            get(install_script::get_gateway_install_script),
+            "/api/v1/gateway/install-all",
+            get(install::get_gateway_install_all),
+        )
+        // 网关面：只装宿主侧 gwlinkd（网关已部署时用；curl ... | bash）——一次性接入券鉴权
+        .route(
+            "/api/v1/gateway/install-linkd",
+            get(install::get_gateway_install_linkd),
         )
         // 网关面：链接上级 link-upstream（初始化 URL 指向此端点；返回 application/json）
         .route(
@@ -297,6 +303,8 @@ pub fn router_for(state: ApiState) -> Router {
             "/api/v1/admin/github-release/resolve",
             post(admin_resolve_github_release),
         )
+        // 管理面：解析腾讯 COS 路径（列对象 + 每制品地址 / sha256 / 平台，供录入页一键填充）
+        .route("/api/v1/admin/cos/resolve", post(admin_resolve_cos))
         // 管理面：改托管状态（published / expired）
         .route(
             "/api/v1/admin/releases/{component}/{version}/status",

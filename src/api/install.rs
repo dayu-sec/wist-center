@@ -1,4 +1,4 @@
-// 网关「脚本安装」：GET /api/v1/gateway/install-script?gateway_id=<id>&token=<token>
+// 网关「全量安装」：GET /api/v1/gateway/install-all?gateway_id=<id>&token=<token>
 //
 // 面向脚本安装形态的网关实例：中心生成一段可直接 `curl ... | bash` 的安装脚本，脚本在目标主机上
 // 把 gops / gx（取中心**最新已发布**制品）装好，再用它们拉取并启动 gateway-stack：
@@ -24,8 +24,8 @@ use crate::infra::{ReleasePackageRecord, group_release_packages, sha256_hex};
 
 use super::{ApiState, PeerConnectInfo, extract::ApiQuery, rate_limit};
 
-/// 脚本安装端点限流桶：token 在 URL 里，独立桶防暴力枚举。
-const GATEWAY_INSTALL_SCRIPT_SCOPE: &str = "gateway-install-script";
+/// 全量安装端点限流桶：token 在 URL 里，独立桶防暴力枚举。
+const GATEWAY_INSTALL_ALL_SCOPE: &str = "gateway-install-all";
 
 /// 需要解析「最新已发布」制品的组件：gops、gx、部署栈、宿主接入器。
 const GOPS_COMPONENT: &str = "galaxy-ops";
@@ -46,15 +46,11 @@ pub struct InstallScriptQueryParams {
     pub domain: Option<String>,
 }
 
-/// 生成脚本安装命令（放进安装指引，供 admin 页面展示/复制）。
-/// 形如 `curl -fsSLk '<center>/api/v1/gateway/install-script?gateway_id=..&token=..' | bash`。
-pub fn build_install_script_command(
-    public_url: &str,
-    gateway_id: &str,
-    link_token: &str,
-) -> String {
+/// 生成「全量安装」命令（放进安装指引，供 admin 页面展示/复制）。
+/// 形如 `curl -fsSLk '<center>/api/v1/gateway/install-all?gateway_id=..&token=..' | bash`。
+pub fn build_install_all_command(public_url: &str, gateway_id: &str, link_token: &str) -> String {
     let endpoint = format!(
-        "{}/api/v1/gateway/install-script?gateway_id={}&token={}",
+        "{}/api/v1/gateway/install-all?gateway_id={}&token={}",
         public_url.trim_end_matches('/'),
         url_encode(gateway_id),
         url_encode(link_token),
@@ -65,79 +61,31 @@ pub fn build_install_script_command(
 }
 
 /// 取脚本：校验一次性接入券（只校验不消费）→ 解析最新制品 → 渲染脚本。
-pub async fn get_gateway_install_script(
+/// 取全量安装脚本：GET /api/v1/gateway/install-all（一次性接入券鉴权，返回 shell 脚本）。
+pub async fn get_gateway_install_all(
     State(state): State<ApiState>,
     client: PeerConnectInfo,
     ApiQuery(params): ApiQuery<InstallScriptQueryParams>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Some(response) =
-        rate_limit::check_rate_limit(&state, &client_key, GATEWAY_INSTALL_SCRIPT_SCOPE)
+        rate_limit::check_rate_limit(&state, &client_key, GATEWAY_INSTALL_ALL_SCOPE)
     {
         return response;
     }
-    let gateway_id = params.gateway_id.trim();
-    if gateway_id.is_empty() {
-        return super::error::ApiError::bad_request(
-            super::codes::GATEWAY_ID_REQUIRED,
-            "gateway_id must not be empty",
-        )
-        .into_response();
-    }
-    let Some(token) = params
-        .token
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-    else {
-        rate_limit::record_auth_failure(&state, &client_key, GATEWAY_INSTALL_SCRIPT_SCOPE);
-        return super::error::ApiError::unauthorized(
-            super::codes::MISSING_INSTALL_TOKEN,
-            "missing install token",
-        )
-        .with_no_store()
-        .into_response();
+    // 一次性接入券：网关存在、券 hash 匹配、未过期。**只校验不消费**（券留给 link-upstream）。
+    let (gateway_id, _token) = match validate_install_request(
+        &state,
+        &client_key,
+        GATEWAY_INSTALL_ALL_SCOPE,
+        params.gateway_id.as_str(),
+        params.token.as_deref(),
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(response) => return response,
     };
-    // 校验一次性接入券：网关存在、券 hash 匹配、未过期。**不消费**（留给 link-upstream）。
-    let gateway = match state.store.get_gateway(gateway_id).await {
-        Ok(Some(gateway)) => gateway,
-        Ok(None) => {
-            rate_limit::record_auth_failure(&state, &client_key, GATEWAY_INSTALL_SCRIPT_SCOPE);
-            return super::error::ApiError::unauthorized(
-                super::codes::UNKNOWN_GATEWAY,
-                "unknown gateway",
-            )
-            .with_no_store()
-            .into_response();
-        }
-        Err(err) => {
-            return super::error::internal_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                super::codes::GATEWAY_STORE_UNAVAILABLE,
-                "failed to load gateway store",
-                err.display_chain(),
-            );
-        }
-    };
-    if gateway.link_token_hash.is_empty() || sha256_hex(token) != gateway.link_token_hash {
-        rate_limit::record_auth_failure(&state, &client_key, GATEWAY_INSTALL_SCRIPT_SCOPE);
-        return super::error::ApiError::unauthorized(
-            super::codes::INVALID_INSTALL_TOKEN,
-            "invalid install token",
-        )
-        .with_no_store()
-        .into_response();
-    }
-    if link_token_expired(gateway.link_token_expires_at.as_deref()) {
-        rate_limit::record_auth_failure(&state, &client_key, GATEWAY_INSTALL_SCRIPT_SCOPE);
-        return super::error::ApiError::unauthorized(
-            super::codes::INSTALL_TOKEN_EXPIRED,
-            "install token expired",
-        )
-        .with_no_store()
-        .into_response();
-    }
-    rate_limit::clear_auth_failures(&state, &client_key, GATEWAY_INSTALL_SCRIPT_SCOPE);
 
     let gops = match latest_published_package(&state, GOPS_COMPONENT).await {
         Ok(package) => package,
@@ -152,7 +100,7 @@ pub async fn get_gateway_install_script(
         Err(response) => return response,
     };
     let (Some(gops), Some(gx), Some(stack)) = (gops, gx, stack) else {
-        return super::error::ApiError::unavailable(super::codes::INSTALL_SCRIPT_UNAVAILABLE, "install script unavailable: publish galaxy-ops / galaxy-flow / wist-gateway-stack releases first")
+        return super::error::ApiError::unavailable(super::codes::INSTALL_ALL_UNAVAILABLE, "install-all unavailable: publish galaxy-ops / galaxy-flow / wist-gateway-stack releases first")
             .into_response();
     };
     // 宿主接入器：**可选** —— 未发布时脚本照常生成，只是跳过这一步（见脚本内的可读提示）。
@@ -161,9 +109,9 @@ pub async fn get_gateway_install_script(
         Err(response) => return response,
     };
 
-    let script = render_install_script(
+    let script = render_install_all_script(
         state.config.public_url.trim_end_matches('/'),
-        gateway_id,
+        &gateway_id,
         &gops,
         &gx,
         &stack,
@@ -277,8 +225,8 @@ fn url_encode(value: &str) -> String {
     out
 }
 
-/// 脚本模板：用占位符替换（避免 `format!` 与 shell 花括号打架）。
-const SCRIPT_TEMPLATE: &str = r#"#!/usr/bin/env bash
+/// 全量安装脚本模板：用占位符替换（避免 `format!` 与 shell 花括号打架）。
+const INSTALL_ALL_SCRIPT_TEMPLATE: &str = r#"#!/usr/bin/env bash
 # WistCenter · 网关脚本安装（gateway_id=__GATEWAY_ID__）
 #
 # 由中心自动生成：装 gops / gx（取中心最新发布制品）→ gops prj new → prj import gateway-stack
@@ -382,14 +330,14 @@ sha256_of() {
 install_component() {
   name="$1"; url="$2"; want_sha="${3:-}"; dest="${4:-$INSTALL_DIR}"; use_sudo="${5:-}"
   d="$(mktemp -d)"
-  log "下载 $name：$url"
+  log "下载 ${name}：$url"
   curl -fsSL "${CURL_TLS[@]}" "$url" -o "$d/pkg"
   if [ -n "$want_sha" ]; then
     have="$(sha256_of "$d/pkg" || true)"
     if [ -z "$have" ]; then
       log "提示：本机无 sha256sum/shasum，跳过 $name 的摘要校验"
     elif [ "$have" != "$want_sha" ]; then
-      echo "下载校验失败 $name：期望 $want_sha，实际 $have" >&2
+      echo "下载校验失败 ${name}：期望 ${want_sha}，实际 $have" >&2
       rm -rf "$d"; return 1
     fi
   fi
@@ -407,7 +355,7 @@ install_component() {
   elif [ -d "$d/artifacts" ]; then
     $use_sudo install -m 0755 "$d"/artifacts/* "$dest"/
   elif [ "$(head -c 2 "$d/pkg" 2>/dev/null | od -An -tx1 | tr -d ' \n')" = "1f8b" ]; then
-    echo "解包 $name 失败（$url）：tar 与 python3 均不可用？" >&2
+    echo "解包 $name 失败（${url}）：tar 与 python3 均不可用？" >&2
     rm -rf "$d"; return 1
   else
     $use_sudo install -m 0755 "$d/pkg" "$dest/$name"
@@ -469,7 +417,7 @@ if [ -z "${GATEWAY_SELF_ENDPOINT:-}" ]; then
   if [ "$GATEWAY_PORT_VALUE" = "443" ]; then GATEWAY_SELF_ENDPOINT="https://127.0.0.1"
   else GATEWAY_SELF_ENDPOINT="https://127.0.0.1:$GATEWAY_PORT_VALUE"; fi
 fi
-set_value "$VALUES_FILE" CENTER_ENDPOINT "$CENTER_URL"
+set_value "$VALUES_FILE" GWLINKD_CENTER_ENDPOINT "$CENTER_URL"
 set_value "$VALUES_FILE" GWLINKD_GATEWAY_ID "$GATEWAY_ID"
 set_value "$VALUES_FILE" GWLINKD_TRUST_BUNDLE "$STACK_DIR/identity/gwlinkd/control-center.pem"
 # 身份材料（客户端证书 + 私钥、中心信任锚）落 identity/：不可再生 ⇒ 进 contract（不进交付包）。
@@ -532,11 +480,11 @@ else
   fi
 
   if [ ! -f "$GWLINKD_TOML" ]; then
-    echo "未找到渲染后的 $GWLINKD_TOML（localize 没跑成？）—— 无法安装 wist-gwlinkd。" >&2
+    echo "未找到渲染后的 ${GWLINKD_TOML}（localize 没跑成？）—— 无法安装 wist-gwlinkd。" >&2
     exit 1
   fi
   if [ ! -f "$GWLINKD_PUB" ]; then
-    echo "未找到现场态配置 $GWLINKD_PUB（localize 没跑成？）—— 无法安装 wist-gwlinkd。" >&2
+    echo "未找到现场态配置 ${GWLINKD_PUB}（localize 没跑成？）—— 无法安装 wist-gwlinkd。" >&2
     exit 1
   fi
 
@@ -545,10 +493,10 @@ else
   if [ "$(id -u)" != "0" ]; then RUN_AS_OPT="--run-as $DEPLOY_USER"; fi
   $SUDO "$GWLINKD_BIN" service install --system $RUN_AS_OPT --bin "$GWLINKD_BIN" --config "$GWLINKD_TOML" --pub-config "$GWLINKD_PUB" --force
   $SUDO "$GWLINKD_BIN" service status --system || true
-  log "wist-gwlinkd 已安装并常驻（user=$DEPLOY_USER，config=$GWLINKD_TOML，pub=$GWLINKD_PUB）；到网关页「链接上级」完成接入（gateway_id=$GATEWAY_ID）"
+  log "wist-gwlinkd 已安装并常驻（user=${DEPLOY_USER}，config=${GWLINKD_TOML}，pub=${GWLINKD_PUB}）；到网关页「链接上级」完成接入（gateway_id=${GATEWAY_ID}）"
 fi
 
-log "完成：工程 $PROJECT_ROOT（gateway_id=$GATEWAY_ID）"
+log "完成：工程 ${PROJECT_ROOT}（gateway_id=${GATEWAY_ID}）"
 "#;
 
 /// 域名清洗：只留 `[A-Za-z0-9.-]`（空/无有效字符 → `None`）。
@@ -562,9 +510,9 @@ fn sanitize_domain(domain: Option<&str>) -> Option<String> {
     (!cleaned.is_empty()).then_some(cleaned)
 }
 
-/// 渲染安装脚本：把中心地址、网关身份、各组件制品（地址 + 摘要）与域名填进模板。
+/// 渲染全量安装脚本：把中心地址、网关身份、各组件制品（地址 + 摘要）与域名填进模板。
 #[allow(clippy::too_many_arguments)]
-fn render_install_script(
+fn render_install_all_script(
     center_url: &str,
     gateway_id: &str,
     gops: &ReleasePackageRecord,
@@ -588,7 +536,7 @@ fn render_install_script(
         ),
         None => (String::new(), String::new()),
     };
-    SCRIPT_TEMPLATE
+    INSTALL_ALL_SCRIPT_TEMPLATE
         .replace("__CENTER_URL__", &shell_single_quote_escape(center_url))
         .replace("__GATEWAY_ID__", &shell_single_quote_escape(gateway_id))
         .replace(
@@ -709,3 +657,342 @@ pub async fn get_gateway_prepare_script(
     )
         .into_response()
 }
+
+// ─────────────────────────── 「只装 gwlinkd」（网关已部署时） ───────────────────────────
+
+/// 「只装 gwlinkd」端点限流桶：与完整安装脚本分开计数（token 在 URL 里，独立桶防暴力枚举）。
+const GATEWAY_INSTALL_LINKD_SCOPE: &str = "gateway-install-linkd";
+
+/// 「只装 gwlinkd」查询参数：`gateway_id` + 一次性 `token`（无 `domain` —— 不装网关本体）。
+#[derive(serde::Deserialize)]
+pub struct InstallLinkdQueryParams {
+    pub gateway_id: String,
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+/// `install-all` / `install-linkd` 的公共入参校验：非空 `gateway_id` + 一次性接入券。
+/// 券**只校验、不消费**（留给 link-upstream）：网关存在 + 券 hash 匹配 + 未过期。
+/// 失败时按 `scope` 记一次鉴权失败并返回构造好的错误响应；成功时清失败计数。
+#[allow(clippy::result_large_err)]
+async fn validate_install_request(
+    state: &ApiState,
+    client_key: &str,
+    scope: &str,
+    gateway_id_param: &str,
+    token_param: Option<&str>,
+) -> Result<(String, String), Response> {
+    let gateway_id = gateway_id_param.trim().to_string();
+    if gateway_id.is_empty() {
+        return Err(super::error::ApiError::bad_request(
+            super::codes::GATEWAY_ID_REQUIRED,
+            "gateway_id must not be empty",
+        )
+        .into_response());
+    }
+    let Some(token) = token_param.map(str::trim).filter(|t| !t.is_empty()) else {
+        rate_limit::record_auth_failure(state, client_key, scope);
+        return Err(super::error::ApiError::unauthorized(
+            super::codes::MISSING_INSTALL_TOKEN,
+            "missing install token",
+        )
+        .with_no_store()
+        .into_response());
+    };
+    let gateway = match state.store.get_gateway(&gateway_id).await {
+        Ok(Some(gateway)) => gateway,
+        Ok(None) => {
+            rate_limit::record_auth_failure(state, client_key, scope);
+            return Err(super::error::ApiError::unauthorized(
+                super::codes::UNKNOWN_GATEWAY,
+                "unknown gateway",
+            )
+            .with_no_store()
+            .into_response());
+        }
+        Err(err) => {
+            return Err(super::error::internal_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                super::codes::GATEWAY_STORE_UNAVAILABLE,
+                "failed to load gateway store",
+                err.display_chain(),
+            ));
+        }
+    };
+    if gateway.link_token_hash.is_empty() || sha256_hex(token) != gateway.link_token_hash {
+        rate_limit::record_auth_failure(state, client_key, scope);
+        return Err(super::error::ApiError::unauthorized(
+            super::codes::INVALID_INSTALL_TOKEN,
+            "invalid install token",
+        )
+        .with_no_store()
+        .into_response());
+    }
+    if link_token_expired(gateway.link_token_expires_at.as_deref()) {
+        rate_limit::record_auth_failure(state, client_key, scope);
+        return Err(super::error::ApiError::unauthorized(
+            super::codes::INSTALL_TOKEN_EXPIRED,
+            "install token expired",
+        )
+        .with_no_store()
+        .into_response());
+    }
+    rate_limit::clear_auth_failures(state, client_key, scope);
+    Ok((gateway_id, token.to_string()))
+}
+
+/// 生成「只装 gwlinkd」命令：
+/// `curl -fsSLk '<center>/api/v1/gateway/install-linkd?gateway_id=..&token=..' | bash`。
+pub fn build_install_linkd_command(public_url: &str, gateway_id: &str, link_token: &str) -> String {
+    let endpoint = format!(
+        "{}/api/v1/gateway/install-linkd?gateway_id={}&token={}",
+        public_url.trim_end_matches('/'),
+        url_encode(gateway_id),
+        url_encode(link_token),
+    );
+    format!("curl -fsSLk '{endpoint}' | bash")
+}
+
+/// 取「只装 gwlinkd」脚本：GET /api/v1/gateway/install-linkd（一次性接入券鉴权，返回 shell 脚本）。
+///
+/// 面向**网关已部署**的机器：只补装宿主侧 `wist-gwlinkd`（**不装** gops/gx/gateway-stack）。
+/// 在**已部署的网关工程**里补齐 gwlinkd 配置（走栈的 `gops sys localize`）再装二进制 + 系统服务；
+/// 本脚本**不做接入**（接入仍走网关「链接上级」页/gwlinkd）。
+pub async fn get_gateway_install_linkd(
+    State(state): State<ApiState>,
+    client: PeerConnectInfo,
+    ApiQuery(params): ApiQuery<InstallLinkdQueryParams>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Some(response) =
+        rate_limit::check_rate_limit(&state, &client_key, GATEWAY_INSTALL_LINKD_SCOPE)
+    {
+        return response;
+    }
+    let (gateway_id, _token) = match validate_install_request(
+        &state,
+        &client_key,
+        GATEWAY_INSTALL_LINKD_SCOPE,
+        params.gateway_id.as_str(),
+        params.token.as_deref(),
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    // 本端点**就是**装 gwlinkd：未发布该组件 → 明确不可用（不像完整脚本那样可跳过）。
+    let Some(gwlinkd) = (match latest_published_package(&state, GWLINKD_COMPONENT).await {
+        Ok(package) => package,
+        Err(response) => return response,
+    }) else {
+        return super::error::ApiError::unavailable(
+            super::codes::INSTALL_ALL_UNAVAILABLE,
+            "install-linkd unavailable: publish a wist-gwlinkd release first",
+        )
+        .into_response();
+    };
+    let script = render_linkd_script(
+        state.config.public_url.trim_end_matches('/'),
+        &gateway_id,
+        &gwlinkd,
+        state.config.ca_cert.clone(),
+    );
+    (
+        [(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")],
+        script,
+    )
+        .into_response()
+}
+
+/// 渲染「只装 gwlinkd」脚本：填中心地址、网关身份、宿主接入器制品（地址 + 摘要）与 CA。
+fn render_linkd_script(
+    center_url: &str,
+    gateway_id: &str,
+    gwlinkd: &ReleasePackageRecord,
+    ca_pem: Option<String>,
+) -> String {
+    LINKD_SCRIPT_TEMPLATE
+        .replace("__CENTER_URL__", &shell_single_quote_escape(center_url))
+        .replace("__GATEWAY_ID__", &shell_single_quote_escape(gateway_id))
+        .replace("__GWLINKD_CASE__", &platform_case_branches(gwlinkd))
+        .replace("__GWLINKD_SHA_CASE__", &platform_sha_case_branches(gwlinkd))
+        .replace("__CENTER_CA_PEM__", ca_pem.as_deref().unwrap_or(""))
+}
+
+/// 「只装 gwlinkd」脚本模板：在**已部署的网关工程**里补齐 gwlinkd 配置并装宿主侧接入器。
+///
+/// 定位工程：默认当前目录（gops 工程根，含 `ops-prj.yml`），可用 `STACK_DIR` / `PROJECT_ROOT` 覆盖。
+/// 配置：把 gwlinkd 现场值写进 `values/<stack>/sys_value.yml`，跑 `gops sys localize` 渲染出
+/// `configs/gwlinkd/gwlinkd.toml` 与 `identity/gwlinkd/gwlinkd-pub.toml`（+ `.env`）。
+/// 不做接入：只装二进制 + 系统服务；接入仍由「链接上级」页/gwlinkd 完成。
+const LINKD_SCRIPT_TEMPLATE: &str = r#"#!/usr/bin/env bash
+# WistCenter · 只装宿主侧 wist-gwlinkd（网关已部署时用）
+#
+// 由中心自动生成：在**已部署的网关工程**里补齐 gwlinkd 配置（走栈的 `gops sys localize`）并装
+// 宿主侧接入器。**不装** gops / gx / gateway-stack —— 那些由「全量安装（install-all）」负责。
+# 本脚本**不做接入**：接入仍走网关「链接上级」页（或 gwlinkd 自联）。
+set -euo pipefail
+
+CENTER_URL='__CENTER_URL__'
+GATEWAY_ID='__GATEWAY_ID__'
+CA_DIR="$HOME/.wist/ca"
+CA_CENTER="$CA_DIR/control-center.pem"
+CA_BUNDLE="$CA_DIR/ca-bundle.pem"
+
+log() { printf '\033[1;36m==> %s\033[0m\n' "$*"; }
+mkdir -p "$CA_DIR"
+export PATH="$HOME/bin:$HOME/.local/bin:$PATH"
+
+# 中心 CA（自签）：写盘 + 组「系统根 + 中心CA」bundle（与 install-all 同口径）。
+cat > "$CA_CENTER" <<'WIST_CENTER_CA_EOF'
+__CENTER_CA_PEM__
+WIST_CENTER_CA_EOF
+if grep -q 'BEGIN CERTIFICATE' "$CA_CENTER" 2>/dev/null; then
+  sys_bundle=''
+  for f in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem; do
+    [ -f "$f" ] && sys_bundle="$f" && break
+  done
+  if [ -n "$sys_bundle" ]; then cat "$sys_bundle" "$CA_CENTER" > "$CA_BUNDLE"; else cp "$CA_CENTER" "$CA_BUNDLE"; fi
+  export SSL_CERT_FILE="$CA_BUNDLE" CURL_CA_BUNDLE="$CA_BUNDLE"
+  CURL_TLS=(--cacert "$CA_BUNDLE")
+  log "已载入中心 CA：$CA_BUNDLE"
+else
+  CURL_TLS=(-k)
+  log "中心未提供 CA（明文 / 未配 CA）→ curl 回退 -k"
+fi
+
+# 前置：curl / 解包工具 / gops。
+command -v curl >/dev/null 2>&1 || { echo '缺少 curl' >&2; exit 1; }
+if ! command -v tar >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1; then
+  echo '缺少 tar 与 python3（至少一个用于解包）' >&2; exit 1
+fi
+command -v gops >/dev/null 2>&1 || { echo '缺少 gops（网关由 gops 部署；请确认 PATH 含 $HOME/bin）' >&2; exit 1; }
+
+# 平台探测 → target-triple（与中心制品的平台对齐）。
+case "$(uname -s)/$(uname -m)" in
+  Darwin/arm64)              PLATFORM='aarch64-apple-darwin' ;;
+  Linux/x86_64)              PLATFORM='x86_64-unknown-linux-musl' ;;
+  Linux/aarch64|Linux/arm64) PLATFORM='aarch64-unknown-linux-musl' ;;
+  *) echo "unsupported platform: $(uname -s)/$(uname -m)" >&2; exit 1 ;;
+esac
+
+# 宿主接入器制品地址 / 摘要（按平台，取自中心最新发布 wist-gwlinkd）。
+gwlinkd_url() { case "$PLATFORM" in
+__GWLINKD_CASE__    *) return 1 ;;
+  esac; }
+gwlinkd_sha() { case "$PLATFORM" in
+__GWLINKD_SHA_CASE__    *) return 1 ;;
+  esac; }
+
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}';
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{print $1}';
+  else return 1; fi
+}
+
+# 定位**已部署的网关工程**：默认当前目录（gops 工程根，含 ops-prj.yml）；
+# 可用 STACK_DIR（栈目录）或 PROJECT_ROOT（工程根）覆盖。
+PROJECT_ROOT="$(cd "${PROJECT_ROOT:-$PWD}" && pwd)"
+if [ -n "${STACK_DIR:-}" ]; then
+  STACK_DIR="$(cd "$STACK_DIR" && pwd)"
+elif [ -d "$PROJECT_ROOT/wist-gateway-stack" ]; then
+  STACK_DIR="$PROJECT_ROOT/wist-gateway-stack"
+else
+  echo "找不到网关栈目录：$PROJECT_ROOT/wist-gateway-stack" >&2
+  echo '请在 gops 工程根（含 ops-prj.yml）下运行，或设 STACK_DIR=<栈目录>。' >&2
+  exit 1
+fi
+[ -f "$STACK_DIR/sys-prj.yml" ] || { echo "STACK_DIR 不像网关栈（缺 sys-prj.yml）：$STACK_DIR" >&2; exit 1; }
+VALUES_FILE="$PROJECT_ROOT/values/wist-gateway-stack/sys_value.yml"
+
+# 现场值写进 values（gops 覆盖机制）：一份值，localize 时一致地烘进渲染配置。
+set_value() {
+  local file="$1" key="$2" value="$3"
+  mkdir -p "$(dirname "$file")"
+  if grep -qE "^${key}:" "$file" 2>/dev/null; then
+    sed -E "s|^${key}:.*|${key}: ${value}|" "$file" > "$file.tmp"
+    mv "$file.tmp" "$file"
+  else
+    printf '%s: %s\n' "$key" "$value" >> "$file"
+  fi
+}
+
+# gwlinkd 现场值（与完整安装脚本同一口径）。路径一律**绝对**：gwlinkd 是系统服务，cwd 不确定。
+GATEWAY_PORT_VALUE="$(sed -n 's/^GATEWAY_PORT:[[:space:]]*//p' "$VALUES_FILE" 2>/dev/null | head -n1)"
+[ -n "$GATEWAY_PORT_VALUE" ] || GATEWAY_PORT_VALUE=443
+if [ -z "${GATEWAY_SELF_ENDPOINT:-}" ]; then
+  if [ "$GATEWAY_PORT_VALUE" = "443" ]; then GATEWAY_SELF_ENDPOINT='https://127.0.0.1'
+  else GATEWAY_SELF_ENDPOINT="https://127.0.0.1:$GATEWAY_PORT_VALUE"; fi
+fi
+set_value "$VALUES_FILE" GWLINKD_CENTER_ENDPOINT "$CENTER_URL"
+set_value "$VALUES_FILE" GWLINKD_GATEWAY_ID "$GATEWAY_ID"
+set_value "$VALUES_FILE" GWLINKD_TRUST_BUNDLE "$STACK_DIR/identity/gwlinkd/control-center.pem"
+set_value "$VALUES_FILE" GWLINKD_IDENTITY_DIR "$STACK_DIR/identity/gwlinkd"
+set_value "$VALUES_FILE" GWLINKD_STATE_DIR "$STACK_DIR/configs/gwlinkd/state"
+set_value "$VALUES_FILE" GATEWAY_SELF_ENDPOINT "$GATEWAY_SELF_ENDPOINT"
+set_value "$VALUES_FILE" GATEWAY_SELF_CA "$STACK_DIR/identity/gateway/public/gateway-ca.crt.pem"
+set_value "$VALUES_FILE" GWLINKD_UPGRADER_PROGRAM 'gops'
+set_value "$VALUES_FILE" GWLINKD_UPGRADE_PROJECT_DIR "$PROJECT_ROOT"
+
+# 渲染 gwlinkd 配置（主配置 + 现场态声明/值）—— 复用栈的 localize。
+log 'gops sys localize（渲染 gwlinkd 配置）'
+( cd "$STACK_DIR" && gops sys localize )
+
+# 安装宿主侧 wist-gwlinkd（系统服务常驻，非 root 运行）—— 与完整安装脚本 g) 同口径。
+GWLINKD_URL="$(gwlinkd_url || true)"
+if [ -z "$GWLINKD_URL" ]; then
+  echo "中心未发布本平台（${PLATFORM}）的 wist-gwlinkd 制品 —— 请先在中心「包管理」发布，再重试。" >&2
+  exit 1
+fi
+log '安装 wist-gwlinkd（宿主侧接入器）'
+DEPLOY_USER="$(id -un)"
+if [ "$(id -u)" = "0" ]; then SUDO=''
+elif command -v sudo >/dev/null 2>&1; then SUDO='sudo'
+else echo '安装 wist-gwlinkd 需要 root 或 sudo（写 /usr/local/bin 与系统服务定义）' >&2; exit 1; fi
+
+install_gwlinkd() {
+  url="$1"; want_sha="${2:-}"; use_sudo="${3:-}"; dest='/usr/local/bin'; name='wist-gwlinkd'
+  d="$(mktemp -d)"
+  log "下载 wist-gwlinkd：$url"
+  curl -fsSL "${CURL_TLS[@]}" "$url" -o "$d/pkg"
+  if [ -n "$want_sha" ]; then
+    have="$(sha256_of "$d/pkg" || true)"
+    if [ -z "$have" ]; then log '提示：本机无 sha256sum/shasum，跳过 wist-gwlinkd 的摘要校验';
+    elif [ "$have" != "$want_sha" ]; then echo "下载校验失败 wist-gwlinkd：期望 ${want_sha}，实际 $have" >&2; rm -rf "$d"; return 1; fi
+  fi
+  tar -xzf "$d/pkg" -C "$d" 2>/dev/null || true
+  bin="$(find "$d" -type f -name "$name" -print -quit 2>/dev/null)"
+  if [ -z "$bin" ] && command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import sys,tarfile; tarfile.open(sys.argv[1]).extractall(sys.argv[2])' "$d/pkg" "$d" 2>/dev/null || true
+    bin="$(find "$d" -type f -name "$name" -print -quit 2>/dev/null)"
+  fi
+  if [ -z "$bin" ]; then echo "解包 wist-gwlinkd 失败（${url}）" >&2; rm -rf "$d"; return 1; fi
+  $use_sudo install -m 0755 "$bin" "$dest/$name"
+  rm -rf "$d"
+}
+
+GWLINKD_BIN='/usr/local/bin/wist-gwlinkd'
+GWLINKD_TOML="$STACK_DIR/configs/gwlinkd/gwlinkd.toml"
+GWLINKD_PUB="$STACK_DIR/identity/gwlinkd/gwlinkd-pub.toml"
+GWLINKD_CA="$STACK_DIR/identity/gwlinkd/control-center.pem"
+
+install_gwlinkd "$GWLINKD_URL" "$(gwlinkd_sha || true)" "$SUDO"
+
+# 中心 CA 信任锚：写到渲染配置里 GWLINKD_TRUST_BUNDLE 指向的路径（自签中心必需）。
+if grep -q 'BEGIN CERTIFICATE' "$CA_CENTER" 2>/dev/null; then
+  mkdir -p "$(dirname "$GWLINKD_CA")"
+  install -m 0644 "$CA_CENTER" "$GWLINKD_CA"
+fi
+
+[ -f "$GWLINKD_TOML" ] || { echo "未找到渲染后的 $GWLINKD_TOML —— 该网关栈版本可能还不支持 gwlinkd（请先升级 wist-gateway-stack 再重跑）。" >&2; exit 1; }
+[ -f "$GWLINKD_PUB" ] || { echo "未找到现场态配置 $GWLINKD_PUB —— localize 没跑成？" >&2; exit 1; }
+
+# 装成**系统级服务、非 root 运行**（--run-as）：开机自启 / 崩溃拉起，进程属主 = 部署用户。
+RUN_AS_OPT=''
+if [ "$(id -u)" != "0" ]; then RUN_AS_OPT="--run-as $DEPLOY_USER"; fi
+$SUDO "$GWLINKD_BIN" service install --system $RUN_AS_OPT --bin "$GWLINKD_BIN" --config "$GWLINKD_TOML" --pub-config "$GWLINKD_PUB" --force
+$SUDO "$GWLINKD_BIN" service status --system || true
+log "wist-gwlinkd 已安装并常驻（user=${DEPLOY_USER}，config=${GWLINKD_TOML}，pub=${GWLINKD_PUB}）；到网关页「链接上级」完成接入（gateway_id=${GATEWAY_ID}）"
+log '完成。'
+"#;
