@@ -5,6 +5,27 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.13.0-alpha] - 2026-10-15
+
+### 新增
+
+- **管理面「录入安装包」支持腾讯云 COS 路径一键填充**：`POST /api/v1/admin/cos/resolve` —— 输入
+  `bucket/组件/版本`（或 `cos://…` / 带 region 的下载地址）即返回该版本的各平台制品地址 / sha256 / 平台。
+  无凭据：按发布命名约定拼对象地址、匿名 `HEAD` 校验并读回 `x-cos-meta-artifact-sha256`（region 未指定逐个试）。
+- **网关安装脚本拆出「只装宿主侧 gwlinkd」**：`GET /api/v1/gateway/install-linkd` —— 网关本体已部署时，
+  只补装 / 重装宿主侧 `wist-gwlinkd`（一次性接入券鉴权）。
+
+### 变更
+
+- **安装脚本端点改名**：`/api/v1/gateway/install-script` → **`/api/v1/gateway/install-all`**（语义 = 全量安装）。
+- **安装材料字段同步改名 / 新增**：`install_script_command` → `install_all_command`，并新增 `install_linkd_command`。
+- **错误码改名**：`install_script_unavailable` → **`install_all_unavailable`**；另新增 `cos_path_required` / `cos_resolve_failed`。
+
+### 升级注意
+
+- **需与前端 `wist-center-web >= 0.5.0-alpha` 配套**：页面已改用新端点与新字段 —— 后端与页面不同版会出现
+  「拿不到安装命令」。旧端点 / 旧错误码**不再提供**（调用方需同步改）。
+
 ## [0.12.2-alpha] - 2026-10-14
 
 ### 变更
