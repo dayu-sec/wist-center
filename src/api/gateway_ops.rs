@@ -32,6 +32,11 @@ use super::{
 const GATEWAY_AUTH_SCOPE: &str = "gateway";
 /// 注册自携带 token 鉴权，无网关身份可查，独立限流桶防 token 暴力枚举。
 const GATEWAY_REGISTER_SCOPE: &str = "gateway-register";
+/// gwlinkd 自身的组件名（与 `wist-gwlinkd::upgrade::SELF_COMPONENT` 同值）。
+///
+/// 升级计划里出现它时中心会带上 `artifact_sha256` —— 自更新在进程内直接覆盖自己的二进制，
+/// 需要和地址**同源**的摘要做校验；其余 ① 升级组件仍保持「不带摘要」的既有行为。
+const GWLINKD_COMPONENT: &str = "wist-gwlinkd";
 
 /// 允许 Gateway Web 以 Authorization Header 直接调用初始化端点。
 /// 该端点不使用 Cookie，因此使用通配来源不会扩大用户会话权限；Token 仍只在 Header 中传输。
@@ -383,12 +388,18 @@ async fn upgrade_plan_for(
         None => None,
     };
     let artifact_url = resolved.as_ref().map(|record| record.artifact_url.clone());
-    // 摘要**只**给「agent 包下发」（②）：① 升级路径的取件/校验另有一套（gops / 工具目录），
-    // 现在给它加摘要会改变其既有行为，超出本特性范围。
-    let artifact_sha256 = if plan.action == ACTION_PUSH_AGENT_PACKAGE {
+    // 摘要：②「Agent 包下发」必须带（网关逐平台校验）；① 升级默认不带（gops / tool-copy
+    // 各有既有校验），但 **gwlinkd 自更新例外**：它在进程内直接覆盖自己，
+    // 必须拿到与地址同源的摘要做校验。
+    let self_update = target
+        .as_ref()
+        .is_some_and(|(component, _)| component == GWLINKD_COMPONENT);
+    let artifact_sha256 = if plan.action == ACTION_PUSH_AGENT_PACKAGE || self_update {
         resolved
             .as_ref()
             .and_then(|record| record.package_sha256.clone())
+            // 老记录可能没有摘要：**空串当没有**（否则网关侧 `parse_digest` 会把空串报成「形态不对」）。
+            .filter(|sha| !sha.trim().is_empty())
     } else {
         None
     };
@@ -2103,6 +2114,80 @@ mod tests {
             plan.artifacts.is_empty(),
             "① upgrade 不带多平台清单：网关本机一个平台，用单值 artifact_url"
         );
+    }
+
+    /// gwlinkd 自更新例外：① 升级计划也给它**带摘要**（自更新要校验自己覆盖的字节），
+    /// 其余 ① 组件（如 gateway-stack）仍不带。
+    #[tokio::test]
+    async fn a_gwlinkd_upgrade_plan_carries_the_center_digest() {
+        let digest = "9a1c0d5e7b2a6489f0c1d2e3a4b5c6d7e8f9012345678abcdef0123456789ab";
+        let state = provision_state("link-tok-gwlinkd-upgrade-digest");
+        let url = "https://center.example/api/v1/releases/artifact/wist-gwlinkd/0.12.0/wist-gwlinkd-0.12.0-x86_64-unknown-linux-musl.tar.gz";
+        state
+            .store
+            .publish_release(
+                "wist-gwlinkd",
+                "0.12.0",
+                url,
+                Some(digest),
+                Some("x86_64-unknown-linux-musl"),
+            )
+            .await
+            .expect("publish gwlinkd release");
+        seed_rolling_plan(
+            &state,
+            "upgrade",
+            r#"{"targets":[{"component":"wist-gwlinkd","target_version":"0.12.0"}]}"#,
+            "gw-p",
+        )
+        .await;
+
+        let plan = super::upgrade_plan_for(&state, "gw-p", Some("x86_64-unknown-linux-musl"))
+            .await
+            .expect("plan");
+        assert_eq!(plan.action.as_deref(), Some("upgrade"));
+        assert_eq!(plan.component.as_deref(), Some("wist-gwlinkd"));
+        assert_eq!(plan.artifact_url.as_deref(), Some(url));
+        assert_eq!(
+            plan.artifact_sha256.as_deref(),
+            Some(digest),
+            "gwlinkd 自更新必须拿到与地址同源的摘要"
+        );
+        assert!(
+            plan.artifacts.is_empty(),
+            "① 升级不带多平台清单（网关本机一个平台，用单值 artifact_url）"
+        );
+    }
+
+    /// 老 release 记录可能没摘要：gwlinkd 计划应**不带**（而不是带空串让网关侧报形态错）。
+    #[tokio::test]
+    async fn a_gwlinkd_upgrade_plan_omits_a_blank_digest() {
+        let state = provision_state("link-tok-gwlinkd-blank-digest");
+        let url = "https://center.example/api/v1/releases/artifact/wist-gwlinkd/0.11.9/wist-gwlinkd-0.11.9-x86_64-unknown-linux-musl.tar.gz";
+        state
+            .store
+            .publish_release(
+                "wist-gwlinkd",
+                "0.11.9",
+                url,
+                None,
+                Some("x86_64-unknown-linux-musl"),
+            )
+            .await
+            .expect("publish gwlinkd release");
+        seed_rolling_plan(
+            &state,
+            "upgrade",
+            r#"{"targets":[{"component":"wist-gwlinkd","target_version":"0.11.9"}]}"#,
+            "gw-p",
+        )
+        .await;
+
+        let plan = super::upgrade_plan_for(&state, "gw-p", Some("x86_64-unknown-linux-musl"))
+            .await
+            .expect("plan");
+        assert_eq!(plan.artifact_url.as_deref(), Some(url));
+        assert_eq!(plan.artifact_sha256, None, "空摘要当没有，不往网关送空串");
     }
 
     /// 发布 ②：`resolve_release_artifacts` 取该版本**全部平台**制品（平台 + 地址 + 摘要），

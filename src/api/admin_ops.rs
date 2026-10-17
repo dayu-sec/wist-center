@@ -4706,6 +4706,12 @@ mod tests {
             "configs/gwlinkd/gwlinkd.toml",
             "identity/gwlinkd/gwlinkd-pub.toml",
             "--pub-config",
+            // 自更新：真实二进制放在运行用户可写的目录，PATH 上留符号链接。
+            "/usr/local/lib/wist-gwlinkd",
+            "GWLINKD_REAL_DIR=\"/usr/local/lib/wist-gwlinkd\"",
+            "chown \"$DEPLOY_USER\" \"$GWLINKD_REAL_DIR\" \"$GWLINKD_REAL\"",
+            "ln -sfn \"$GWLINKD_REAL\" \"$GWLINKD_BIN\"",
+            "--bin \"$GWLINKD_BIN\"",
         ] {
             assert!(body.contains(needle), "script missing `{needle}`:\n{body}");
         }
@@ -4822,6 +4828,12 @@ mod tests {
             "STACK_DIR",
             "gw-linkd",
             "aarch64-apple-darwin",
+            // 自更新：真实二进制放在运行用户可写的目录，PATH 上留符号链接。
+            "/usr/local/lib/wist-gwlinkd",
+            "GWLINKD_REAL_DIR='/usr/local/lib/wist-gwlinkd'",
+            "chown \"$DEPLOY_USER\" \"$GWLINKD_REAL_DIR\" \"$GWLINKD_REAL\"",
+            "ln -sfn \"$GWLINKD_REAL\" \"$GWLINKD_BIN\"",
+            "--bin \"$GWLINKD_BIN\"",
         ] {
             assert!(body.contains(needle), "script missing `{needle}`:\n{body}");
         }

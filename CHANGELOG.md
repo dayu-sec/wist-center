@@ -5,6 +5,23 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [Unreleased]
+
+### 变更
+
+- **gwlinkd 升级计划带摘要**：中心为 `wist-gwlinkd` 的 ① 计划带上 `artifact_sha256`（其余 ① 组件仍不带），
+  供宿主侧自更新在覆盖前校验 —— 与地址同源（release 记录）。
+- **`install-all` / `install-linkd` 的 gwlinkd 安装布局改为可自更新**：真实二进制落
+  `/usr/local/lib/wist-gwlinkd/wist-gwlinkd`（**目录与文件都归运行用户**），
+  `/usr/local/bin/wist-gwlinkd` 留符号链接。
+  root 拥有的 `/usr/local/bin` 无法被非 root 常驻就地覆盖（原子 rename 需要目录可写）；
+  重跑安装脚本即完成迁移。
+
+### 升级注意
+
+- **首次启用 gwlinkd 自更新要先重跑一次安装脚本**：旧 gwlinkd 不认识自更新组件，升级计划会失败；
+  重跑后两者同时到位（新本体 + 可写布局）。
+
 ## [0.13.0-alpha] - 2026-10-15
 
 ### 新增

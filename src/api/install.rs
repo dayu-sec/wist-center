@@ -460,18 +460,27 @@ else
   if [ "$(id -u)" = "0" ]; then SUDO=""
   elif command -v sudo >/dev/null 2>&1; then SUDO="sudo"
   else
-    echo "安装 wist-gwlinkd 需要 root 或 sudo（写 /usr/local/bin 与系统服务定义）" >&2
+    echo "安装 wist-gwlinkd 需要 root 或 sudo（写 /usr/local/lib、/usr/local/bin 与系统服务定义）" >&2
     exit 1
   fi
 
   GWLINKD_BIN="/usr/local/bin/wist-gwlinkd"
+  # 真实二进制放**运行用户可写**的目录：gwlinkd 的自更新要在进程内就地覆盖它。
+  # `/usr/local/bin` 是 root 拥有，非 root 服务写不进去（原子 rename 需要目录可写）；
+  # PATH 上仍留同名符号链接，运维手敲 `wist-gwlinkd ...` 不受影响。
+  GWLINKD_REAL_DIR="/usr/local/lib/wist-gwlinkd"
+  GWLINKD_REAL="$GWLINKD_REAL_DIR/wist-gwlinkd"
   GWLINKD_TOML="$STACK_DIR/configs/gwlinkd/gwlinkd.toml"
   # 现场态（中心地址 / 网关标识 / 信任锚 / 临时券）与主配置**分文件**：它**不在**同目录，
   # 所以必须经 WIST_GWLINKD_PUB_CONFIG 显式告诉进程（见 wist-gwlinkd 的 service install）。
   GWLINKD_PUB="$STACK_DIR/identity/gwlinkd/gwlinkd-pub.toml"
   GWLINKD_CA="$STACK_DIR/identity/gwlinkd/control-center.pem"
 
-  install_component wist-gwlinkd "$GWLINKD_URL" "$(gwlinkd_sha || true)" /usr/local/bin "$SUDO"
+  $SUDO install -d -m 0755 "$GWLINKD_REAL_DIR"
+  install_component wist-gwlinkd "$GWLINKD_URL" "$(gwlinkd_sha || true)" "$GWLINKD_REAL_DIR" "$SUDO"
+  # 交给运行身份：**目录与文件都归它**（原子 rename 需要目录可写，只给文件写权限不够）。
+  $SUDO chown "$DEPLOY_USER" "$GWLINKD_REAL_DIR" "$GWLINKD_REAL"
+  $SUDO ln -sfn "$GWLINKD_REAL" "$GWLINKD_BIN"
 
   # 中心 CA 信任锚：写到渲染配置里 GWLINKD_TRUST_BUNDLE 指向的路径（自签中心必需）。
   if grep -q 'BEGIN CERTIFICATE' "$CA_CENTER" 2>/dev/null; then
@@ -949,10 +958,10 @@ log '安装 wist-gwlinkd（宿主侧接入器）'
 DEPLOY_USER="$(id -un)"
 if [ "$(id -u)" = "0" ]; then SUDO=''
 elif command -v sudo >/dev/null 2>&1; then SUDO='sudo'
-else echo '安装 wist-gwlinkd 需要 root 或 sudo（写 /usr/local/bin 与系统服务定义）' >&2; exit 1; fi
+else echo '安装 wist-gwlinkd 需要 root 或 sudo（写 /usr/local/lib、/usr/local/bin 与系统服务定义）' >&2; exit 1; fi
 
 install_gwlinkd() {
-  url="$1"; want_sha="${2:-}"; use_sudo="${3:-}"; dest='/usr/local/bin'; name='wist-gwlinkd'
+  url="$1"; want_sha="${2:-}"; use_sudo="${3:-}"; dest="${4:-/usr/local/bin}"; name='wist-gwlinkd'
   d="$(mktemp -d)"
   log "下载 wist-gwlinkd：$url"
   curl -fsSL "${CURL_TLS[@]}" "$url" -o "$d/pkg"
@@ -973,11 +982,18 @@ install_gwlinkd() {
 }
 
 GWLINKD_BIN='/usr/local/bin/wist-gwlinkd'
+# 真实二进制放**运行用户可写**的目录（自更新要在进程内覆盖它）；`/usr/local/bin` 留符号链接。
+GWLINKD_REAL_DIR='/usr/local/lib/wist-gwlinkd'
+GWLINKD_REAL="$GWLINKD_REAL_DIR/wist-gwlinkd"
 GWLINKD_TOML="$STACK_DIR/configs/gwlinkd/gwlinkd.toml"
 GWLINKD_PUB="$STACK_DIR/identity/gwlinkd/gwlinkd-pub.toml"
 GWLINKD_CA="$STACK_DIR/identity/gwlinkd/control-center.pem"
 
-install_gwlinkd "$GWLINKD_URL" "$(gwlinkd_sha || true)" "$SUDO"
+$SUDO install -d -m 0755 "$GWLINKD_REAL_DIR"
+install_gwlinkd "$GWLINKD_URL" "$(gwlinkd_sha || true)" "$SUDO" "$GWLINKD_REAL_DIR"
+# 交给运行身份：**目录与文件都归它**（原子 rename 需要目录可写，只给文件写权限不够）。
+$SUDO chown "$DEPLOY_USER" "$GWLINKD_REAL_DIR" "$GWLINKD_REAL"
+$SUDO ln -sfn "$GWLINKD_REAL" "$GWLINKD_BIN"
 
 # 中心 CA 信任锚：写到渲染配置里 GWLINKD_TRUST_BUNDLE 指向的路径（自签中心必需）。
 if grep -q 'BEGIN CERTIFICATE' "$CA_CENTER" 2>/dev/null; then
