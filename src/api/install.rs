@@ -15,17 +15,27 @@
 // 本端点**只校验不消费** —— 券仍留给随后的 link-upstream 使用（本脚本不做接入）。
 
 use axum::{
-    extract::State,
-    http::{StatusCode, header},
+    Json,
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
 
-use crate::infra::{ReleasePackageRecord, group_release_packages, sha256_hex};
+use crate::infra::{ReleasePackageRecord, group_release_packages, normalize_version, sha256_hex};
 
-use super::{ApiState, PeerConnectInfo, extract::ApiQuery, rate_limit};
+use super::{
+    ApiState, PeerConnectInfo, admin_auth, codes,
+    error::ApiError,
+    extract::{ApiJson, ApiQuery},
+    rate_limit,
+};
 
 /// 全量安装端点限流桶：token 在 URL 里，独立桶防暴力枚举。
 const GATEWAY_INSTALL_ALL_SCOPE: &str = "gateway-install-all";
+/// 手动升级脚本（网关面，短命签名）限流桶。
+const GATEWAY_UPGRADE_SCRIPT_SCOPE: &str = "gateway-upgrade-script";
+/// `curl ... | bash` 手动升级命令的有效期（秒）：够复制到网关宿主执行，又不长期可重放。
+const GATEWAY_UPGRADE_SCRIPT_TTL_SECONDS: i64 = 30 * 60;
 
 /// 需要解析「最新已发布」制品的组件：gops、gx、部署栈、宿主接入器。
 const GOPS_COMPONENT: &str = "galaxy-ops";
@@ -813,6 +823,383 @@ pub async fn get_gateway_install_linkd(
     )
         .into_response()
 }
+
+/// 手动升级请求：组件 + 版本（版本可带 `v` 前缀）。
+#[derive(serde::Deserialize)]
+pub struct GatewayUpgradeScriptRequest {
+    pub component: String,
+    #[serde(default)]
+    pub version: String,
+}
+
+/// 手动升级脚本回执：页面展示 `curl ... | bash` 一行命令，同时附脚本内容（便于预览 / 排查）。
+#[derive(serde::Serialize)]
+pub struct GatewayUpgradeScriptResponse {
+    pub gateway_id: String,
+    pub component: String,
+    pub version: String,
+    pub filename: String,
+    pub script: String,
+    /// `curl ... | bash` 一行命令（短命签名，默认 30 分钟有效）。
+    pub command: String,
+    /// 命令过期时刻（RFC3339）。
+    pub expires_at: String,
+}
+
+/// 网关面「手动升级脚本」查询：`curl ... | bash` 打开的那条 URL。
+#[derive(serde::Deserialize)]
+pub struct GatewayUpgradeScriptQuery {
+    pub gateway_id: String,
+    pub component: String,
+    pub version: String,
+    pub expires: i64,
+    pub signature: String,
+}
+
+/// 生成单台网关的**手动升级执行脚本**：
+/// `POST /api/v1/admin/gateways/{gateway_id}/upgrade-script`。
+///
+/// 只生成脚本 / 一行命令，**不建计划、不下发任务** —— 运维把 `curl ... | bash` 粘到网关宿主执行，
+/// 与首次安装同一套下载 / 校验 / 安装逻辑。支持 `gwlink` / `wist-gwlinkd` 与
+/// `gateway-stack` / `wist-gateway-stack` 两种命名。
+pub async fn admin_gateway_upgrade_script(
+    State(state): State<ApiState>,
+    Path(gateway_id): Path<String>,
+    headers: HeaderMap,
+    client: PeerConnectInfo,
+    ApiJson(request): ApiJson<GatewayUpgradeScriptRequest>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = admin_auth::require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+
+    // 目标网关必须存在（与建计划同一道校验：物化到不存在的网关只会静默落库、永不命中）。
+    let known = match state.store.list_gateways().await {
+        Ok(gateways) => gateways
+            .iter()
+            .any(|gateway| gateway.gateway_id == gateway_id),
+        Err(err) => {
+            return super::error::internal_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                codes::GATEWAY_LIST_FAILED,
+                "failed to list gateways",
+                err.display_chain(),
+            );
+        }
+    };
+    if !known {
+        return ApiError::not_found(
+            codes::GATEWAY_NOT_FOUND,
+            format!("unknown gateway: {gateway_id}"),
+        )
+        .into_response();
+    }
+
+    // 组件命名：同时接受中心组件名与页面上的简称。
+    let component = match request.component.trim() {
+        GWLINKD_COMPONENT | "gwlink" => GWLINKD_COMPONENT,
+        STACK_COMPONENT | "gateway-stack" => STACK_COMPONENT,
+        other => {
+            return ApiError::bad_request(
+                codes::INVALID_COMPONENT,
+                format!("unsupported upgrade component: {other}（可用：gwlink / gateway-stack）"),
+            )
+            .into_response();
+        }
+    };
+    // 版本命名：中心 release 记录通常不带 `v`，手敲 tag 常带；统一去掉。
+    let version = normalize_version(request.version.trim());
+    if version.is_empty() {
+        return ApiError::bad_request(codes::INVALID_VERSION, "version is required")
+            .into_response();
+    }
+
+    let (release_version, script) =
+        match build_upgrade_script(&state, &gateway_id, component, &version).await {
+            Ok(value) => value,
+            Err(error) => return error.into_response(),
+        };
+
+    // 一行命令：URL 里只带短命签名（不塞 admin token）；网关面端点验签后直接回脚本。
+    let expires = chrono::Utc::now().timestamp() + GATEWAY_UPGRADE_SCRIPT_TTL_SECONDS;
+    let signature = crate::infra::derive_upgrade_script_token(
+        &state.config.hmac_secret,
+        &gateway_id,
+        component,
+        &release_version,
+        expires,
+    );
+    let endpoint = format!(
+        "{}/api/v1/gateway/upgrade-script?gateway_id={}&component={}&version={}&expires={}&signature={}",
+        state.config.public_url.trim_end_matches('/'),
+        url_encode(&gateway_id),
+        url_encode(component),
+        url_encode(&release_version),
+        expires,
+        signature,
+    );
+    let command = format!("curl -fsSLk '{endpoint}' | bash");
+    let expires_at = chrono::DateTime::<chrono::Utc>::from_timestamp(expires, 0)
+        .map(|value| value.to_rfc3339())
+        .unwrap_or_default();
+    let filename = format!("upgrade-{component}-{release_version}.sh");
+
+    (
+        StatusCode::OK,
+        Json(GatewayUpgradeScriptResponse {
+            gateway_id,
+            component: component.to_string(),
+            version: release_version,
+            filename,
+            script,
+            command,
+            expires_at,
+        }),
+    )
+        .into_response()
+}
+
+/// 网关面：验短命签名后回升级脚本（`curl ... | bash` 打开的就是它）。
+pub async fn get_gateway_upgrade_script(
+    State(state): State<ApiState>,
+    client: PeerConnectInfo,
+    ApiQuery(params): ApiQuery<GatewayUpgradeScriptQuery>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Some(response) =
+        rate_limit::check_rate_limit(&state, &client_key, GATEWAY_UPGRADE_SCRIPT_SCOPE)
+    {
+        return response;
+    }
+    let now = chrono::Utc::now().timestamp();
+    if params.expires <= now {
+        rate_limit::record_auth_failure(&state, &client_key, GATEWAY_UPGRADE_SCRIPT_SCOPE);
+        return ApiError::unauthorized(
+            codes::UPGRADE_SCRIPT_TOKEN_EXPIRED,
+            "upgrade script token expired",
+        )
+        .with_no_store()
+        .into_response();
+    }
+    if !crate::infra::verify_upgrade_script_token(
+        &state.config.hmac_secret,
+        &params.gateway_id,
+        &params.component,
+        &params.version,
+        params.expires,
+        &params.signature,
+    ) {
+        rate_limit::record_auth_failure(&state, &client_key, GATEWAY_UPGRADE_SCRIPT_SCOPE);
+        return ApiError::unauthorized(
+            codes::UPGRADE_SCRIPT_TOKEN_INVALID,
+            "invalid upgrade script token",
+        )
+        .with_no_store()
+        .into_response();
+    }
+    rate_limit::clear_auth_failures(&state, &client_key, GATEWAY_UPGRADE_SCRIPT_SCOPE);
+
+    let component = match params.component.as_str() {
+        GWLINKD_COMPONENT => GWLINKD_COMPONENT,
+        STACK_COMPONENT => STACK_COMPONENT,
+        _ => {
+            return ApiError::bad_request(
+                codes::INVALID_COMPONENT,
+                "unsupported upgrade component",
+            )
+            .into_response();
+        }
+    };
+    let version = normalize_version(params.version.trim());
+    let (_release_version, script) =
+        match build_upgrade_script(&state, &params.gateway_id, component, &version).await {
+            Ok(value) => value,
+            Err(error) => return error.into_response(),
+        };
+    (
+        [(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")],
+        script,
+    )
+        .into_response()
+}
+
+/// 管理面与网关面共用的脚本生成：按组件 + 归一化版本解析发布记录并渲染。
+#[allow(clippy::result_large_err)]
+async fn build_upgrade_script(
+    state: &ApiState,
+    gateway_id: &str,
+    component: &'static str,
+    version: &str,
+) -> Result<(String, String), ApiError> {
+    let records = state.store.list_releases(component).await.map_err(|err| {
+        ApiError::internal(
+            codes::RELEASE_LIST_FAILED,
+            "failed to load releases",
+            err.display_chain(),
+        )
+    })?;
+    let package = group_release_packages(component, records)
+        .into_iter()
+        .find(|package| {
+            // 发布记录里的版本可能带 `v`（包名 / 顶层目录名带 `v` 时原样保留）；
+            // 请求侧已归一，这里也归一后比 —— 两边写不写 `v` 都能命中同一条记录。
+            package.status != "expired" && normalize_version(&package.package.version) == version
+        })
+        .ok_or_else(|| {
+            ApiError::not_found(
+                codes::RELEASE_NOT_FOUND,
+                format!("no dispatchable {component} release: {version}"),
+            )
+        })?;
+    // 回执与文件名用**发布记录里的原始版本**（可能带 `v`）—— 与页面上看到的一致。
+    let release_version = package.package.version.clone();
+    let script = match component {
+        GWLINKD_COMPONENT => render_linkd_script(
+            state.config.public_url.trim_end_matches('/'),
+            gateway_id,
+            &package,
+            state.config.ca_cert.clone(),
+        ),
+        _ => render_stack_upgrade_script(
+            state.config.public_url.trim_end_matches('/'),
+            gateway_id,
+            &release_version,
+            &package,
+            state.config.ca_cert.clone(),
+        )
+        .ok_or_else(|| {
+            ApiError::not_found(
+                codes::RELEASE_NOT_FOUND,
+                format!("no artifact for {component} release: {release_version}"),
+            )
+        })?,
+    };
+    Ok((release_version, script))
+}
+
+/// 渲染「手动升级 gateway-stack」脚本：填中心地址 / 网关身份 / 指定版本制品（地址 + 摘要）与 CA。
+fn render_stack_upgrade_script(
+    center_url: &str,
+    gateway_id: &str,
+    version: &str,
+    package: &ReleasePackageRecord,
+    ca_pem: Option<String>,
+) -> Option<String> {
+    // gateway-stack 是单制品（无平台概念）；历史/异常数据里若只有带平台的制品，取第一条。
+    let artifact = package
+        .package
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.platform.is_none())
+        .or_else(|| package.package.artifacts.first())?;
+    Some(
+        STACK_UPGRADE_SCRIPT_TEMPLATE
+            .replace("__CENTER_URL__", &shell_single_quote_escape(center_url))
+            .replace("__GATEWAY_ID__", &shell_single_quote_escape(gateway_id))
+            .replace("__STACK_VERSION__", &shell_single_quote_escape(version))
+            .replace(
+                "__STACK_URL__",
+                &shell_single_quote_escape(&artifact.source),
+            )
+            .replace(
+                "__STACK_SHA__",
+                &shell_single_quote_escape(&artifact.sha256),
+            )
+            .replace("__CENTER_CA_PEM__", ca_pem.as_deref().unwrap_or("")),
+    )
+}
+
+/// 「手动升级 gateway-stack」脚本模板：在网关宿主的 gops 工程根下载指定版本、校验摘要，
+/// 再交给 `gops prj upgrade`（与 gwlinkd 的升级驱动同一命令）。
+const STACK_UPGRADE_SCRIPT_TEMPLATE: &str = r#"#!/usr/bin/env bash
+# WistCenter · 手动升级网关栈（wist-gateway-stack）到 __STACK_VERSION__
+#
+# 在网关宿主上的 gops 工程根执行（含 ops-prj.yml）；可用 PROJECT_ROOT=<工程根> 覆盖。
+# 执行者是 gops，与宿主侧 gwlinkd 的升级驱动同一命令；失败默认整份回滚。
+set -euo pipefail
+
+CENTER_URL='__CENTER_URL__'
+GATEWAY_ID='__GATEWAY_ID__'
+STACK_VERSION='__STACK_VERSION__'
+STACK_URL='__STACK_URL__'
+STACK_SHA='__STACK_SHA__'
+
+log() { printf '\033[1;36m==> %s\033[0m\n' "$*"; }
+
+command -v gops >/dev/null 2>&1 || { echo '缺少 gops（网关由 gops 部署；请确认 PATH 含 $HOME/bin）' >&2; exit 1; }
+command -v curl >/dev/null 2>&1 || { echo '缺少 curl' >&2; exit 1; }
+
+# 中心 CA（自签）：与 install-all / install-linkd 同口径（信任锚 + bundle）。
+CA_DIR="$HOME/.wist/ca"
+CA_CENTER="$CA_DIR/control-center.pem"
+CA_BUNDLE="$CA_DIR/ca-bundle.pem"
+mkdir -p "$CA_DIR"
+cat > "$CA_CENTER" <<'WIST_CENTER_CA_EOF'
+__CENTER_CA_PEM__
+WIST_CENTER_CA_EOF
+if grep -q 'BEGIN CERTIFICATE' "$CA_CENTER" 2>/dev/null; then
+  sys_bundle=''
+  for f in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem; do
+    [ -f "$f" ] && sys_bundle="$f" && break
+  done
+  if [ -n "$sys_bundle" ]; then cat "$sys_bundle" "$CA_CENTER" > "$CA_BUNDLE"; else cp "$CA_CENTER" "$CA_BUNDLE"; fi
+  export SSL_CERT_FILE="$CA_BUNDLE" CURL_CA_BUNDLE="$CA_BUNDLE"
+  CURL_TLS=(--cacert "$CA_BUNDLE")
+  log "已载入中心 CA：$CA_BUNDLE"
+else
+  CURL_TLS=(-k)
+  log "中心未提供 CA（明文 / 未配 CA）→ curl 回退 -k"
+fi
+
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}';
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{print $1}';
+  else return 1; fi
+}
+
+# 定位已部署的 gops 工程：默认当前目录；可用 PROJECT_ROOT 覆盖。
+PROJECT_ROOT="$(cd "${PROJECT_ROOT:-$PWD}" && pwd)"
+[ -f "$PROJECT_ROOT/ops-prj.yml" ] || {
+  echo "找不到 gops 工程：$PROJECT_ROOT/ops-prj.yml（请在工程根执行，或设 PROJECT_ROOT=<工程根>）" >&2
+  exit 1
+}
+
+log "下载 wist-gateway-stack ${STACK_VERSION}"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+curl -fsSL "${CURL_TLS[@]}" "$STACK_URL" -o "$WORK/stack.tar.gz"
+if [ -n "$STACK_SHA" ]; then
+  have="$(sha256_of "$WORK/stack.tar.gz" || true)"
+  if [ -z "$have" ]; then log '提示：本机无 sha256sum/shasum，跳过摘要校验';
+  elif [ "$have" != "$STACK_SHA" ]; then
+    echo "下载校验失败 wist-gateway-stack：期望 ${STACK_SHA}，实际 ${have}" >&2
+    exit 1
+  fi
+fi
+
+# 健康检查：优先沿用本机 gwlinkd 已渲染的 upgrade_health_cmd（与宿主侧驱动同一口径）；
+# 没配就不加（gops 只会在命令失败时回滚）。
+HEALTH_CMD=''
+HEALTH_TIMEOUT=120
+GWLINKD_TOML="$PROJECT_ROOT/configs/gwlinkd/gwlinkd.toml"
+if [ -f "$GWLINKD_TOML" ]; then
+  HEALTH_CMD="$(sed -n 's/^[[:space:]]*upgrade_health_cmd[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' "$GWLINKD_TOML" | head -n1)"
+  parsed_timeout="$(sed -n 's/^[[:space:]]*upgrade_health_timeout_seconds[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$GWLINKD_TOML" | head -n1)"
+  if [ -n "$parsed_timeout" ]; then HEALTH_TIMEOUT="$parsed_timeout"; fi
+fi
+
+log "gops prj upgrade --to <本地制品> --on-failure rollback-all"
+cd "$PROJECT_ROOT"
+# `--force 1` 跳过确认：`curl ... | bash` 时 stdin 是脚本管道，不能等交互提示。
+if [ -n "$HEALTH_CMD" ]; then
+  gops prj upgrade --to "$WORK/stack.tar.gz" --on-failure rollback-all --force 1 \
+    --health-cmd "$HEALTH_CMD" --health-timeout "$HEALTH_TIMEOUT" --json
+else
+  gops prj upgrade --to "$WORK/stack.tar.gz" --on-failure rollback-all --force 1 --json
+fi
+log "完成：${GATEWAY_ID} 已升级到 wist-gateway-stack ${STACK_VERSION}"
+"#;
 
 /// 渲染「只装 gwlinkd」脚本：填中心地址、网关身份、宿主接入器制品（地址 + 摘要）与 CA。
 fn render_linkd_script(

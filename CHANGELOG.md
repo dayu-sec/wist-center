@@ -5,6 +5,16 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [Unreleased]
+
+### 新增
+
+- **手动升级脚本端点**：`POST /api/v1/admin/gateways/{gateway_id}/upgrade-script` —— 按组件 +
+  版本命名生成一条 **`curl ... | bash`** 命令（Admin Bearer；URL 带 30 分钟 HMAC 短命签名，
+  不塞 admin token）。新增网关面 `GET /api/v1/gateway/upgrade-script` 验签后直接回脚本。
+  支持 `gwlink` / `gateway-stack` 别名；`wist-gwlinkd` 复用首次安装逻辑并钉住请求版本，
+  `wist-gateway-stack` 下载校验后执行 `gops prj upgrade`。只生成命令/脚本，不建计划、不下发任务。
+
 ## [0.14.0-alpha] - 2026-10-17
 
 ### 变更

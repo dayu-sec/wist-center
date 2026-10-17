@@ -175,6 +175,11 @@ pub fn router_for(state: ApiState) -> Router {
             "/api/v1/gateway/install-linkd",
             get(install::get_gateway_install_linkd),
         )
+        // 网关面：手动升级脚本（短命签名；`curl ... | bash` 打开的就是它）
+        .route(
+            "/api/v1/gateway/upgrade-script",
+            get(install::get_gateway_upgrade_script),
+        )
         // 网关面：链接上级 link-upstream（初始化 URL 指向此端点；返回 application/json）
         .route(
             "/api/v1/gateway/link-upstream",
@@ -287,6 +292,11 @@ pub fn router_for(state: ApiState) -> Router {
         .route(
             "/api/v1/admin/gateways/{gateway_id}/archive",
             post(admin_set_gateway_archived),
+        )
+        // 管理面：生成单台网关的「手动升级」执行脚本（按组件 + 版本命名；只生成脚本，不建计划）
+        .route(
+            "/api/v1/admin/gateways/{gateway_id}/upgrade-script",
+            post(install::admin_gateway_upgrade_script),
         )
         // 管理面：版本发布（wist-agentd / wist-gateway-stack / galaxy-ops / galaxy-flow，镜像外部制品）
         .route(

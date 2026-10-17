@@ -100,6 +100,8 @@ codes! {
     RELEASE_RESOLVE_FAILED => "release_resolve_failed",
     RELEASE_STATUS_UPDATE_FAILED => "release_status_update_failed",
     RELEASE_URL_REQUIRED => "release_url_required",
+    UPGRADE_SCRIPT_TOKEN_EXPIRED => "upgrade_script_token_expired",
+    UPGRADE_SCRIPT_TOKEN_INVALID => "upgrade_script_token_invalid",
     REQUESTED_BY_REQUIRED => "requested_by_required",
     ROLLOUT_CREATE_FAILED => "rollout_create_failed",
     ROLLOUT_PLAN_LOAD_FAILED => "rollout_plan_load_failed",

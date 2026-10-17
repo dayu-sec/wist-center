@@ -35,6 +35,57 @@ pub fn derive_regist_token(secret: &str, gateway_id: &str, identity_token: &str)
     hex_lower(hmac::sign(&key, data.as_bytes()).as_ref())
 }
 
+/// 手动升级脚本的**短命签名**（无状态 token）：
+/// `HMAC-SHA256(center_secret, "upgrade-script:{gateway_id}:{component}:{version}:{expires}")` 的 hex。
+///
+/// `curl ... | bash` 的 URL 里只带它 + `expires`，**不把 admin token 塞进 URL**；
+/// 网关面端点据此校验「这条命令确实是中心管理面为这台网关生成的、且没过期」。
+pub fn derive_upgrade_script_token(
+    secret: &str,
+    gateway_id: &str,
+    component: &str,
+    version: &str,
+    expires: i64,
+) -> String {
+    let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
+    let data = upgrade_script_payload(gateway_id, component, version, expires);
+    hex_lower(hmac::sign(&key, data.as_bytes()).as_ref())
+}
+
+/// 校验短命签名（常量时间比较 hex 字符串）。
+pub fn verify_upgrade_script_token(
+    secret: &str,
+    gateway_id: &str,
+    component: &str,
+    version: &str,
+    expires: i64,
+    signature: &str,
+) -> bool {
+    let expected = derive_upgrade_script_token(secret, gateway_id, component, version, expires);
+    constant_time_eq(expected.as_bytes(), signature.as_bytes())
+}
+
+/// 常量时间比较（长度不等直接 false；相等长度下不提前返回）。
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (left, right) in left.iter().zip(right) {
+        diff |= left ^ right;
+    }
+    diff == 0
+}
+
+fn upgrade_script_payload(
+    gateway_id: &str,
+    component: &str,
+    version: &str,
+    expires: i64,
+) -> String {
+    format!("upgrade-script:{gateway_id}:{component}:{version}:{expires}")
+}
+
 fn hex_lower(bytes: &[u8]) -> String {
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -83,5 +134,42 @@ mod tests {
         assert_ne!(base, derive_regist_token("other", "gw-001", "id-1"));
         assert_ne!(base, derive_regist_token("sec", "gw-002", "id-1"));
         assert_ne!(base, derive_regist_token("sec", "gw-001", "id-2"));
+    }
+
+    #[test]
+    fn upgrade_script_token_is_bound_and_verifiable() {
+        let token = derive_upgrade_script_token("sec", "gw-1", "wist-gwlinkd", "v0.12.0", 100);
+        assert_eq!(
+            token,
+            derive_upgrade_script_token("sec", "gw-1", "wist-gwlinkd", "v0.12.0", 100)
+        );
+        assert!(verify_upgrade_script_token(
+            "sec",
+            "gw-1",
+            "wist-gwlinkd",
+            "v0.12.0",
+            100,
+            &token
+        ));
+        // 换密钥 / 网关 / 组件 / 版本 / 过期时刻 / 签名 → 均不通过。
+        for (secret, gateway, component, version, expires) in [
+            ("other", "gw-1", "wist-gwlinkd", "v0.12.0", 100),
+            ("sec", "gw-2", "wist-gwlinkd", "v0.12.0", 100),
+            ("sec", "gw-1", "wist-gateway-stack", "v0.12.0", 100),
+            ("sec", "gw-1", "wist-gwlinkd", "v0.13.0", 100),
+            ("sec", "gw-1", "wist-gwlinkd", "v0.12.0", 101),
+        ] {
+            assert!(!verify_upgrade_script_token(
+                secret, gateway, component, version, expires, &token
+            ));
+        }
+        assert!(!verify_upgrade_script_token(
+            "sec",
+            "gw-1",
+            "wist-gwlinkd",
+            "v0.12.0",
+            100,
+            "deadbeef"
+        ));
     }
 }

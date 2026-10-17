@@ -4852,6 +4852,258 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// shell 语法门禁：把渲染出的脚本交给 `bash -n`，防模板改动（引号 / heredoc）把命令弄坏。
+    fn assert_bash_syntax(name: &str, script: &str) {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("wic-{name}-{nanos}.sh"));
+        std::fs::write(&path, script).expect("write script");
+        let output = std::process::Command::new("bash")
+            .arg("-n")
+            .arg(&path)
+            .output()
+            .expect("run bash -n");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            output.status.success(),
+            "bash -n 失败（{name}）：{}\n---\n{script}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// 手动升级脚本：只生成脚本、不建计划；按**指定版本**渲染（不是最新），并支持
+    /// `gwlink` / `gateway-stack` 命名。
+    #[tokio::test]
+    async fn upgrade_script_pins_the_requested_version_and_accepts_names() {
+        use axum::{body::Body, http::Request};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("wic-upgrade-script-{nanos}.json"));
+        let store = FileStore::new(&path);
+        store
+            .create_gateway("gw-script", "tok-script")
+            .expect("create gateway");
+        let state = create_state_with_store(store);
+
+        let base = "http://127.0.0.1:3100/api/v1/releases/artifact";
+        // 同一组件放两个版本：脚本必须取请求里的 0.12.0，而不是最新/旧版。
+        state
+            .store
+            .publish_release(
+                "wist-gwlinkd",
+                "v0.11.0",
+                &format!(
+                    "{base}/wist-gwlinkd/v0.11.0/wist-gwlinkd-v0.11.0-x86_64-unknown-linux-musl.tar.gz"
+                ),
+                Some("old"),
+                Some("x86_64-unknown-linux-musl"),
+            )
+            .await
+            .expect("publish old gwlinkd");
+        for (platform, sha) in [
+            ("x86_64-unknown-linux-musl", "sha-x86"),
+            ("aarch64-unknown-linux-musl", "sha-arm64"),
+            ("aarch64-apple-darwin", "sha-mac"),
+        ] {
+            state
+                .store
+                .publish_release(
+                    "wist-gwlinkd",
+                    "v0.12.0",
+                    &format!("{base}/wist-gwlinkd/v0.12.0/wist-gwlinkd-v0.12.0-{platform}.tar.gz"),
+                    Some(sha),
+                    Some(platform),
+                )
+                .await
+                .expect("publish gwlinkd");
+        }
+        state
+            .store
+            .publish_release(
+                "wist-gateway-stack",
+                "v0.14.0",
+                &format!("{base}/wist-gateway-stack/v0.14.0/wist-gateway-stack-v0.14.0.tar.gz"),
+                Some("sha-stack"),
+                None,
+            )
+            .await
+            .expect("publish stack");
+
+        let app = super::super::router_for(state);
+
+        // gwlink 命名 + `v` 前缀 → 归一到 0.12.0；三平台 + 安装/重启逻辑都在脚本里。
+        let (status, view) = post_json(
+            &app,
+            "/api/v1/admin/gateways/gw-script/upgrade-script",
+            serde_json::json!({ "component": "gwlink", "version": "v0.12.0" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{view}");
+        assert_eq!(view["component"], "wist-gwlinkd");
+        assert_eq!(view["version"], "v0.12.0");
+        let script = view["script"].as_str().expect("script");
+        assert!(script.contains("wist-gwlinkd-v0.12.0-x86_64-unknown-linux-musl.tar.gz"));
+        assert!(script.contains("wist-gwlinkd-v0.12.0-aarch64-apple-darwin.tar.gz"));
+        assert!(script.contains("sha-mac"));
+        assert!(
+            !script.contains("wist-gwlinkd-v0.11.0"),
+            "脚本必须使用请求的版本，不能拿最新/旧版：{script}"
+        );
+        assert!(script.contains("--bin \"$GWLINKD_BIN\""));
+        // 与首次安装同一套逻辑：先按现场值渲染配置，再装二进制 / 系统服务。
+        assert!(script.contains("gops sys localize"));
+        assert_bash_syntax("upgrade-gwlinkd", script);
+        // 页面只给一行命令：短命签名 + 不出现 admin token。
+        let command = view["command"].as_str().expect("command");
+        assert!(command.starts_with("curl -fsSLk '"), "{command}");
+        assert!(
+            command.contains("/api/v1/gateway/upgrade-script?"),
+            "{command}"
+        );
+        assert!(command.contains("signature="), "{command}");
+        assert!(command.contains("expires="), "{command}");
+        assert!(
+            !command.contains("admin-tok"),
+            "命令不能把 admin token 塞进 URL：{command}"
+        );
+        assert!(view["expires_at"].is_string(), "{view}");
+
+        // 按命令里的 URL 真打一次（网关面）：验签后回脚本。
+        let url = command
+            .trim_start_matches("curl -fsSLk '")
+            .trim_end_matches("' | bash");
+        let path = &url[url.find("/api/v1/gateway/upgrade-script").expect("path")..];
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes()
+                .to_vec(),
+        )
+        .expect("utf8");
+        assert!(body.contains("wist-gwlinkd-v0.12.0-x86_64-unknown-linux-musl.tar.gz"));
+
+        // 改一个查询参数 → 签名失效（401），不能生成别的版本。
+        let tampered = path.replace("version=v0.12.0", "version=v0.13.0");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(tampered)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let _ = response.into_body().collect().await;
+
+        // 过期（签名本身合法，但 expires 已过）→ 401，且不生成脚本。
+        let expired = chrono::Utc::now().timestamp() - 10;
+        let signature = crate::infra::derive_upgrade_script_token(
+            "test-hmac-secret",
+            "gw-script",
+            "wist-gwlinkd",
+            "v0.12.0",
+            expired,
+        );
+        let uri = format!(
+            "/api/v1/gateway/upgrade-script?gateway_id=gw-script&component=wist-gwlinkd&version=v0.12.0&expires={expired}&signature={signature}"
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let _ = response.into_body().collect().await;
+
+        // gateway-stack 命名：单制品 + gops 升级命令。
+        let (status, view) = post_json(
+            &app,
+            "/api/v1/admin/gateways/gw-script/upgrade-script",
+            serde_json::json!({ "component": "gateway-stack", "version": "0.14.0" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{view}");
+        assert_eq!(view["component"], "wist-gateway-stack");
+        assert_eq!(view["version"], "v0.14.0");
+        let script = view["script"].as_str().expect("script");
+        assert!(script.contains("wist-gateway-stack-v0.14.0.tar.gz"));
+        assert!(script.contains("sha-stack"));
+        assert!(script.contains("gops prj upgrade --to"));
+        assert!(script.contains("--on-failure rollback-all"));
+        // `curl | bash` 的 stdin 是脚本管道：必须跳过交互确认。
+        assert!(script.contains("--force 1"));
+        // 健康检查沿用本机 gwlinkd 的配置（有则传，没配不加）。
+        assert!(script.contains("--health-cmd"));
+        assert!(script.contains("--health-timeout"));
+        assert_bash_syntax("upgrade-stack", script);
+
+        // 不支持的组件 / 未知版本 / 未知网关都是可读错误。
+        let (status, _) = post_json(
+            &app,
+            "/api/v1/admin/gateways/gw-script/upgrade-script",
+            serde_json::json!({ "component": "wist-agentd", "version": "0.1.0" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = post_json(
+            &app,
+            "/api/v1/admin/gateways/gw-script/upgrade-script",
+            serde_json::json!({ "component": "gwlink", "version": "9.9.9" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = post_json(
+            &app,
+            "/api/v1/admin/gateways/gw-ghost/upgrade-script",
+            serde_json::json!({ "component": "gwlink", "version": "0.12.0" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // 无管理令牌 → 401（不返回脚本）。
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/admin/gateways/gw-script/upgrade-script")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"component":"gwlink","version":"0.12.0"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let _ = response.into_body().collect().await;
+    }
+
     // ── 错误信封的 wire 契约：所有错误都应是 `{ "error": { code, message } }` ──────────
 
     async fn read_json(response: axum::response::Response) -> (StatusCode, serde_json::Value) {
