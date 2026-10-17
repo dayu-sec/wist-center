@@ -437,7 +437,9 @@ set_value "$VALUES_FILE" GWLINKD_STATE_DIR "$STACK_DIR/configs/gwlinkd/state"
 set_value "$VALUES_FILE" GATEWAY_SELF_ENDPOINT "$GATEWAY_SELF_ENDPOINT"
 set_value "$VALUES_FILE" GATEWAY_SELF_CA "$STACK_DIR/identity/gateway/public/gateway-ca.crt.pem"
 # gwlinkd 驱动升级：gops 工程根（含 ops-prj.yml，**绝对路径**）——gops 从 cwd 解析工程。
-set_value "$VALUES_FILE" GWLINKD_UPGRADER_PROGRAM "gops"
+# 执行器也写**绝对路径**：gwlinkd 是系统服务，PATH 只有 /usr/local/bin:/usr/bin:/bin…，
+# 不含安装脚本用的 $HOME/bin；写相对名 `gops` 会在 spawn 时 ENOENT（os error 2）。
+set_value "$VALUES_FILE" GWLINKD_UPGRADER_PROGRAM "$INSTALL_DIR/gops"
 set_value "$VALUES_FILE" GWLINKD_UPGRADE_PROJECT_DIR "$PROJECT_ROOT"
 
 # d) 变量解析 + 本地化（把域名等现场值烘进 .env 与渲染配置）
@@ -1225,8 +1227,8 @@ fn render_linkd_script(
 const LINKD_SCRIPT_TEMPLATE: &str = r#"#!/usr/bin/env bash
 # WistCenter · 只装宿主侧 wist-gwlinkd（网关已部署时用）
 #
-// 由中心自动生成：在**已部署的网关工程**里补齐 gwlinkd 配置（走栈的 `gops sys localize`）并装
-// 宿主侧接入器。**不装** gops / gx / gateway-stack —— 那些由「全量安装（install-all）」负责。
+# 由中心自动生成：在**已部署的网关工程**里补齐 gwlinkd 配置（走栈的 `gops sys localize`）并装
+# 宿主侧接入器。**不装** gops / gx / gateway-stack —— 那些由「全量安装（install-all）」负责。
 # 本脚本**不做接入**：接入仍走网关「链接上级」页（或 gwlinkd 自联）。
 set -euo pipefail
 
@@ -1263,7 +1265,10 @@ command -v curl >/dev/null 2>&1 || { echo '缺少 curl' >&2; exit 1; }
 if ! command -v tar >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1; then
   echo '缺少 tar 与 python3（至少一个用于解包）' >&2; exit 1
 fi
-command -v gops >/dev/null 2>&1 || { echo '缺少 gops（网关由 gops 部署；请确认 PATH 含 $HOME/bin）' >&2; exit 1; }
+# 捕获**可执行文件**的绝对路径：`type -P` 只查 PATH，不会把 shell 函数/别名当成程序。
+# gwlinkd 是系统服务，PATH 不含 $HOME/bin，配置里写相对名 `gops` 会在 spawn 时 ENOENT（os error 2）。
+GOPS_BIN="$(type -P gops || true)"
+[ -n "$GOPS_BIN" ] || { echo '缺少 gops（网关由 gops 部署；请确认 PATH 含 $HOME/bin）' >&2; exit 1; }
 
 # 平台探测 → target-triple（与中心制品的平台对齐）。
 case "$(uname -s)/$(uname -m)" in
@@ -1328,7 +1333,7 @@ set_value "$VALUES_FILE" GWLINKD_IDENTITY_DIR "$STACK_DIR/identity/gwlinkd"
 set_value "$VALUES_FILE" GWLINKD_STATE_DIR "$STACK_DIR/configs/gwlinkd/state"
 set_value "$VALUES_FILE" GATEWAY_SELF_ENDPOINT "$GATEWAY_SELF_ENDPOINT"
 set_value "$VALUES_FILE" GATEWAY_SELF_CA "$STACK_DIR/identity/gateway/public/gateway-ca.crt.pem"
-set_value "$VALUES_FILE" GWLINKD_UPGRADER_PROGRAM 'gops'
+set_value "$VALUES_FILE" GWLINKD_UPGRADER_PROGRAM "$GOPS_BIN"
 set_value "$VALUES_FILE" GWLINKD_UPGRADE_PROJECT_DIR "$PROJECT_ROOT"
 
 # 渲染 gwlinkd 配置（主配置 + 现场态声明/值）—— 复用栈的 localize。

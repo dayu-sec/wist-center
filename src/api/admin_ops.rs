@@ -4703,6 +4703,8 @@ mod tests {
             "service install --system",
             "GWLINKD_GATEWAY_ID",
             "GWLINKD_IDENTITY_DIR",
+            // 执行器写**绝对路径**：gwlinkd 服务 PATH 不含 $HOME/bin，相对名会在 spawn 时 ENOENT。
+            "set_value \"$VALUES_FILE\" GWLINKD_UPGRADER_PROGRAM \"$INSTALL_DIR/gops\"",
             "configs/gwlinkd/gwlinkd.toml",
             "identity/gwlinkd/gwlinkd-pub.toml",
             "--pub-config",
@@ -4715,6 +4717,11 @@ mod tests {
         ] {
             assert!(body.contains(needle), "script missing `{needle}`:\n{body}");
         }
+        // `//` 不是 bash 注释：它会被当成命令执行（`//: is a directory`）。模板里别再写。
+        assert!(
+            !body.lines().any(|line| line.trim_start().starts_with("//")),
+            "生成的脚本里不能有 `//` 注释：\n{body}"
+        );
 
         // 券无效 → 401。
         let response = app
@@ -4825,6 +4832,9 @@ mod tests {
             "--pub-config",
             "configs/gwlinkd/gwlinkd.toml",
             "identity/gwlinkd/gwlinkd-pub.toml",
+            // 执行器写**绝对路径**：gwlinkd 服务 PATH 不含 $HOME/bin，相对名会在 spawn 时 ENOENT。
+            "GOPS_BIN=\"$(type -P gops || true)\"",
+            "set_value \"$VALUES_FILE\" GWLINKD_UPGRADER_PROGRAM \"$GOPS_BIN\"",
             "STACK_DIR",
             "gw-linkd",
             "aarch64-apple-darwin",
@@ -4837,6 +4847,11 @@ mod tests {
         ] {
             assert!(body.contains(needle), "script missing `{needle}`:\n{body}");
         }
+        // `//` 不是 bash 注释：它会被当成命令执行（`//: is a directory`）。模板里别再写。
+        assert!(
+            !body.lines().any(|line| line.trim_start().starts_with("//")),
+            "生成的脚本里不能有 `//` 注释：\n{body}"
+        );
 
         // 券无效 → 401。
         let response = app
