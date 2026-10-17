@@ -5,6 +5,22 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.15.1-alpha] - 2026-10-17
+
+### 修复
+
+- **安装脚本里的升级执行器改为绝对路径**：`install-all` / `install-linkd` 生成 gwlinkd 配置时，
+  `GWLINKD_UPGRADER_PROGRAM` 不再写相对名 `gops`，而是 `$INSTALL_DIR/gops` / `type -P gops` 的结果。
+  修复 gwlinkd 作为 launchd / systemd 服务运行时 PATH 不含 `~/bin`，升级计划以
+  `启动升级执行器 gops 失败: No such file or directory (os error 2)` 落失败。
+- **「只装 gwlinkd」脚本头两行误用 `//` 注释**：`curl ... | bash` 时会执行成 `//: is a directory`。
+  改成 `#`，并加契约测试禁止生成脚本里出现 `//` 注释。
+
+### 升级注意
+
+- 已部署的网关若要立即生效，重跑一次「只装 gwlinkd」或「全量安装」脚本即可；
+  或把 `upgrader_program` 配成 `gops` 的绝对路径。
+
 ## [0.15.0-alpha] - 2026-10-17
 
 ### 新增
