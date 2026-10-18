@@ -160,6 +160,9 @@ pub(super) fn detail_view(plan: &UpgradePlanRecord) -> RolloutPlanDetailView {
 struct UpgradeSpec {
     #[serde(default)]
     targets: Vec<UpgradeSpecTarget>,
+    /// 「知识库包下发」专用：录入后是否立即激活（缺省 false）。其余动作忽略。
+    #[serde(default)]
+    activate: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -181,6 +184,15 @@ pub(super) fn first_upgrade_target(spec: &str) -> Option<(String, String)> {
         return None;
     }
     Some((target.component, target.target_version))
+}
+
+/// 「知识库包下发」的 `activate`（缺省 false）：spec 形如
+/// `{"targets":[{"component":"wist-knowledge","target_version":"0.3.0"}],"activate":true}`。
+/// 解不出 / 非 JSON → `false`（录入 ≠ 生效的保守默认）。
+pub(super) fn knowledge_activate(spec: &str) -> bool {
+    serde_json::from_str::<UpgradeSpec>(spec)
+        .map(|parsed| parsed.activate)
+        .unwrap_or(false)
 }
 
 // ── 建计划（服务端切阶段 + 全量条目落 `pending`） ──

@@ -9,12 +9,13 @@ use axum::{
 };
 
 use wist_control::{
-    ACTION_PUSH_AGENT_PACKAGE, AgentStatusAcceptedReturned, DateTime, GatewayCredentialBundle,
-    GatewayCredentialVerificationResult, GatewayEnrollmentResult, GatewayInitialConfig,
-    GatewayInitializationStatus, GatewayInstanceLifecycleState, GatewayStatusAccepted,
-    GatewayUpgradePlan, GatewayUpgradeResultAccepted, QueryGatewayInitializationStatus,
-    RegisterGateway, RenewGatewayCredential, ReportAgentStatus, ReportGatewayStatus,
-    ReportGatewayUpgradeResult, VerifyGatewayCredential,
+    ACTION_PUSH_AGENT_PACKAGE, ACTION_PUSH_KNOWLEDGE_PACKAGE, AgentStatusAcceptedReturned,
+    DateTime, GatewayCredentialBundle, GatewayCredentialVerificationResult,
+    GatewayEnrollmentResult, GatewayInitialConfig, GatewayInitializationStatus,
+    GatewayInstanceLifecycleState, GatewayStatusAccepted, GatewayUpgradePlan,
+    GatewayUpgradeResultAccepted, QueryGatewayInitializationStatus, RegisterGateway,
+    RenewGatewayCredential, ReportAgentStatus, ReportGatewayStatus, ReportGatewayUpgradeResult,
+    VerifyGatewayCredential,
 };
 
 use crate::infra::{
@@ -373,6 +374,7 @@ async fn upgrade_plan_for(
             action: None,
             artifact_sha256: None,
             artifacts: Vec::new(),
+            activate: None,
         });
     };
     // 现模型的 `GatewayUpgradePlan` 只承载**单组件**目标；多组件计划这里取第一个
@@ -394,7 +396,10 @@ async fn upgrade_plan_for(
     let self_update = target
         .as_ref()
         .is_some_and(|(component, _)| component == GWLINKD_COMPONENT);
-    let artifact_sha256 = if plan.action == ACTION_PUSH_AGENT_PACKAGE || self_update {
+    let artifact_sha256 = if plan.action == ACTION_PUSH_AGENT_PACKAGE
+        || plan.action == ACTION_PUSH_KNOWLEDGE_PACKAGE
+        || self_update
+    {
         resolved
             .as_ref()
             .and_then(|record| record.package_sha256.clone())
@@ -415,6 +420,9 @@ async fn upgrade_plan_for(
     } else {
         Vec::new()
     };
+    // 「知识库包下发」：`activate` 从 spec 解（缺省 false）—— 录入与生效是两件事（设计 I2）。
+    let activate = (plan.action == ACTION_PUSH_KNOWLEDGE_PACKAGE)
+        .then(|| rollout::knowledge_activate(&plan.spec));
     // 网关已取走这份计划：把本阶段条目标 `dispatched`（幂等；失败只记日志，不影响下发）。
     if let Err(err) = rollout::mark_gateway_entry_dispatched(state, &plan.plan_id, gateway_id).await
     {
@@ -433,6 +441,7 @@ async fn upgrade_plan_for(
         artifact_url,
         artifact_sha256,
         artifacts,
+        activate,
     })
 }
 
@@ -2114,6 +2123,97 @@ mod tests {
             plan.artifacts.is_empty(),
             "① upgrade 不带多平台清单：网关本机一个平台，用单值 artifact_url"
         );
+    }
+
+    /// 「知识库包下发」：单制品（无平台）也带摘要与 `activate`；`artifacts` 为空（不按平台挑）。
+    ///
+    /// 知识库是**内容**：网关只需要一份包；`activate` 决定录入后是否立刻切生效指针。
+    #[tokio::test]
+    async fn knowledge_push_plan_carries_digest_and_activate() {
+        let digest = "780d6375472e069016209755a42bfdaa89876da03670d2c9ffc8d397bc52c6ec";
+        let state = provision_state("link-tok-knowledge-push");
+        let url = "https://center.example/api/v1/releases/artifact/wist-knowledge/0.3.0/wist-knowledge-0.3.0.tar.gz";
+        state
+            .store
+            .publish_release("wist-knowledge", "0.3.0", url, Some(digest), None)
+            .await
+            .expect("publish knowledge release");
+        seed_rolling_plan(
+            &state,
+            ACTION_PUSH_KNOWLEDGE_PACKAGE,
+            r#"{"targets":[{"component":"wist-knowledge","target_version":"0.3.0"}],"activate":true}"#,
+            "gw-k",
+        )
+        .await;
+
+        let plan = super::upgrade_plan_for(&state, "gw-k", None)
+            .await
+            .expect("plan");
+        assert_eq!(plan.action.as_deref(), Some(ACTION_PUSH_KNOWLEDGE_PACKAGE));
+        assert_eq!(plan.component.as_deref(), Some("wist-knowledge"));
+        assert_eq!(plan.to_version.as_deref(), Some("0.3.0"));
+        assert_eq!(plan.artifact_url.as_deref(), Some(url));
+        assert_eq!(
+            plan.artifact_sha256.as_deref(),
+            Some(digest),
+            "知识库包必须带摘要：网关拿来源字节核对"
+        );
+        assert_eq!(plan.activate, Some(true), "activate 从 spec 里解");
+        assert!(
+            plan.artifacts.is_empty(),
+            "知识库是单制品：不按平台挑，也不带多平台清单"
+        );
+    }
+
+    /// `activate` 缺省 = false（录入 ≠ 生效）；非知识库动作不带 `activate`。
+    #[tokio::test]
+    async fn knowledge_push_defaults_to_record_only() {
+        let digest = "780d6375472e069016209755a42bfdaa89876da03670d2c9ffc8d397bc52c6ec";
+        let state = provision_state("link-tok-knowledge-record-only");
+        let url = "https://center.example/api/v1/releases/artifact/wist-knowledge/0.3.0/wist-knowledge-0.3.0.tar.gz";
+        state
+            .store
+            .publish_release("wist-knowledge", "0.3.0", url, Some(digest), None)
+            .await
+            .expect("publish knowledge release");
+        seed_rolling_plan(
+            &state,
+            ACTION_PUSH_KNOWLEDGE_PACKAGE,
+            r#"{"targets":[{"component":"wist-knowledge","target_version":"0.3.0"}]}"#,
+            "gw-k2",
+        )
+        .await;
+
+        let plan = super::upgrade_plan_for(&state, "gw-k2", None)
+            .await
+            .expect("plan");
+        assert_eq!(plan.activate, Some(false), "缺省不激活（录入 ≠ 生效）");
+
+        // ① 升级不带 `activate`（只对知识库动作有意义）。
+        let state = provision_state("link-tok-upgrade-no-activate");
+        let stack_url = "https://center.example/api/v1/releases/artifact/wist-gateway-stack/0.1.28/wist-gateway-stack-0.1.28.tar.gz";
+        state
+            .store
+            .publish_release(
+                "wist-gateway-stack",
+                "0.1.28",
+                stack_url,
+                Some(digest),
+                None,
+            )
+            .await
+            .expect("publish stack release");
+        seed_rolling_plan(
+            &state,
+            "upgrade",
+            r#"{"targets":[{"component":"wist-gateway-stack","target_version":"0.1.28"}]}"#,
+            "gw-u",
+        )
+        .await;
+        let plan = super::upgrade_plan_for(&state, "gw-u", None)
+            .await
+            .expect("plan");
+        assert_eq!(plan.activate, None, "① upgrade 不带 activate");
     }
 
     /// gwlinkd 自更新例外：① 升级计划也给它**带摘要**（自更新要校验自己覆盖的字节），

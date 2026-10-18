@@ -26,6 +26,9 @@ use super::{
     rate_limit, rollout,
 };
 
+/// 知识库包组件名（与 `wist-knowledge` 仓 / 网关 `[[families]]` 目录同一命名）。
+const KNOWLEDGE_COMPONENT: &str = "wist-knowledge";
+
 /// 创建网关实例请求体：对齐模型 `AdminCreateGatewayInstanceRequest`（gateway_name/requested_by）。
 /// **不含接入凭据**：接入券由「生成/轮换」端点产出（设计 §8）。
 #[derive(serde::Deserialize)]
@@ -768,17 +771,64 @@ pub async fn admin_publish_release(
     )
     .await
     {
-        Ok(_record) => match load_package(&state, &component, &version).await {
-            Ok(Some(package)) => Json(package).into_response(),
-            Ok(None) => super::error::ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                super::codes::RELEASE_NOT_FOUND_AFTER_WRITE,
-                "release recorded but not found",
-            )
-            .into_response(),
-            Err(response) => response,
-        },
+        Ok(_record) => {
+            // 知识库包：签名旁文件（`<来源>.sig`）一并镜像 —— 中心下发时 gwlinkd 会把
+            // `<制品地址>` 与 `<制品地址>.sig` 一起取到网关投放目录，网关再验签。
+            if component == KNOWLEDGE_COMPONENT {
+                mirror_knowledge_signature(&state, &component, &version, &request.artifact_url)
+                    .await;
+            }
+            match load_package(&state, &component, &version).await {
+                Ok(Some(package)) => Json(package).into_response(),
+                Ok(None) => super::error::ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    super::codes::RELEASE_NOT_FOUND_AFTER_WRITE,
+                    "release recorded but not found",
+                )
+                .into_response(),
+                Err(response) => response,
+            }
+        }
         Err(response) => response,
+    }
+}
+
+/// 知识库包的**签名旁文件**（`<来源>.sig`）随包镜像到中心制品存储（best-effort）。
+///
+/// 为何要在中心做：中心「知识库下发」让 gwlinkd 把 `<制品地址>` 与 `<制品地址>.sig` 一起取到网关
+/// 投放目录，网关按 `<本地包>.sig` 验签。中心若不镜像 `.sig`，配了验签公钥的网关会拒收所有
+/// 中心推送的知识库包（错误在计划条目里可见，但那样才发现就晚了）。
+///
+/// 取不到 / 存储失败只告警不阻断发布：未配公钥的网关本来就只校验摘要。
+async fn mirror_knowledge_signature(
+    state: &ApiState,
+    component: &str,
+    version: &str,
+    artifact_url: &str,
+) {
+    let signature_url = format!("{artifact_url}.sig");
+    let bytes = match crate::infra::read_package_source(&signature_url).await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            log::warn!(
+                "event=KnowledgeSignatureNotMirrored component={component} version={version} url={signature_url} err={err}"
+            );
+            return;
+        }
+    };
+    // 与包本体同目录、同名 + `.sig` —— 与网关 `read_signature`（`<source>.sig`）同一约定。
+    let filename = format!(
+        "{}.sig",
+        crate::infra::artifact_filename(artifact_url, component, version)
+    );
+    if let Err(err) = state
+        .artifact_store
+        .store(component, version, &filename, bytes)
+        .await
+    {
+        log::warn!(
+            "event=KnowledgeSignatureStoreFailed component={component} version={version} err={err}"
+        );
     }
 }
 
