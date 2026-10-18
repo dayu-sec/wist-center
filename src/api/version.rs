@@ -58,6 +58,7 @@ mod tests {
                 gateway_image: "wist-gateway:latest".to_string(),
                 artifact_dir: artifact_dir.clone(),
                 object_storage: None,
+                package_sources: Vec::new(),
                 ca_cert: None,
                 protocol_version: "1.0".to_string(),
                 hmac_secret: "test-hmac-secret".to_string(),

@@ -71,20 +71,45 @@ fn parse_release_url(url: &str) -> Option<(String, String, String)> {
     Some((owner.to_string(), repo.to_string(), tag.to_string()))
 }
 
-/// 解析 GitHub release：拉 tag 与资产清单。`token` 为空则匿名请求。
-pub async fn resolve_github_release(
-    release_url: &str,
+/// 一条 release 的摘要（自动探测「最新版本」用，不下载资产）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GitHubReleaseSummary {
+    pub tag: String,
+    pub published_at: Option<String>,
+    pub prerelease: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubReleaseListItem {
+    tag_name: String,
+    #[serde(default)]
+    published_at: Option<String>,
+    #[serde(default)]
+    prerelease: bool,
+    #[serde(default)]
+    draft: bool,
+}
+
+/// 列 GitHub releases（API 顺序 = 最新在前，最多 `limit` 条；跳过 draft）。
+///
+/// 自动探测最新版本用它：一次 API 请求就能拿到最新 tag，再按 tag 拉资产。
+/// 公开仓匿名即可；私有仓 / 限流用 `WIST_CENTER_GITHUB_TOKEN`。
+pub async fn list_github_releases(
+    repo: &str,
     token: Option<&str>,
-) -> Result<ResolvedRelease, String> {
-    let (owner, repo, tag) = parse_release_url(release_url).ok_or_else(|| {
-        "not a GitHub release URL (expected https://github.com/<owner>/<repo>/releases/tag/<tag>)"
-            .to_string()
-    })?;
+    limit: usize,
+) -> Result<Vec<GitHubReleaseSummary>, String> {
+    let (owner, name) = repo
+        .split_once('/')
+        .ok_or_else(|| format!("not a GitHub repo (expected owner/repo): {repo}"))?;
     let client = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .build()
         .map_err(|err| format!("failed to build http client: {err}"))?;
-    let api = format!("{GITHUB_API}/repos/{owner}/{repo}/releases/tags/{tag}");
+    let api = format!(
+        "{GITHUB_API}/repos/{owner}/{name}/releases?per_page={}",
+        limit.clamp(1, 100)
+    );
     let mut request = client
         .get(&api)
         .header("user-agent", "wist-center")
@@ -98,15 +123,114 @@ pub async fn resolve_github_release(
         .map_err(|err| format!("failed to reach GitHub: {err}"))?;
     if !response.status().is_success() {
         return Err(format!(
-            "GitHub API returned {} for {owner}/{repo}@{tag}",
+            "GitHub API returned {} for {owner}/{name} releases",
             response.status()
         ));
     }
-    let release: GitHubRelease = response
+    let items: Vec<GitHubReleaseListItem> = response
         .json()
         .await
-        .map_err(|err| format!("failed to parse GitHub release payload: {err}"))?;
+        .map_err(|err| format!("failed to parse GitHub releases payload: {err}"))?;
+    Ok(items
+        .into_iter()
+        .filter(|item| !item.draft)
+        .map(|item| GitHubReleaseSummary {
+            tag: item.tag_name,
+            published_at: item.published_at,
+            prerelease: item.prerelease,
+        })
+        .collect())
+}
 
+/// 解析 GitHub release：拉 tag 与资产清单。`token` 为空则匿名请求。
+///
+/// **tag 带不带 `v` 都接受**：录入页的版本号来自包身份（如知识库 `0.3.0`），而 GitHub tag
+/// 通常是 `v0.3.0`。先按原样查；404 时再试另一种写法（带 v / 去 v），避免为前缀差异手工改版本。
+pub async fn resolve_github_release(
+    release_url: &str,
+    token: Option<&str>,
+) -> Result<ResolvedRelease, String> {
+    let (owner, repo, tag) = parse_release_url(release_url).ok_or_else(|| {
+        "not a GitHub release URL (expected https://github.com/<owner>/<repo>/releases/tag/<tag>)"
+            .to_string()
+    })?;
+    let client = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .map_err(|err| format!("failed to build http client: {err}"))?;
+
+    let mut last_error = None;
+    for candidate in tag_candidates(&tag) {
+        match fetch_github_release(&client, &owner, &repo, &candidate, token).await {
+            Ok(release) => return Ok(map_release(release)),
+            Err((status, message)) => {
+                last_error = Some(message);
+                // 只有 404 值得换一种 tag 写法；403 / 429 / 5xx 换写法也没用。
+                if status.as_u16() != 404 {
+                    break;
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| format!("failed to resolve {owner}/{repo}@{tag}")))
+}
+
+/// tag 的候选写法：原样优先，再试带 / 去 `v`。
+fn tag_candidates(tag: &str) -> Vec<String> {
+    let tag = tag.trim();
+    if tag.is_empty() {
+        return Vec::new();
+    }
+    if let Some(stripped) = tag.strip_prefix('v') {
+        if stripped.is_empty() {
+            vec![tag.to_string()]
+        } else {
+            vec![tag.to_string(), stripped.to_string()]
+        }
+    } else {
+        vec![tag.to_string(), format!("v{tag}")]
+    }
+}
+
+/// 单次按 tag 取 release；失败时带 HTTP 状态码，供调用方决定要不要换写法。
+async fn fetch_github_release(
+    client: &reqwest::Client,
+    owner: &str,
+    repo: &str,
+    tag: &str,
+    token: Option<&str>,
+) -> Result<GitHubRelease, (reqwest::StatusCode, String)> {
+    let api = format!("{GITHUB_API}/repos/{owner}/{repo}/releases/tags/{tag}");
+    let mut request = client
+        .get(&api)
+        .header("user-agent", "wist-center")
+        .header("accept", "application/vnd.github+json");
+    if let Some(token) = token.filter(|value| !value.is_empty()) {
+        request = request.header("authorization", format!("Bearer {token}"));
+    }
+    let response = request.send().await.map_err(|err| {
+        (
+            reqwest::StatusCode::BAD_GATEWAY,
+            format!("failed to reach GitHub: {err}"),
+        )
+    })?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err((
+            status,
+            format!("GitHub API returned {status} for {owner}/{repo}@{tag}"),
+        ));
+    }
+    response.json().await.map_err(|err| {
+        (
+            status,
+            format!("failed to parse GitHub release payload: {err}"),
+        )
+    })
+}
+
+/// `GitHubRelease` → 解析结果：从文件名读平台槽位、从 `digest` 读 sha256。
+fn map_release(release: GitHubRelease) -> ResolvedRelease {
     let assets = release
         .assets
         .into_iter()
@@ -129,16 +253,23 @@ pub async fn resolve_github_release(
             }
         })
         .collect();
-
-    Ok(ResolvedRelease {
+    ResolvedRelease {
         version: release.tag_name,
         assets,
-    })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tries_tag_with_and_without_v() {
+        assert_eq!(tag_candidates("0.3.0"), vec!["0.3.0", "v0.3.0"]);
+        assert_eq!(tag_candidates("v0.3.0"), vec!["v0.3.0", "0.3.0"]);
+        assert_eq!(tag_candidates("  0.3.0  "), vec!["0.3.0", "v0.3.0"]);
+        assert!(tag_candidates("   ").is_empty());
+    }
 
     #[test]
     fn parses_release_urls() {

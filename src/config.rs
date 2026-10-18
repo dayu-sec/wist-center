@@ -13,6 +13,7 @@
 // 相对路径（store.store_path / artifacts.dir / security.ca_cert_path）按配置文件所在目录解析。
 
 use std::{
+    collections::HashSet,
     env, fs,
     path::{Path, PathBuf},
 };
@@ -120,6 +121,9 @@ pub struct CenterConfig {
     pub artifact_dir: PathBuf,
     /// 云对象存储（可选，S3 兼容 / MinIO）；配置了 endpoint 则发布制品存对象存储，否则本地。
     pub object_storage: Option<ObjectStorageConfig>,
+    /// 安装包来源（`[packages.sources]`）：录入页据此把「版本号」拼成 GitHub Release 地址 / COS 路径，
+    /// 做 URL 探测后一键填充。只存**位置**，不存凭据（COS 制品牌公有读）。
+    pub package_sources: Vec<PackageSourceConfig>,
     /// 控制中心 CA 证书内容（control-center.pem，信任根）——分发给 Gateway 作为
     /// control_center.trust_bundle。来源：配置文件的 `security.ca_cert_path` 或
     /// `WARP_INSIGHT_CENTER_CA_CERT_PATH`，默认 `<配置目录>/ca/control-center.pem`；
@@ -151,6 +155,22 @@ pub struct ObjectStorageConfig {
     pub secret_key: String,
 }
 
+/// 一个安装包组件的来源位置：`component` 与 `/api/v1/admin/releases/:component` 的路径段一致。
+///
+/// 录入页只让操作者填**版本号**：GitHub 源拼 `https://github.com/<repo>/releases/tag/<version>`，
+/// COS 源拼 `<bucket>/<prefix>/<version>`，再走既有的解析接口做 URL 探测。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageSourceConfig {
+    pub component: String,
+    /// `owner/repo`（也接受 `https://github.com/owner/repo`）。
+    pub github_repo: Option<String>,
+    pub cos_bucket: Option<String>,
+    /// 默认取 `github_repo` 的末段（仓库名）。
+    pub cos_prefix: Option<String>,
+    /// 虚拟主机下载地址里能读出 region 时可留空；留空则解析器按候选区逐个探测。
+    pub cos_region: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct GatewayCredentialSeed {
     pub gateway_id: String,
@@ -180,6 +200,7 @@ struct RawCenterConfig {
     telemetry: RawTelemetryConfig,
     security: RawSecurityConfig,
     artifacts: RawArtifactsConfig,
+    packages: RawPackagesConfig,
     enrollment: RawEnrollmentConfig,
     log: wist_log::LogSection,
 }
@@ -221,6 +242,21 @@ struct RawArtifactsConfig {
     object_storage_bucket: Option<String>,
     object_storage_access_key: Option<String>,
     object_storage_secret_key: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawPackagesConfig {
+    #[serde(default)]
+    sources: Vec<RawPackageSource>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawPackageSource {
+    component: String,
+    github_repo: Option<String>,
+    cos_bucket: Option<String>,
+    cos_prefix: Option<String>,
+    cos_region: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -338,6 +374,7 @@ impl CenterConfig {
         let store = raw.store;
         let security = raw.security;
         let artifacts = raw.artifacts;
+        let package_sources = normalize_package_sources(raw.packages.sources)?;
         let admin_token = normalize_optional(serve.admin_token);
         // 对象存储：endpoint/bucket/凭据四项齐全才启用（否则用本地文件）。
         let object_storage = match (
@@ -409,6 +446,7 @@ impl CenterConfig {
                 ),
             ),
             object_storage,
+            package_sources,
             ca_cert: fs::read_to_string(&ca_cert_path).ok(),
             protocol_version: serve
                 .protocol_version
@@ -667,6 +705,100 @@ fn expand(env: &EnvDict, value: &str) -> Result<String, ConfigError> {
     Ok(expanded)
 }
 
+/// 归一化 `[packages.sources]`：组件唯一、GitHub 仓库写成 `owner/repo`、COS 前缀缺省取仓库名。
+///
+/// 这里只做**位置**校验（不联网、不碰凭据）：录入页拼出来的 URL 是否可用由解析接口现测。
+fn normalize_package_sources(
+    raw: Vec<RawPackageSource>,
+) -> Result<Vec<PackageSourceConfig>, ConfigError> {
+    let mut sources = Vec::with_capacity(raw.len());
+    let mut seen = HashSet::new();
+    for item in raw {
+        let component = item.component.trim().to_string();
+        if component.is_empty() || component.contains('/') {
+            return Err(config_validation(
+                "packages.sources[].component must be a single non-empty path segment",
+            ));
+        }
+        if !seen.insert(component.clone()) {
+            return Err(config_validation(format!(
+                "packages.sources[].component duplicated: {component}"
+            )));
+        }
+        let github_repo = normalize_optional(item.github_repo).map(|repo| {
+            let repo = repo
+                .strip_prefix("https://github.com/")
+                .or_else(|| repo.strip_prefix("http://github.com/"))
+                .or_else(|| repo.strip_prefix("github.com/"))
+                .unwrap_or(&repo)
+                .trim_end_matches('/')
+                .trim_end_matches(".git")
+                .to_string();
+            repo
+        });
+        if let Some(repo) = &github_repo {
+            let parts: Vec<&str> = repo.split('/').collect();
+            if parts.len() != 2 || parts.iter().any(|part| part.is_empty()) {
+                return Err(config_validation(format!(
+                    "packages.sources[].github_repo must be `owner/repo`: {repo}"
+                )));
+            }
+        }
+        let cos_bucket = normalize_optional(item.cos_bucket);
+        if let Some(bucket) = &cos_bucket {
+            // bucket / region / prefix 都会拼进 `https://<bucket>.cos.<region>.myqcloud.com/<prefix>/...`。
+            // 这些字段来自管理员配置，但仍然不应能改变 URL 的 host / 注入 query。
+            if bucket.contains(['/', '@', ':']) || bucket.contains(char::is_whitespace) {
+                return Err(config_validation(format!(
+                    "packages.sources[].cos_bucket must be a bare bucket name: {bucket}"
+                )));
+            }
+        }
+        let cos_region = normalize_optional(item.cos_region);
+        if let Some(region) = &cos_region {
+            if region.contains(['/', '@', ':']) || region.contains(char::is_whitespace) {
+                return Err(config_validation(format!(
+                    "packages.sources[].cos_region must be a bare region (e.g. ap-hongkong): {region}"
+                )));
+            }
+        }
+        let cos_prefix = normalize_optional(item.cos_prefix)
+            .map(|prefix| prefix.trim_matches('/').to_string())
+            .filter(|prefix| !prefix.is_empty())
+            .or_else(|| {
+                github_repo
+                    .as_deref()
+                    .and_then(|repo| repo.rsplit('/').next())
+                    .map(str::to_string)
+            });
+        if let Some(prefix) = &cos_prefix {
+            if prefix.contains(['?', '#']) {
+                return Err(config_validation(format!(
+                    "packages.sources[].cos_prefix must not contain '?' or '#': {prefix}"
+                )));
+            }
+        }
+        if cos_bucket.is_some() && cos_prefix.is_none() {
+            return Err(config_validation(
+                "packages.sources[].cos_prefix is required when cos_bucket is set",
+            ));
+        }
+        if github_repo.is_none() && cos_bucket.is_none() {
+            return Err(config_validation(format!(
+                "packages.sources[] for {component} needs github_repo and/or cos_bucket"
+            )));
+        }
+        sources.push(PackageSourceConfig {
+            component,
+            github_repo,
+            cos_bucket,
+            cos_prefix,
+            cos_region,
+        });
+    }
+    Ok(sources)
+}
+
 fn trim_trailing_slash(value: String) -> String {
     value.trim_end_matches('/').to_string()
 }
@@ -746,6 +878,93 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("time")
             .as_nanos()
+    }
+
+    #[test]
+    fn parses_package_sources_and_defaults_the_cos_prefix() {
+        let sources = normalize_package_sources(vec![
+            RawPackageSource {
+                component: "wist-agentd".into(),
+                github_repo: Some("https://github.com/dayu-sec/wist-agentd".into()),
+                cos_bucket: Some("github-1347593047".into()),
+                cos_prefix: None,
+                cos_region: Some("ap-hongkong".into()),
+            },
+            RawPackageSource {
+                component: "galaxy-ops".into(),
+                github_repo: Some("galaxio-labs/galaxy-ops".into()),
+                cos_bucket: None,
+                ..Default::default()
+            },
+        ])
+        .expect("sources");
+        assert_eq!(sources.len(), 2);
+        assert_eq!(
+            sources[0].github_repo.as_deref(),
+            Some("dayu-sec/wist-agentd")
+        );
+        // COS 前缀缺省取仓库名。
+        assert_eq!(sources[0].cos_prefix.as_deref(), Some("wist-agentd"));
+        assert_eq!(sources[0].cos_region.as_deref(), Some("ap-hongkong"));
+        assert_eq!(sources[1].cos_prefix.as_deref(), Some("galaxy-ops"));
+    }
+
+    #[test]
+    fn rejects_duplicate_or_unscoped_package_sources() {
+        fn source(component: &str) -> RawPackageSource {
+            RawPackageSource {
+                component: component.into(),
+                github_repo: Some("dayu-sec/wist-agentd".into()),
+                ..Default::default()
+            }
+        }
+        // 组件重复。
+        assert!(normalize_package_sources(vec![source("a"), source("a")]).is_err());
+        // 既没 GitHub 也没 COS。
+        assert!(
+            normalize_package_sources(vec![RawPackageSource {
+                component: "a".into(),
+                ..Default::default()
+            }])
+            .is_err()
+        );
+        // 仓库不是 owner/repo。
+        assert!(
+            normalize_package_sources(vec![RawPackageSource {
+                component: "a".into(),
+                github_repo: Some("not-a-repo".into()),
+                ..Default::default()
+            }])
+            .is_err()
+        );
+        // 组件名不能带路径分隔符。
+        assert!(
+            normalize_package_sources(vec![RawPackageSource {
+                component: "a/b".into(),
+                github_repo: Some("x/y".into()),
+                ..Default::default()
+            }])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn loads_package_sources_from_file() {
+        let path = write_temp_config(
+            r#"
+[packages]
+[[packages.sources]]
+component = "wist-agentd"
+github_repo = "dayu-sec/wist-agentd"
+cos_bucket = "github-1347593047"
+"#,
+        );
+        let config = CenterConfig::load_from_path(&path).expect("config loads");
+        assert_eq!(config.package_sources.len(), 1);
+        assert_eq!(
+            config.package_sources[0].cos_prefix.as_deref(),
+            Some("wist-agentd")
+        );
     }
 
     #[test]
@@ -1221,5 +1440,29 @@ max_bytes = 1048576
             Some(sha256_hex("sec-file-admin-token").as_str())
         );
         let _ = fs::remove_file(sec);
+    }
+
+    /// 来源字段会拼进 URL：bucket/region 不能改 host，prefix 不能注入 query/fragment。
+    #[test]
+    fn package_source_fields_cannot_inject_url_parts() {
+        fn cos(bucket: &str, prefix: &str, region: Option<&str>) -> RawPackageSource {
+            RawPackageSource {
+                component: "demo".into(),
+                github_repo: None,
+                cos_bucket: Some(bucket.into()),
+                cos_prefix: Some(prefix.into()),
+                cos_region: region.map(str::to_string),
+            }
+        }
+        // prefix 两端斜杠归一化。
+        let ok = normalize_package_sources(vec![cos("bucket", "/demo/", None)]).expect("ok");
+        assert_eq!(ok[0].cos_prefix.as_deref(), Some("demo"));
+        // bucket / region 不能带路径或 userinfo。
+        assert!(normalize_package_sources(vec![cos("b@evil", "demo", None)]).is_err());
+        assert!(normalize_package_sources(vec![cos("b/x", "demo", None)]).is_err());
+        assert!(normalize_package_sources(vec![cos("b", "demo", Some("r/x"))]).is_err());
+        // prefix 不能注入 query / fragment。
+        assert!(normalize_package_sources(vec![cos("b", "demo?x=1", None)]).is_err());
+        assert!(normalize_package_sources(vec![cos("b", "demo#frag", None)]).is_err());
     }
 }

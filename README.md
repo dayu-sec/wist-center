@@ -139,6 +139,34 @@ In the file:
   never clobbers the site's public URL, and re-rendering the declaration never clobbers the value
   (the value is not in there).
 
+### Package sources (auto-detect the latest)
+
+The install-package entry does **not** ask for a version after the first import. It takes the most
+recently recorded version as the base and asks for the newest one: GitHub releases are listed
+(newest first); a COS-only deployment probes the next patch versions under the configured prefix
+(`v0.1.46-alpha` → `v0.1.47-alpha`, …, stopping after three consecutive misses). When a newer
+version is found the page fills the artifact URLs and digests automatically and leaves the submit
+button. The first import (nothing recorded) uses the GitHub release list; a COS-only component
+without a recorded version keeps the manual version field. `GET /api/v1/admin/package-sources/latest`
+backs this; `GET /api/v1/admin/package-sources` returns the configured locations (never credentials).
+No background polling or bucket listing is involved — the COS bucket stays public-read. Set
+`WIST_CENTER_GITHUB_TOKEN` (fallback `GITHUB_TOKEN`): anonymous GitHub requests are limited to
+60/hour, and the auto-detection makes two calls per page load.
+
+```toml
+[packages]
+
+[[packages.sources]]
+component = "wist-agentd"                # same segment as /api/v1/admin/releases/:component
+github_repo = "dayu-sec/wist-agentd"     # https://github.com/<owner>/<repo>/releases/tag/<version>
+cos_bucket = "github-1347593047"           # <bucket>/<prefix>/<version>
+cos_prefix = "wist-agentd"               # defaults to the repository name
+cos_region = "ap-hongkong"              # optional; when set the virtual-host URL carries the region
+```
+
+`GET /api/v1/admin/package-sources` returns these locations (never credentials). GitHub and COS can
+be configured together; if neither is configured the page falls back to pasting a full URL.
+
 ### Environment variables
 
 | Variable | Default | Purpose |
@@ -165,6 +193,7 @@ In the file:
 | `WARP_INSIGHT_CENTER_SERVER_KEY_PATH` | *(unset)* | Server TLS private key (PEM). |
 | `WARP_INSIGHT_CENTER_PROTOCOL_VERSION` | `1.0` | Gateway ↔ center wire protocol version. |
 | `WARP_INSIGHT_CENTER_GATEWAY_IMAGE` | `wist-gateway:latest` | Image reference used in the generated gateway install command. |
+| `WIST_CENTER_GITHUB_TOKEN` | *(unset; falls back to `GITHUB_TOKEN`)* | Token used to list / resolve GitHub releases (auto-detect latest, one-click fill). Anonymous requests are limited to 60/hour; set it for private repos or frequent checks. |
 
 All four `..._OBJECT_STORAGE_*` variables must be set together; if any is missing, release
 artifacts are written to `ARTIFACT_DIR` instead.
@@ -208,6 +237,8 @@ All require the admin Bearer token:
 | `POST` | `/api/v1/admin/gateways/bind` |
 | `POST` | `/api/v1/admin/policies/global` |
 | `POST` | `/api/v1/gateway/agents/dispatch` |
+| `GET` | `/api/v1/admin/package-sources` |
+| `GET` | `/api/v1/admin/package-sources/latest` (`?component=…&base_version=…&source=…`) |
 | `POST` / `GET` | `/api/v1/admin/releases/:component` |
 | `POST` | `/api/v1/admin/releases/:component/batch` |
 | `POST` | `/api/v1/admin/releases/:component/:version/status` |

@@ -1191,6 +1191,286 @@ pub struct ResolveGitHubReleaseRequest {
     pub release_url: String,
 }
 
+/// 「自动探测最新版本」的查询参数。
+#[derive(Debug, serde::Deserialize)]
+pub struct PackageSourceLatestQuery {
+    pub component: String,
+    /// 已知版本（缺省取该组件最近一次录入的版本）。COS 侧从这里往后探测。
+    #[serde(default)]
+    pub base_version: Option<String>,
+    /// 只查某个来源（`github` / `cos`）；缺省先 GitHub、再 COS。
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+/// 自动探测某组件的最新版本：GitHub 列 releases；只有 COS 时从已知版本往后探测。
+///
+/// 录入页不再要求每次都填版本号：第一次可以用 GitHub 的最新 release（或手工指定），
+/// 之后用「已录入的最新版本」作为基准自动往前找。返回解析好的 assets，页面直接填表。
+pub async fn admin_package_source_latest(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    client: PeerConnectInfo,
+    ApiQuery(query): ApiQuery<PackageSourceLatestQuery>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    let Some(source) = state
+        .config
+        .package_sources
+        .iter()
+        .find(|source| source.component == query.component)
+    else {
+        return super::error::ApiError::not_found(
+            super::codes::PACKAGE_SOURCE_NOT_FOUND,
+            "no package source configured for this component",
+        )
+        .into_response();
+    };
+
+    // `source` 只接受 github / cos；非法值 / 该来源未配置 → 400（而不是 502 让人以为网络问题）。
+    let prefer = query
+        .source
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let (want_github, want_cos) = match prefer {
+        None => (true, true),
+        Some("github") => (true, false),
+        Some("cos") => (false, true),
+        Some(other) => {
+            return super::error::ApiError::bad_request(
+                super::codes::PACKAGE_SOURCE_NOT_CONFIGURED,
+                format!("source must be `github` or `cos`: {other}"),
+            )
+            .into_response();
+        }
+    };
+    if want_github && source.github_repo.is_none() {
+        return super::error::ApiError::bad_request(
+            super::codes::PACKAGE_SOURCE_NOT_CONFIGURED,
+            "github source is not configured for this component",
+        )
+        .into_response();
+    }
+    if want_cos && (source.cos_bucket.is_none() || source.cos_prefix.is_none()) {
+        return super::error::ApiError::bad_request(
+            super::codes::PACKAGE_SOURCE_NOT_CONFIGURED,
+            "cos source is not configured for this component",
+        )
+        .into_response();
+    }
+
+    let releases = match state.store.list_releases(&query.component).await {
+        Ok(releases) => releases,
+        Err(err) => {
+            return super::error::ApiError::internal(
+                super::codes::PACKAGE_SOURCE_CHECK_FAILED,
+                "failed to load recorded releases",
+                err,
+            )
+            .into_response();
+        }
+    };
+    let recorded_latest = releases
+        .iter()
+        .max_by(|left, right| left.published_at.cmp(&right.published_at))
+        .map(|release| release.version.clone());
+    let base = query
+        .base_version
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| recorded_latest.clone());
+    let is_imported = |version: &str| {
+        let version = version.trim().trim_start_matches('v');
+        releases
+            .iter()
+            .any(|release| release.version.trim().trim_start_matches('v') == version)
+    };
+
+    let token = std::env::var("WIST_CENTER_GITHUB_TOKEN")
+        .ok()
+        .or_else(|| std::env::var("GITHUB_TOKEN").ok());
+    // 记下 GitHub 侧的失败原因：到最后兜底 502 时带上，别只回一句泛泛的 “failed to check”。
+    let mut github_error: Option<String> = None;
+
+    // GitHub 优先：一次 API 请求就能拿到最新 tag，比 COS 逐个探测准。
+    if want_github && let Some(repo) = source.github_repo.as_deref() {
+        match crate::infra::list_github_releases(repo, token.as_deref(), 20).await {
+            Ok(items) => {
+                if let Some(latest) = items.first() {
+                    let version = latest.tag.clone();
+                    let up_to_date = base.as_deref().is_some_and(|base| {
+                        base.trim().trim_start_matches('v')
+                            == version.trim().trim_start_matches('v')
+                    });
+                    if up_to_date {
+                        return Json(serde_json::json!({
+                            "component": query.component,
+                            "source": "github",
+                            "base_version": base,
+                            "version": version,
+                            "imported": is_imported(&version),
+                            "up_to_date": true,
+                            "assets": [],
+                        }))
+                        .into_response();
+                    }
+                    let url = format!("https://github.com/{repo}/releases/tag/{version}");
+                    match crate::infra::resolve_github_release(&url, token.as_deref()).await {
+                        Ok(resolved) => {
+                            return Json(serde_json::json!({
+                                "component": query.component,
+                                "source": "github",
+                                "base_version": base,
+                                "version": resolved.version,
+                                "imported": is_imported(&resolved.version),
+                                "up_to_date": false,
+                                "assets": resolved.assets,
+                            }))
+                            .into_response();
+                        }
+                        Err(err) => {
+                            github_error = Some(format!("resolve {url}: {err}"));
+                            log::warn!("auto-detect latest: resolve {url} failed: {err}");
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                github_error = Some(format!("list {repo}: {err}"));
+                log::warn!("auto-detect latest: list {repo} failed: {err}");
+            }
+        }
+    }
+
+    // COS 兜底：从已知版本往后逐个试（没有 List，只能按命名约定探测）。
+    if want_cos
+        && let (Some(bucket), Some(prefix)) =
+            (source.cos_bucket.as_deref(), source.cos_prefix.as_deref())
+    {
+        let Some(base) = base else {
+            return super::error::ApiError::bad_request(
+                super::codes::PACKAGE_SOURCE_BASE_REQUIRED,
+                "the first import needs a version: no recorded release to probe from",
+            )
+            .into_response();
+        };
+        let base_path = match source.cos_region.as_deref() {
+            Some(region) => format!("https://{bucket}.cos.{region}.myqcloud.com/{prefix}"),
+            None => format!("{bucket}/{prefix}"),
+        };
+        // 录入的版本号可能带/不带 `v`（知识库的包身份去掉了 v，COS 前缀仍带 v），两种都试；
+        // 命中的那种前缀就是后续候选的写法。**基准不在 COS 上也要继续探**：COS 可能只保留了
+        // 更新的版本（如录入的 v0.3.0 已不在，但 v0.4.0 / v0.5.0 在），此时靠 minor 探测找到。
+        let mut base_variants = vec![base.clone()];
+        if let Some(stripped) = base.strip_prefix('v') {
+            if !stripped.is_empty() {
+                base_variants.push(stripped.to_string());
+            }
+        } else {
+            base_variants.push(format!("v{base}"));
+        }
+        let mut probe_base = base.clone();
+        let mut base_found = false;
+        for variant in &base_variants {
+            if crate::infra::resolve_cos_path(&format!("{base_path}/{variant}"))
+                .await
+                .is_ok()
+            {
+                probe_base = variant.clone();
+                base_found = true;
+                break;
+            }
+        }
+        // patch 优先，再 minor（跳版），最后 major；全部试完取最后一个命中（候选按版本递增）。
+        let candidates = crate::infra::version_probe_candidates(&probe_base, 6, 4, 2);
+        let mut found: Option<crate::infra::ResolvedRelease> = None;
+        for candidate in &candidates {
+            if let Ok(resolved) =
+                crate::infra::resolve_cos_path(&format!("{base_path}/{candidate}")).await
+            {
+                found = Some(resolved);
+            }
+        }
+        if let Some(resolved) = found {
+            let imported = is_imported(&resolved.version);
+            return Json(serde_json::json!({
+                "component": query.component,
+                "source": "cos",
+                "base_version": base,
+                "version": resolved.version,
+                "imported": imported,
+                "up_to_date": false,
+                "assets": resolved.assets,
+            }))
+            .into_response();
+        }
+        if base_found {
+            return Json(serde_json::json!({
+                "component": query.component,
+                "source": "cos",
+                "base_version": base,
+                "version": probe_base,
+                "imported": is_imported(&probe_base),
+                "up_to_date": true,
+                "assets": [],
+            }))
+            .into_response();
+        }
+        return super::error::ApiError::handled(
+            StatusCode::BAD_GATEWAY,
+            super::codes::PACKAGE_SOURCE_CHECK_FAILED,
+            "the recorded version was not found under the configured COS path and no newer candidate matched; check cos_bucket / cos_prefix",
+        )
+        .into_response();
+    }
+
+    let message = match github_error {
+        Some(err) => format!("failed to check the latest package version: {err}"),
+        None => "failed to check the latest package version".to_string(),
+    };
+    super::error::ApiError::handled(
+        StatusCode::BAD_GATEWAY,
+        super::codes::PACKAGE_SOURCE_CHECK_FAILED,
+        message,
+    )
+    .into_response()
+}
+
+/// 安装包来源（`[packages.sources]`）：录入页据此把「版本号」拼成 GitHub Release 地址 / COS 路径。
+///
+/// 只返回位置，不返回任何凭据；没有配置时返回空数组（页面回落到手工粘贴地址）。
+pub async fn admin_list_package_sources(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    client: PeerConnectInfo,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    let sources: Vec<serde_json::Value> = state
+        .config
+        .package_sources
+        .iter()
+        .map(|source| {
+            serde_json::json!({
+                "component": source.component,
+                "github_repo": source.github_repo,
+                "cos_bucket": source.cos_bucket,
+                "cos_prefix": source.cos_prefix,
+                "cos_region": source.cos_region,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "sources": sources })).into_response()
+}
+
 /// 解析 GitHub Release：POST /api/v1/admin/github-release/resolve。
 /// 从 `https://github.com/<owner>/<repo>/releases/tag/<tag>` 拉出 tag（版本）与各平台制品地址（含 sha256）。
 pub async fn admin_resolve_github_release(
@@ -1233,7 +1513,7 @@ pub struct ResolveCosRequest {
 }
 
 /// 解析腾讯 COS 路径：POST /api/v1/admin/cos/resolve。
-/// 从 `wist-1347593047/wist-gwlinkd/v0.9.3-alpha`（bucket + `component/version` 前缀）列出对象，
+/// 从 `github-1347593047/wist-gwlinkd/v0.9.3-alpha`（bucket + `component/version` 前缀）列出对象，
 /// 返回每个制品的下载地址 / sha256 / 平台；镜像 GitHub resolver，供录入页一键填充多平台制品。
 pub async fn admin_resolve_cos(
     State(state): State<ApiState>,
@@ -2095,7 +2375,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::{
-        config::{CenterConfig, GatewayCredentialSeed},
+        config::{CenterConfig, GatewayCredentialSeed, PackageSourceConfig},
         infra::FileStore,
     };
 
@@ -2163,6 +2443,7 @@ mod tests {
                 gateway_image: "wist-gateway:latest".to_string(),
                 artifact_dir: std::env::temp_dir().join("wic-artifacts"),
                 object_storage: None,
+                package_sources: Vec::new(),
                 ca_cert: None,
                 protocol_version: "1.0".to_string(),
                 hmac_secret: "test-hmac-secret".to_string(),
@@ -4007,6 +4288,7 @@ mod tests {
                 gateway_image: "wist-gateway:latest".to_string(),
                 artifact_dir: std::env::temp_dir().join("wic-artifacts"),
                 object_storage: None,
+                package_sources: Vec::new(),
                 ca_cert: None,
                 protocol_version: "1.0".to_string(),
                 hmac_secret: "test-hmac-secret".to_string(),
@@ -4213,6 +4495,7 @@ mod tests {
                 gateway_image: "wist-gateway:latest".to_string(),
                 artifact_dir: std::env::temp_dir().join("wic-artifacts"),
                 object_storage: None,
+                package_sources: Vec::new(),
                 ca_cert: None,
                 protocol_version: "1.0".to_string(),
                 hmac_secret: "test-hmac-secret".to_string(),
@@ -4524,6 +4807,7 @@ mod tests {
                 gateway_image: "wist-gateway:latest".to_string(),
                 artifact_dir: std::env::temp_dir().join("wic-artifacts"),
                 object_storage: None,
+                package_sources: Vec::new(),
                 ca_cert: Some(
                     "-----BEGIN CERTIFICATE-----\nca\n-----END CERTIFICATE-----".to_string(),
                 ),
@@ -5329,5 +5613,98 @@ mod tests {
                 .is_some_and(|token| !token.is_empty()),
             "响应应含一次性明文接入券：{body}"
         );
+    }
+
+    fn package_source_state() -> ApiState {
+        let mut state = state_with_store(test_store());
+        state.config.package_sources = vec![
+            PackageSourceConfig {
+                component: "wist-agentd".into(),
+                github_repo: Some("dayu-sec/wist-agentd".into()),
+                cos_bucket: Some("github-1347593047".into()),
+                cos_prefix: Some("wist-agentd".into()),
+                cos_region: Some("ap-hongkong".into()),
+            },
+            PackageSourceConfig {
+                component: "cos-only".into(),
+                github_repo: None,
+                cos_bucket: Some("github-1347593047".into()),
+                cos_prefix: Some("cos-only".into()),
+                cos_region: None,
+            },
+        ];
+        state
+    }
+
+    /// 配置里的来源要原样返回（页面据此拼 URL），且缺少 GitHub 的组件必须返回 null。
+    #[tokio::test]
+    async fn lists_configured_package_sources() {
+        let app = super::super::router_for(package_source_state());
+        let (status, body) = get_json(&app, "/api/v1/admin/package-sources").await;
+        assert_eq!(status, StatusCode::OK);
+        let sources = body["sources"].as_array().expect("sources array");
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0]["component"], "wist-agentd");
+        assert_eq!(sources[0]["github_repo"], "dayu-sec/wist-agentd");
+        assert_eq!(sources[0]["cos_region"], "ap-hongkong");
+        assert_eq!(sources[1]["component"], "cos-only");
+        assert!(sources[1]["github_repo"].is_null());
+    }
+
+    /// 安装包来源也是管理面：没有 admin bearer 不能读。
+    #[tokio::test]
+    async fn package_sources_require_admin_bearer() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let app = super::super::router_for(package_source_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/admin/package-sources")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// 非法 / 未配置的 `source` 要在**发网络请求之前**返回 400，而不是 502。
+    #[tokio::test]
+    async fn package_source_latest_validates_source_before_probing() {
+        let app = super::super::router_for(package_source_state());
+
+        let (status, body) = get_json(
+            &app,
+            "/api/v1/admin/package-sources/latest?component=wist-agentd&source=bogus",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["error"]["code"],
+            super::super::codes::PACKAGE_SOURCE_NOT_CONFIGURED
+        );
+
+        // cos-only 组件被要求查 github → 400，而不是拿空 repo 去请求 GitHub。
+        let (status, body) = get_json(
+            &app,
+            "/api/v1/admin/package-sources/latest?component=cos-only&source=github",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["error"]["code"],
+            super::super::codes::PACKAGE_SOURCE_NOT_CONFIGURED
+        );
+
+        // 未配置来源的组件仍然 404（先判组件，再判 source）。
+        let (status, _) = get_json(
+            &app,
+            "/api/v1/admin/package-sources/latest?component=ghost",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }

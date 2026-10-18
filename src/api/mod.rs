@@ -35,11 +35,11 @@ use admin_ops::{
     admin_dispatch_global_policy, admin_get_agent_history, admin_get_gateway_history,
     admin_get_gateway_initial_config, admin_get_gateway_uptime, admin_list_gateway_agents,
     admin_list_gateway_instances, admin_list_gateway_lifecycle, admin_list_gateway_status,
-    admin_list_releases, admin_list_upgrade_plans, admin_publish_release,
-    admin_publish_release_batch, admin_resolve_cos, admin_resolve_github_release,
-    admin_retry_upgrade_plan, admin_rotate_gateway_link_token, admin_set_gateway_archived,
-    admin_set_release_status, admin_show_gateway_status, admin_view_gateway_list,
-    admin_view_upgrade_plan,
+    admin_list_package_sources, admin_list_releases, admin_list_upgrade_plans,
+    admin_package_source_latest, admin_publish_release, admin_publish_release_batch,
+    admin_resolve_cos, admin_resolve_github_release, admin_retry_upgrade_plan,
+    admin_rotate_gateway_link_token, admin_set_gateway_archived, admin_set_release_status,
+    admin_show_gateway_status, admin_view_gateway_list, admin_view_upgrade_plan,
 };
 use gateway_ops::{
     download_release_artifact, get_gateway_initial_config, get_gateway_upgrade_plan,
@@ -307,6 +307,16 @@ pub fn router_for(state: ApiState) -> Router {
         .route(
             "/api/v1/admin/releases/{component}/batch",
             post(admin_publish_release_batch),
+        )
+        // 管理面：安装包来源（录入页按版本号拼 URL 做探活）
+        .route(
+            "/api/v1/admin/package-sources",
+            get(admin_list_package_sources),
+        )
+        // 管理面：自动探测最新版本（GitHub 列 releases；只有 COS 时从已知版本往后探测）
+        .route(
+            "/api/v1/admin/package-sources/latest",
+            get(admin_package_source_latest),
         )
         // 管理面：解析 GitHub Release（拉 tag + 多平台制品地址，供录入页一键填充）
         .route(

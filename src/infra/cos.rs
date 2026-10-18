@@ -2,7 +2,7 @@
 //! 下载地址 / sha256 / 平台 —— 镜像 [`crate::infra::github`] 的 GitHub release 解析。
 //!
 //! 供「录入安装包」页一键填充多平台制品：输入
-//! `wist-1347593047/wist-gwlinkd/v0.9.3-alpha`（或 `cos://…` / 带 region 的下载地址）→
+//! `github-1347593047/wist-gwlinkd/v0.9.3-alpha`（或 `cos://…` / 带 region 的下载地址）→
 //! 返回 `{version, assets[]}`，每个 asset 带 `artifact_url`（COS 虚拟主机公开地址）、
 //! `sha256`（对象自定义元数据 `x-cos-meta-artifact-sha256`，缺失为 `None`）与
 //! `platform`（完整 target-triple，如 `x86_64-unknown-linux-musl`；单制品为 `None`）。
@@ -155,6 +155,150 @@ fn resolve_region(from_path: Option<String>) -> Option<String> {
 /// 约定（与各仓 release.yml 的 `upload-cos` 一致）：对象键为
 /// `{prefix}/{组件}-{版本}[-{三元组}].tar.gz`，其中 `prefix = {组件}/{版本}`。
 ///
+/// 该前缀下要试的对象键：三平台 + 一个「无三元组」的单制品形态（如 `wist-gateway-stack`）。
+///
+/// **版本号在文件名里可能不带 `v`**：知识库的打包脚本用 `${GITHUB_REF_NAME#v}` 命名制品
+/// （`wist-knowledge-0.1.1.tar.gz`），而 COS 前缀仍带 v（`wist-knowledge/v0.1.1/`）。
+/// agentd / gwlinkd 的制品名保留 v，所以两种都试 —— 多出来的那个 HEAD 只在没命中时发生。
+fn artifact_keys(
+    prefix_key: &str,
+    component: &str,
+    version: &str,
+) -> Vec<(String, Option<String>)> {
+    // 版本号在文件名里可能带/不带 `v`：两种写法都要试，且**平台变体与单制品都要覆盖**
+    // （agentd / gwlinkd 的制品名保留 v，知识库的是 `${GITHUB_REF_NAME#v}`）。
+    let mut versions = vec![version.to_string()];
+    if let Some(bare) = version.strip_prefix('v') {
+        if !bare.is_empty() {
+            versions.push(bare.to_string());
+        }
+    } else {
+        versions.push(format!("v{version}"));
+    }
+
+    let mut candidates: Vec<(String, Option<String>)> = Vec::new();
+    for ver in versions {
+        let stem = format!("{component}-{ver}");
+        for triple in KNOWN_PLATFORMS {
+            candidates.push((
+                format!("{prefix_key}/{stem}-{triple}.tar.gz"),
+                Some(triple.to_string()),
+            ));
+        }
+        candidates.push((format!("{prefix_key}/{stem}.tar.gz"), None));
+    }
+    candidates.dedup();
+    candidates
+}
+
+/// 从已知版本生成候选：patch / minor / major 三段递增（保留 `v` 前缀与 `-alpha` 后缀）。
+///
+/// 自动探测「最新版本」用：COS 不能匿名列目录，只能从上次录入的版本往后试。
+/// 先试 patch（`0.1.46` → `0.1.47`…），再试 minor（`0.1.46` → `0.2.0`…），最后 major；
+/// 这样即使下一版跳了 minor（`v0.3.0-alpha` → `v0.5.0-alpha`）也能探到。
+/// 非三段 semver（如 `v1.02`）退回「最后一个数字段递增」。
+pub fn version_probe_candidates(
+    base: &str,
+    patch_steps: usize,
+    minor_steps: usize,
+    major_steps: usize,
+) -> Vec<String> {
+    let base = base.trim();
+    let Some(tag) = parse_semver_tag(base) else {
+        return next_segment_candidates(base, patch_steps);
+    };
+    let mut candidates = Vec::new();
+    for step in 1..=patch_steps {
+        candidates.push(tag.render(tag.major, tag.minor, tag.patch + step as u64));
+    }
+    for step in 1..=minor_steps {
+        candidates.push(tag.render(tag.major, tag.minor + step as u64, 0));
+    }
+    for step in 1..=major_steps {
+        candidates.push(tag.render(tag.major + step as u64, 0, 0));
+    }
+    candidates.dedup();
+    candidates
+}
+
+/// `[v]MAJOR.MINOR.PATCH[-suffix]` 的拆分；三段数字之外返回 None。
+struct SemverTag<'a> {
+    has_v: bool,
+    major: u64,
+    minor: u64,
+    patch: u64,
+    suffix: &'a str,
+}
+
+impl SemverTag<'_> {
+    fn render(&self, major: u64, minor: u64, patch: u64) -> String {
+        let v = if self.has_v { "v" } else { "" };
+        format!("{v}{major}.{minor}.{patch}{}", self.suffix)
+    }
+}
+
+fn parse_semver_tag(value: &str) -> Option<SemverTag<'_>> {
+    let (has_v, rest) = match value.strip_prefix('v').or_else(|| value.strip_prefix('V')) {
+        Some(rest) => (true, rest),
+        None => (false, value),
+    };
+    // 后缀从第一个 `-` / `+` 开始（`0.1.46-alpha` → `-alpha`）。
+    let (core, suffix) = match rest.find(['-', '+']) {
+        Some(index) => (&rest[..index], &rest[index..]),
+        None => (rest, ""),
+    };
+    let parts: Vec<&str> = core.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let major = parts[0].parse::<u64>().ok()?;
+    let minor = parts[1].parse::<u64>().ok()?;
+    let patch = parts[2].parse::<u64>().ok()?;
+    Some(SemverTag {
+        has_v,
+        major,
+        minor,
+        patch,
+        suffix,
+    })
+}
+
+/// 非 semver 的兜底：只递增最后一个数字段，保留宽度。
+fn next_segment_candidates(base: &str, steps: usize) -> Vec<String> {
+    let base = base.trim();
+    let Some((start, end)) = last_digit_range(base) else {
+        return Vec::new();
+    };
+    let digits = &base[start..end];
+    let Ok(number) = digits.parse::<u64>() else {
+        return Vec::new();
+    };
+    let width = digits.len();
+    (1..=steps)
+        .map(|step| {
+            let next = number + step as u64;
+            let rendered = if width > 1 {
+                format!("{next:0width$}")
+            } else {
+                next.to_string()
+            };
+            format!("{}{}{}", &base[..start], rendered, &base[end..])
+        })
+        .collect()
+}
+
+/// 最后一个连续数字段的字节区间。
+fn last_digit_range(value: &str) -> Option<(usize, usize)> {
+    let bytes = value.as_bytes();
+    let end = bytes.iter().rposition(|byte| byte.is_ascii_digit())? + 1;
+    let start = bytes[..end]
+        .iter()
+        .rposition(|byte| !byte.is_ascii_digit())
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    Some((start, end))
+}
+
 /// region 不固定：路径（虚拟主机写法）或 `WIST_CENTER_COS_REGION` 给了就用它；都没给就按
 /// [`REGION_CANDIDATES`] 逐个试，第一个能取到对象的 region 即命中。
 pub async fn resolve_cos_path(cos_path: &str) -> Result<ResolvedRelease, String> {
@@ -167,25 +311,13 @@ pub async fn resolve_cos_path(cos_path: &str) -> Result<ResolvedRelease, String>
         .collect();
     if segments.len() < 2 {
         return Err("cos path must be <bucket>/<component>/<version> (e.g. \
-             wist-1347593047/wist-gwlinkd/v0.9.3-alpha)"
+             github-1347593047/wist-gwlinkd/v0.9.3-alpha)"
             .to_string());
     }
     let component = segments[0];
     let version = segments[segments.len() - 1];
     let prefix_key = parsed.prefix.trim_matches('/');
-    let stem = format!("{component}-{version}");
-
-    // 候选：三平台 + 一个「无三元组」的单制品形态（如 wist-gateway-stack）。
-    let mut candidates: Vec<(String, Option<String>)> = KNOWN_PLATFORMS
-        .iter()
-        .map(|triple| {
-            (
-                format!("{prefix_key}/{stem}-{triple}.tar.gz"),
-                Some((*triple).to_string()),
-            )
-        })
-        .collect();
-    candidates.push((format!("{prefix_key}/{stem}.tar.gz"), None));
+    let candidates = artifact_keys(prefix_key, component, version);
 
     let client = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
@@ -256,29 +388,41 @@ mod tests {
     fn parses_all_accepted_cos_path_forms() {
         // 1. cos:// URL。
         assert_eq!(
-            parse_cos_path("cos://wist-1347593047/wist-gwlinkd/v0.9.3-alpha"),
-            Ok(parsed("wist-1347593047", "wist-gwlinkd/v0.9.3-alpha", None))
+            parse_cos_path("cos://github-1347593047/wist-gwlinkd/v0.9.3-alpha"),
+            Ok(parsed(
+                "github-1347593047",
+                "wist-gwlinkd/v0.9.3-alpha",
+                None
+            ))
         );
         // 2. 裸 bucket/prefix。
         assert_eq!(
-            parse_cos_path("wist-1347593047/wist-gwlinkd/v0.9.3-alpha"),
-            Ok(parsed("wist-1347593047", "wist-gwlinkd/v0.9.3-alpha", None))
+            parse_cos_path("github-1347593047/wist-gwlinkd/v0.9.3-alpha"),
+            Ok(parsed(
+                "github-1347593047",
+                "wist-gwlinkd/v0.9.3-alpha",
+                None
+            ))
         );
         // 3. 虚拟主机下载地址（含 query / fragment / 末尾斜杠）→ 顺带读出 region。
         assert_eq!(
             parse_cos_path(
-                "https://wist-1347593047.cos.ap-guangzhou.myqcloud.com/wist-gwlinkd/v0.9.3-alpha/?x=1#y"
+                "https://github-1347593047.cos.ap-hongkong.myqcloud.com/wist-gwlinkd/v0.9.3-alpha/?x=1#y"
             ),
             Ok(parsed(
-                "wist-1347593047",
+                "github-1347593047",
                 "wist-gwlinkd/v0.9.3-alpha",
-                Some("ap-guangzhou")
+                Some("ap-hongkong")
             ))
         );
         // 空白环绕也归一化。
         assert_eq!(
-            parse_cos_path("  wist-1347593047/wist-gwlinkd/v0.9.3-alpha  "),
-            Ok(parsed("wist-1347593047", "wist-gwlinkd/v0.9.3-alpha", None))
+            parse_cos_path("  github-1347593047/wist-gwlinkd/v0.9.3-alpha  "),
+            Ok(parsed(
+                "github-1347593047",
+                "wist-gwlinkd/v0.9.3-alpha",
+                None
+            ))
         );
     }
 
@@ -287,14 +431,75 @@ mod tests {
         for bad in [
             "",
             "   ",
-            "cos://wist-1347593047",  // 缺 prefix
-            "wist-1347593047",        // 裸形式缺 prefix
-            "cos:///wist-gwlinkd/v1", // 空 bucket
-            "cos://wist-1347593047/", // 空 prefix
-            "wist-1347593047/",       // 空 prefix
+            "cos://github-1347593047",  // 缺 prefix
+            "github-1347593047",        // 裸形式缺 prefix
+            "cos:///wist-gwlinkd/v1",   // 空 bucket
+            "cos://github-1347593047/", // 空 prefix
+            "github-1347593047/",       // 空 prefix
         ] {
             assert!(parse_cos_path(bad).is_err(), "should reject {bad:?}");
         }
+    }
+
+    #[test]
+    fn tries_both_v_and_bare_version_artifact_names() {
+        let agentd = artifact_keys("wist-agentd", "wist-agentd", "v0.4.0-alpha");
+        assert!(agentd.iter().any(|(key, _)| {
+            key.ends_with("/wist-agentd-v0.4.0-alpha-x86_64-unknown-linux-musl.tar.gz")
+        }));
+        // 多平台变体也要试「去 v」写法（不能只补单制品）。
+        assert!(agentd.iter().any(|(key, _)| {
+            key.ends_with("/wist-agentd-0.4.0-alpha-x86_64-unknown-linux-musl.tar.gz")
+        }));
+        assert!(
+            agentd
+                .iter()
+                .any(|(key, _)| key.ends_with("/wist-agentd-0.4.0-alpha.tar.gz"))
+        );
+
+        let knowledge = artifact_keys("wist-knowledge", "wist-knowledge", "v0.1.1");
+        assert!(
+            knowledge
+                .iter()
+                .any(|(key, _)| key.ends_with("/wist-knowledge-0.1.1.tar.gz"))
+        );
+        // 反向：输入不带 v 时，也要试带 v 的制品名（COS 前缀常带 v）。
+        let bare = artifact_keys("wist-knowledge", "wist-knowledge", "0.1.1");
+        assert!(
+            bare.iter()
+                .any(|(key, _)| key.ends_with("/wist-knowledge-v0.1.1.tar.gz"))
+        );
+        assert_eq!(
+            bare.iter()
+                .filter(|(key, _)| key.ends_with("/wist-knowledge-0.1.1.tar.gz"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn probes_patch_minor_and_major_candidates() {
+        // patch 优先。
+        assert_eq!(
+            version_probe_candidates("v0.1.46-alpha", 2, 0, 0),
+            vec!["v0.1.47-alpha", "v0.1.48-alpha"]
+        );
+        // 跳 minor：v0.3.0-alpha → v0.4.0-alpha / v0.5.0-alpha。
+        assert_eq!(
+            version_probe_candidates("v0.3.0-alpha", 1, 2, 0),
+            vec!["v0.3.1-alpha", "v0.4.0-alpha", "v0.5.0-alpha"]
+        );
+        // 不带 v 的也能生成；major 归零。
+        assert_eq!(
+            version_probe_candidates("0.3.0", 0, 1, 1),
+            vec!["0.4.0", "1.0.0"]
+        );
+        // 非 semver：退回最后一个数字段，保留零填充。
+        assert_eq!(
+            version_probe_candidates("v1.02", 1, 1, 0),
+            vec!["v1.03".to_string()]
+        );
+        assert!(version_probe_candidates("latest", 3, 3, 1).is_empty());
     }
 
     #[test]

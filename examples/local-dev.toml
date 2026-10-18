@@ -81,6 +81,19 @@ object_storage_bucket = ""
 object_storage_access_key = ""
 object_storage_secret_key = ""
 
+[packages]
+# 安装包来源：录入页以「最近录入的版本」为基准自动探测最新（GitHub 列 releases；
+# 只有 COS 时从基准版本往后探测），探到新版本直接填表。
+# 每个组件一条；只写位置，不写凭据（COS 制品牌公有读）。
+# GitHub 与 COS 可同时配：页面两个 tab 都可用；只配一个时另一个仍可手工粘贴地址。
+#
+# [[packages.sources]]
+# component = "wist-agentd"
+# github_repo = "dayu-sec/wist-agentd"     # 也接受 https://github.com/dayu-sec/wist-agentd
+# cos_bucket = "github-1347593047"
+# cos_prefix = "wist-agentd"               # 缺省取 github_repo 的末段
+# cos_region = "ap-hongkong"              # 可留空：解析器按候选区逐个探测
+
 [enrollment]
 # 启动时写进 store（只在缺失时写）的网关种子凭据，每项 `gateway_id:token`。
 # 开发时想省掉"先注册一次"的步骤可以填，例如：
