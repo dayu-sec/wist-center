@@ -3,7 +3,7 @@
 
 [package]
 name = "wist-center"
-version = "0.16.0" #@gxl:set(version)
+version = "0.17.0" #@gxl:set(version)
 edition = "2024"
 
 [dependencies]
@@ -19,8 +19,8 @@ async-trait = "0.1"
 aws-sdk-s3 = "1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
 sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "tls-none", "chrono"] }
-wist-control =  "0.15"
-#wist-control = { path = "../wist-control" }
+wist-control =  "0.16"
+#wist-control = { version = "0.16", path = "../wist-control" }
 wist-error =  "0.2"
 # 错误投影 wire 类型（`ProtocolError` / `ProtocolErrorEnvelope`）：与 gateway / gwlinkd / agentd 共用同一份。
 wist-shared = "0.2"

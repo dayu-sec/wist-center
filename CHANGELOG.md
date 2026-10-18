@@ -5,6 +5,21 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.17.0-alpha] - 2026-10-18
+
+### 新增
+
+- **网关宿主依赖工具版本可见**：`ReportGatewayStatus` 带上的 `gops_version` / `gx_version` 现在落库到
+  `gateways`（幂等补列，老库自动加），并随 `GatewayRuntimeStatus` 回到管理面；
+  同时出 Prometheus `gateway_gops_info` / `gateway_gx_info`（有值才推）。
+  - 为什么由 gwlinkd 探：网关栈由 gops 部署/升级，但容器里看不见宿主 `$HOME/bin`；
+    只有宿主侧常驻能探到。页面「网关详情」的 gops / gx 两个读数就来自这里。
+
+### 升级顺序
+
+- 先升 **control 0.16**（字段定义）与 **gateway 0.17**（心跳接收），再升本中心与 gwlinkd 0.14。
+- 老 gwlinkd 不带这两个键 → 落 NULL，页面显示「—」，不冒充已安装。
+
 ## [0.16.0-alpha] - 2026-10-18
 
 ### 新增
