@@ -197,6 +197,49 @@ pub(super) fn knowledge_activate(spec: &str) -> bool {
 
 // ── 建计划（服务端切阶段 + 全量条目落 `pending`） ──
 
+/// 已知动作的 `spec.targets` 校验：非空、组件非空、**目标版本必填**。
+///
+/// 未知动作不校验（形状可能不同，且 gwlinkd 会跳过并留痕）。
+#[allow(clippy::result_large_err)] // 与全仓一致：错误直接是可响应的 `ApiError`。
+fn validate_target_spec(action: &str, spec: &str) -> Result<(), ApiError> {
+    if !matches!(
+        action,
+        wist_control::ACTION_UPGRADE
+            | wist_control::ACTION_PUSH_AGENT_PACKAGE
+            | wist_control::ACTION_PUSH_KNOWLEDGE_PACKAGE
+    ) {
+        return Ok(());
+    }
+    let parsed: UpgradeSpec = serde_json::from_str(spec).map_err(|err| {
+        ApiError::bad_request(codes::INVALID_SPEC, format!("spec must be JSON: {err}"))
+    })?;
+    if parsed.targets.is_empty() {
+        return Err(ApiError::bad_request(
+            codes::INVALID_SPEC,
+            "spec.targets must not be empty",
+        ));
+    }
+    for target in &parsed.targets {
+        let component = target.component.trim();
+        if component.is_empty() {
+            return Err(ApiError::bad_request(
+                codes::INVALID_SPEC,
+                "spec.targets[].component must not be empty",
+            ));
+        }
+        if target.target_version.trim().is_empty() {
+            return Err(ApiError::bad_request(
+                codes::INVALID_SPEC,
+                format!(
+                    "spec.targets[].target_version is required (component `{component}` has no version): \
+                     the center derives the artifact by version, so an empty version can never be dispatched"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn rollout_plan_id(action: &str, now: &DateTime) -> String {
     // 语义化：`plan-<action>-<yyyyMMdd-HHmmss>-<short>`（口径在共享 crate `wist-release::rollout`）。
     wist_release::rollout::plan_id(action, &now.to_chrono().to_rfc3339())
@@ -223,6 +266,10 @@ pub(super) fn build_plan(input: &CreateRolloutPlanRequest) -> Result<UpgradePlan
             "spec is required",
         ));
     }
+    // 已知动作的目标必须带版本：中心按 `(component, target_version)` 反查制品，
+    // 留空就派生不出地址 —— 计划下发后网关无事可做（旧 gwlinkd 甚至静默跳过），
+    // 条目永远停在 `dispatched`。这种注定发不出去的计划，建的时候就拒。
+    validate_target_spec(action, spec)?;
     // 截止时间可省；给了就要是合法 RFC3339。
     let deadline_at = match input
         .deadline_at
@@ -893,6 +940,31 @@ mod tests {
             build_plan(&request(&["gw-001"], 2)).is_err(),
             "阶段数大于台数"
         );
+    }
+
+    /// 目标版本必填：留空时中心派生不出制品，计划永远发不出去。
+    #[test]
+    fn build_plan_requires_a_target_version_for_known_actions() {
+        let mut r = request(&["gw-001"], 1);
+        r.spec = r#"{"targets":[{"component":"wist-gwlinkd"}]}"#.to_string();
+        let err = build_plan(&r).expect_err("versionless target must be rejected");
+        let message = format!("{err:?}");
+        assert!(message.contains("target_version"), "{message}");
+        assert!(message.contains("wist-gwlinkd"), "{message}");
+
+        let mut r = request(&["gw-001"], 1);
+        r.spec = r#"{"targets":[]}"#.to_string();
+        assert!(build_plan(&r).is_err(), "空 targets");
+
+        let mut r = request(&["gw-001"], 1);
+        r.spec = "not json".to_string();
+        assert!(build_plan(&r).is_err(), "非 JSON spec");
+
+        // 未知动作不校验形状（gwlinkd 会跳过并留痕）。
+        let mut r = request(&["gw-001"], 1);
+        r.action = "future-action".to_string();
+        r.spec = r#"{"whatever":true}"#.to_string();
+        assert!(build_plan(&r).is_ok(), "未知动作保持宽容");
     }
 
     /// `deadline_at` / `timeout_seconds` 可省（中心不物化执行单元）。
