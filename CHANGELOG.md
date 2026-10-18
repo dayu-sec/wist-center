@@ -5,6 +5,21 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.17.1-alpha] - 2026-10-18
+
+### 修复
+
+- **建升级计划时 `target_version` 必填**：已知动作（`upgrade` / `push-agent-package` /
+  `push-knowledge-package`）的每个 target 必须带非空版本，否则返回 400（`invalid_spec`）。
+  中心按 `(component, target_version)` 派生制品地址 —— 版本留空则永远发不出去：
+  计划下发后网关无事可做，条目永远停在 `dispatched`（现场表现为「中心没有反馈」）。
+  未知动作不校验（形状可能不同，gwlinkd 会跳过并留痕）。
+
+### 测试
+
+- `build_plan_requires_a_target_version_for_known_actions`：空版本 / 空 targets / 非 JSON 均拒；
+  未知动作保持宽容。
+
 ## [0.17.0-alpha] - 2026-10-18
 
 ### 新增
