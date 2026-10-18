@@ -463,6 +463,19 @@ fn render_prometheus_lines(update: &GatewayStatusUpdate) -> String {
          gateway_info{{{labels},version=\"{version}\"}} 1 {ts}\n\
          gateway_health{{{labels},health=\"{health}\"}} 1 {ts}\n"
     );
+    // 宿主依赖工具版本：有值才推（info-style），与「量不出即 null」同口径。
+    if let Some(gops_version) = update.gops_version.as_deref() {
+        text.push_str(&format!(
+            "gateway_gops_info{{{labels},gops_version=\"{}\"}} 1 {ts}\n",
+            escape_label(gops_version)
+        ));
+    }
+    if let Some(gx_version) = update.gx_version.as_deref() {
+        text.push_str(&format!(
+            "gateway_gx_info{{{labels},gx_version=\"{}\"}} 1 {ts}\n",
+            escape_label(gx_version)
+        ));
+    }
     push_metric(
         &mut text,
         "gateway_memory_bytes",
@@ -637,6 +650,8 @@ mod tests {
             gateway_id: "gw-001".to_string(),
             instance_id: "inst-1".to_string(),
             version: "v2.4.1".to_string(),
+            gops_version: Some("2.4.0".to_string()),
+            gx_version: Some("0.17.0".to_string()),
             status: status.to_string(),
             health: health.to_string(),
             memory_bytes: Some(536_870_912),
@@ -676,6 +691,12 @@ mod tests {
         )));
         assert!(text.contains(&format!(
             "gateway_health{{gateway_id=\"gw-001\",instance_id=\"inst-1\",health=\"healthy\"}} 1 {ts}"
+        )));
+        assert!(text.contains(&format!(
+            "gateway_gops_info{{gateway_id=\"gw-001\",instance_id=\"inst-1\",gops_version=\"2.4.0\"}} 1 {ts}"
+        )));
+        assert!(text.contains(&format!(
+            "gateway_gx_info{{gateway_id=\"gw-001\",instance_id=\"inst-1\",gx_version=\"0.17.0\"}} 1 {ts}"
         )));
     }
 
@@ -771,6 +792,8 @@ mod tests {
         update.disk_usage_percent = None;
         update.disk_total_bytes = None;
         update.disk_available_bytes = None;
+        update.gops_version = None;
+        update.gx_version = None;
         let text = render_prometheus_lines(&update);
         assert!(text.contains("gateway_up{"));
         assert!(!text.contains("gateway_memory_bytes{"));
@@ -778,6 +801,8 @@ mod tests {
         assert!(!text.contains("gateway_uptime_seconds{"));
         assert!(!text.contains("gateway_disk_usage_percent{"));
         assert!(!text.contains("gateway_last_ingest_timestamp_seconds{"));
+        assert!(!text.contains("gateway_gops_info{"));
+        assert!(!text.contains("gateway_gx_info{"));
     }
 
     #[test]

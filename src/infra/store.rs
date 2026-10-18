@@ -363,6 +363,11 @@ pub struct StoredGateway {
     /// 最新上报状态（喂 GatewayRuntimeStatus，last_seen_at = reported_at）。
     #[serde(default)]
     pub version: Option<String>,
+    /// 网关宿主侧依赖工具版本（gops / gx，装在 `$HOME/bin`；由 gwlinkd 探测上报）。
+    #[serde(default)]
+    pub gops_version: Option<String>,
+    #[serde(default)]
+    pub gx_version: Option<String>,
     #[serde(default)]
     pub status: Option<String>,
     #[serde(default)]
@@ -441,6 +446,8 @@ impl StoredGateway {
             link_token_hash: String::new(),
             link_token_expires_at: None,
             version: None,
+            gops_version: None,
+            gx_version: None,
             status: None,
             health: None,
             memory_bytes: None,
@@ -500,6 +507,8 @@ pub struct GatewayStatusUpdate {
     pub gateway_id: String,
     pub instance_id: String,
     pub version: String,
+    pub gops_version: Option<String>,
+    pub gx_version: Option<String>,
     pub status: String,
     pub health: String,
     pub memory_bytes: Option<i64>,
@@ -1359,6 +1368,8 @@ impl Store for FileStore {
                 if let Some(stored) = snapshot.gateways.get_mut(&update.gateway_id) {
                     stored.instance_id = update.instance_id.clone();
                     stored.version = Some(update.version.clone());
+                    stored.gops_version = update.gops_version.clone();
+                    stored.gx_version = update.gx_version.clone();
                     stored.status = Some(update.status.clone());
                     stored.health = Some(update.health.clone());
                     stored.memory_bytes = update.memory_bytes;
@@ -1887,6 +1898,8 @@ mod tests {
                 gateway_id: gateway_id.to_string(),
                 instance_id: "i".to_string(),
                 version: "0.1.26".to_string(),
+                gops_version: None,
+                gx_version: None,
                 status: status.to_string(),
                 health: "ok".to_string(),
                 memory_bytes: None,
@@ -2023,6 +2036,8 @@ mod tests {
                 gateway_id: gateway_id.to_string(),
                 instance_id: "i".to_string(),
                 version: "0.1.26".to_string(),
+                gops_version: None,
+                gx_version: None,
                 status: "online".to_string(),
                 health: "ok".to_string(),
                 memory_bytes: None,

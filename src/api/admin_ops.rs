@@ -2011,6 +2011,8 @@ fn gateway_runtime_status(stored: &StoredGateway) -> GatewayRuntimeStatus {
         gateway_id: stored.gateway_id.clone(),
         instance_id: stored.instance_id.clone(),
         version: stored.version.clone().unwrap_or_default(),
+        gops_version: stored.gops_version.clone(),
+        gx_version: stored.gx_version.clone(),
         // 注意：`status` 已在上面按新鲜度归一，这里不再回退原始字符串。
         health: stored
             .health
@@ -2553,6 +2555,8 @@ mod tests {
                     gateway_id: gateway_id.to_string(),
                     instance_id: format!("inst-{gateway_id}"),
                     version: "0.6.0".to_string(),
+                    gops_version: None,
+                    gx_version: None,
                     status: "online".to_string(),
                     health: "ok".to_string(),
                     memory_bytes: None,

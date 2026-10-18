@@ -10,6 +10,8 @@ CREATE TABLE IF NOT EXISTS gateways (
   link_token_hash TEXT NOT NULL DEFAULT '',
   link_token_expires_at TIMESTAMPTZ,
   version TEXT,
+  gops_version TEXT,
+  gx_version TEXT,
   status TEXT,
   health TEXT,
   memory_bytes BIGINT,
@@ -40,6 +42,11 @@ CREATE TABLE IF NOT EXISTS gateways (
 
 -- 幂等补列（既有库）：新建库的 CREATE 已含该列，老库靠这条补上（网关对外域名）。
 ALTER TABLE gateways ADD COLUMN IF NOT EXISTS public_base_url TEXT;
+
+-- 幂等补列（既有库）：网关宿主侧依赖工具版本（gops / gx，装在 `$HOME/bin`，由 gwlinkd 探测上报）。
+-- 老网关 / 老 gwlinkd 不带这两个键 → 保持 NULL（页面显示「—」，不冒充已安装）。
+ALTER TABLE gateways ADD COLUMN IF NOT EXISTS gops_version TEXT;
+ALTER TABLE gateways ADD COLUMN IF NOT EXISTS gx_version TEXT;
 
 -- 幂等补列（既有库）：归档时刻（NULL = 未归档）。归档是**标记**：默认视图不再显示这台网关，
 -- 状态/历史全留；只归档离线网关，重新上线（换证注册或重新上报 online）时自动清空。

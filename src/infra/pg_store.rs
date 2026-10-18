@@ -63,6 +63,8 @@ struct GatewayRow {
     link_token_hash: String,
     link_token_expires_at: Option<chrono::DateTime<chrono::Utc>>,
     version: Option<String>,
+    gops_version: Option<String>,
+    gx_version: Option<String>,
     status: Option<String>,
     health: Option<String>,
     memory_bytes: Option<i64>,
@@ -140,6 +142,8 @@ impl GatewayRow {
             link_token_hash: self.link_token_hash,
             link_token_expires_at: self.link_token_expires_at.map(|value| value.to_rfc3339()),
             version: self.version,
+            gops_version: self.gops_version,
+            gx_version: self.gx_version,
             status: self.status,
             health: self.health,
             memory_bytes: self.memory_bytes,
@@ -258,7 +262,7 @@ fn parse_optional_timestamptz(value: &Option<String>) -> Option<chrono::DateTime
 
 const GATEWAY_COLUMNS: &str = "gateway_id, instance_id, credential_token_hash, \
                                credential_status, credential_expires_at, link_token_hash, \
-                               link_token_expires_at, version, status, health, memory_bytes, cpu_percent, \
+                               link_token_expires_at, version, gops_version, gx_version, status, health, memory_bytes, cpu_percent, \
                                public_base_url, \
                                uptime_seconds, agent_count, online_agents, offline_agents, last_seen_lag_seconds, \
                                store_bytes, ingest_accepted_total, ingest_rejected_total, last_ingest_at, \
@@ -322,7 +326,8 @@ impl Store for PgStore {
         let last_seen_at = update.last_seen_at.to_chrono();
         sqlx::query(
             "UPDATE gateways \
-             SET instance_id = $2, version = $3, status = $4, health = $5, \
+             SET instance_id = $2, version = $3, gops_version = $26, gx_version = $27, \
+                 status = $4, health = $5, \
                  memory_bytes = $6, cpu_percent = $7, \
                  public_base_url = COALESCE($25, public_base_url), \
                  uptime_seconds = $8, agent_count = $9, online_agents = $10, \
@@ -367,6 +372,8 @@ impl Store for PgStore {
         .bind(update.disk_available_bytes)
         .bind(last_seen_at)
         .bind(update.public_base_url.as_deref())
+        .bind(update.gops_version.as_deref())
+        .bind(update.gx_version.as_deref())
         .execute(&self.pool)
         .await
         .source_raw_err(StoreReason::Sql, "upsert gateway status")?;
@@ -1069,6 +1076,8 @@ mod tests {
                 gateway_id: gateway_id.clone(),
                 instance_id: "it-instance".to_string(),
                 version: "v9.9.9".to_string(),
+                gops_version: None,
+                gx_version: None,
                 status: "online".to_string(),
                 health: "healthy".to_string(),
                 memory_bytes: Some(1_073_741_824),
