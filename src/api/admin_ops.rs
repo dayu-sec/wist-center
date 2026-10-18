@@ -5700,11 +5700,8 @@ mod tests {
         );
 
         // 未配置来源的组件仍然 404（先判组件，再判 source）。
-        let (status, _) = get_json(
-            &app,
-            "/api/v1/admin/package-sources/latest?component=ghost",
-        )
-        .await;
+        let (status, _) =
+            get_json(&app, "/api/v1/admin/package-sources/latest?component=ghost").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }
