@@ -5,6 +5,30 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.17.2-alpha] - 2026-10-18
+
+### 新增
+
+- **安装包来源配置 `[packages.sources]`**：每个组件可配 `github_repo` 与/或
+  `cos_bucket` / `cos_prefix` / `cos_region`。录入页据此按**版本号**拼地址，不再每次填完整 URL。
+  （只写位置，不写凭据；未配的组件仍可手工粘贴地址。）
+- **`GET /api/v1/admin/package-sources`**：列出已配置来源（管理面）。
+- **`GET /api/v1/admin/package-sources/latest?component=&base_version=&source=`**：自动探测最新版本。
+  优先列 GitHub releases（前 20 条）；只有 COS 时从 `base_version` 按 patch/minor/major 生成候选探测。
+
+### 修复
+
+- **未配置/非法的来源不再落成 502**：先校验来源与配置（未知 `source`、未配 `github_repo` /
+  COS 桶前缀直接 400 + `package_source_*` 错误码），再发起外部请求。
+- **GitHub tag 兼容带/不带 `v`**：解析 release 两种写法都试（仅 404 时重试）。
+- **COS 制品 key 覆盖真实命名**：`v` / 裸版本 × 平台制品 × 单制品全组合。
+- **配置归一化拒绝改 URL 语义的字符**：`cos_bucket` / `cos_region` 拒 `/ @ :` 与空白，
+  `cos_prefix` 去掉首尾斜杠并拒 `? #`。
+
+### 测试
+
+- 新增：来源列表、管理员鉴权、先校验后探测（189 → 193 passed）。
+
 ## [0.17.1-alpha] - 2026-10-18
 
 ### 修复
