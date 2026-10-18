@@ -5,6 +5,27 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.16.0-alpha] - 2026-10-18
+
+### 新增
+
+- **知识库包管理与下发**：中心把 `wist-knowledge` 当**单制品发布**（复用现有 release 通道：
+  `POST/GET /api/v1/admin/releases/wist-knowledge`），新增灰度计划动作
+  `push-knowledge-package`。
+  - 计划从**已发布的 release 记录**派生 `artifact_url` / `artifact_sha256`（不手输）；
+  - `activate`（spec 里的可选字段，缺省 false）随计划下发 —— 知识库**录入 ≠ 生效**；
+  - 知识库是单制品：不带多平台清单（`artifacts` 为空）。
+- **知识库签名旁文件随包镜像**：发布 `wist-knowledge` 时把 `<来源>.sig` 一并存到中心制品存储，
+  使 `<镜像地址>.sig` 可取 —— gwlinkd 交付时会把 `.sig` 落到网关投放目录，配了验签公钥的
+  网关才能验签。取不到只告警，不阻断发布。
+
+### 升级顺序
+
+- **先升网关（≥ 0.16.0）与 gwlinkd（≥ 0.13.0），再升中心**：
+  - 旧网关没有 `/api/v1/gateway/knowledge-package`（交付会 404，计划条目标 failed）；
+  - **旧 gwlinkd 会把 `push-knowledge-package` 当 `upgrade` 执行**，把知识库包当网关包去跑 gops。
+- 中心与前端升完后，在「发布计划」页创建知识库下发。
+
 ## [0.15.1-alpha] - 2026-10-17
 
 ### 修复
