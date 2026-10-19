@@ -3,7 +3,7 @@
 
 [package]
 name = "wist-center"
-version = "0.18.0" #@gxl:set(version)
+version = "0.18.1" #@gxl:set(version)
 edition = "2024"
 
 [dependencies]
@@ -72,3 +72,7 @@ http-body-util = "0.1"
 # 测试里造 gzip+tar 的安装包样本（生产代码不用）。
 flate2 = "1"
 tar = "0.4"
+
+# 发布二进制去掉符号表：镜像/ tarball 体积明显变小，排障需要符号时用单独构建。
+[profile.release]
+strip = true
