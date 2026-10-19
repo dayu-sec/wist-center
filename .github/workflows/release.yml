@@ -8,8 +8,8 @@ permissions:
   contents: read
 
 jobs:
-  # 1. 按平台原生编译二进制，产出 tarball
-  build-binaries:
+  # 1a. Linux 二进制（静态 musl）：镜像 job 只依赖这一段，不再等 macOS。
+  build-linux:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -17,12 +17,13 @@ jobs:
       matrix:
         include:
           # Linux 出 **静态 musl**：制品被抽出到宿主原生运行，不能绑宿主 glibc 版本。
+          # 原生 runner 构建：amd64 在 ubuntu-24.04，arm64 在 ubuntu-24.04-arm。
           - os: ubuntu-24.04
+            arch: amd64
             target: x86_64-unknown-linux-musl
           - os: ubuntu-24.04-arm
+            arch: arm64
             target: aarch64-unknown-linux-musl
-          - os: macos-14
-            target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v7
 
@@ -32,7 +33,6 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install musl toolchain
-        if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Cargo build
@@ -59,9 +59,40 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # 2. 用 Linux 二进制构建并推送多架构镜像（ghcr.io + 腾讯云 TCR）
-  docker:
-    needs: [build-binaries]
+  # 1b. macOS 二进制：只 gate GitHub Release，不阻塞镜像构建。
+  build-macos:
+    name: Build aarch64-apple-darwin
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin
+
+      - name: Cargo build
+        run: cargo build --release --target aarch64-apple-darwin
+
+      - name: Package tarball
+        run: |
+          mkdir -p artifacts
+          cp "target/aarch64-apple-darwin/release/wist-center" artifacts/wist-center
+          tar -czf "wist-center-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz" -C artifacts wist-center
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wist-center-aarch64-apple-darwin
+          path: wist-center-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  # 2a/2b. 原生分架构构建镜像，彻底去掉 QEMU：
+  #   amd64 → ubuntu-24.04，arm64 → ubuntu-24.04-arm，各自 push-by-digest；
+  #   最后由 docker-manifest 用 imagetools 合并成多架构 tag。
+  docker-amd64:
+    name: Docker image (linux/amd64)
+    needs: [build-linux]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -71,18 +102,121 @@ jobs:
 
       - uses: actions/download-artifact@v8
         with:
-          pattern: wist-center-*-linux-musl
+          name: wist-center-x86_64-unknown-linux-musl
           path: staged
-          merge-multiple: true
 
-      - name: Stage binaries for docker build
+      - name: Stage binary for docker build
         run: |
-          mkdir -p docker/amd64 docker/arm64
+          mkdir -p docker/amd64
           tar -xzf "staged/wist-center-${{ github.ref_name }}-x86_64-unknown-linux-musl.tar.gz" -C docker/amd64
-          tar -xzf "staged/wist-center-${{ github.ref_name }}-aarch64-unknown-linux-musl.tar.gz" -C docker/arm64
-          ls -R docker/amd64 docker/arm64
+          ls -R docker/amd64
 
-      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: docker
+          platforms: linux/amd64
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+          # 预编译二进制的镜像只剩 COPY；缓存仍能省掉基础层拉取。
+          cache-from: type=gha,scope=center-amd64
+          cache-to: type=gha,mode=max,scope=center-amd64
+
+      - name: Export digest
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          [ -n "${digest}" ] || { echo "::error::build-push 没有返回 digest"; exit 1; }
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digest-amd64
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  docker-arm64:
+    name: Docker image (linux/arm64)
+    needs: [build-linux]
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: wist-center-aarch64-unknown-linux-musl
+          path: staged
+
+      - name: Stage binary for docker build
+        run: |
+          mkdir -p docker/arm64
+          tar -xzf "staged/wist-center-${{ github.ref_name }}-aarch64-unknown-linux-musl.tar.gz" -C docker/arm64
+          ls -R docker/arm64
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: docker
+          platforms: linux/arm64
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=center-arm64
+          cache-to: type=gha,mode=max,scope=center-arm64
+
+      - name: Export digest
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          [ -n "${digest}" ] || { echo "::error::build-push 没有返回 digest"; exit 1; }
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digest-arm64
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # 2c. 合并两个架构的 digest → 多架构 manifest；ghcr 先出，TCR 同一次推送。
+  docker-manifest:
+    name: Compose multi-arch manifest
+    needs: [docker-amd64, docker-arm64]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: digest-*
+          path: /tmp/digests
+          merge-multiple: true
 
       - uses: docker/setup-buildx-action@v4
 
@@ -121,17 +255,28 @@ jobs:
           esac
           printf 'tags<<__EOF__\n%s\n__EOF__\n' "$tags" >> "$GITHUB_OUTPUT"
 
-      - name: Build and push
-        uses: docker/build-push-action@v7
-        with:
-          context: docker
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          platforms: linux/amd64,linux/arm64
+      - name: Create multi-arch manifests
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          digests=()
+          for f in /tmp/digests/*; do
+            digests+=("ghcr.io/${{ github.repository }}@sha256:$(basename "$f")")
+          done
+          [ "${#digests[@]}" -eq 2 ] || { echo "::error::期望 2 个架构 digest，实际 ${#digests[@]}"; exit 1; }
+          args=()
+          while IFS= read -r tag; do
+            [ -n "$tag" ] && args+=(-t "$tag")
+          done <<< "$TAGS"
+          docker buildx imagetools create "${args[@]}" "${digests[@]}"
+          while IFS= read -r tag; do
+            [ -n "$tag" ] && docker buildx imagetools inspect "$tag"
+          done <<< "$TAGS"
 
   # 3. 发布 tarball 到 GitHub Release
   release:
-    needs: [build-binaries]
+    needs: [build-linux, build-macos]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -154,9 +299,10 @@ jobs:
 
 # 注：本工作流产出二进制 tarball + 多架构容器镜像。
 #   - tarball：三个平台的原生产物，挂到 GitHub Release（release job）。
-#   - 镜像：`docker/` 作为构建上下文（其中的 Dockerfile + 流水线暂存的 amd64/ arm64
-#     产物），双推 ghcr.io 与腾讯云 TCR（docker job）。需在仓库 Secrets 配置
-#     TCR_USERNAME / TCR_PASSWORD。
+#   - 镜像：**原生分架构**构建（amd64 在 ubuntu-24.04、arm64 在 ubuntu-24.04-arm），
+#     各自 push-by-digest，再由 docker-manifest 用 `imagetools create` 合并并双推
+#     ghcr.io 与腾讯云 TCR。**不使用 QEMU**：arm64 原生跑 Dockerfile，避免 apt 在
+#     模拟器里耗时 10 分钟以上。需在仓库 Secrets 配置 TCR_USERNAME / TCR_PASSWORD。
 # docker/initdb 是 PostgreSQL 的初始化脚本挂载目录（见 docker-compose.yml），
 # 与镜像构建无关 —— Dockerfile 只 COPY ${TARGETARCH}/wist-center。
 
