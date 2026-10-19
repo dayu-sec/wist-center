@@ -6,6 +6,7 @@ pub use wist_control::*;
 pub mod api;
 pub mod config;
 pub mod infra;
+pub mod wparse_proxy;
 // NOTE(hand-added): 本进程运行日志（`[log]` 段）已抽到共享 crate `wist-log`（见 config 里的 `wist_log::LogSection`）。
 
 pub type AppError = wist_error::AppError;

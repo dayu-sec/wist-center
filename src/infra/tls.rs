@@ -44,6 +44,20 @@ pub fn load_gateway_mtls_server_config(
         .map_err(|err| format!("invalid TLS certificate or private key: {err}"))
 }
 
+/// 仅服务端证书的 TLS 配置（**不校客户端证书**）。
+///
+/// 用于规则发布兼容入口：调用方是 WarpStation（持 Bearer proxy token），
+/// 它没有、也不应该持有网关 mTLS 客户端证书。
+pub fn load_server_only_config(cert_path: &Path, key_path: &Path) -> Result<ServerConfig, String> {
+    install_crypto_provider();
+    let certs = certificate_chain_from_pem_file(cert_path)?;
+    let key = private_key_from_pem_file(key_path)?;
+    ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|err| format!("invalid TLS certificate or private key: {err}"))
+}
+
 /// 从**已完成握手**的服务端连接里取出已验证的客户端叶证书 DER。
 ///
 /// `None` = 该连接没出示客户端证书（首次注册）或没开 mTLS；「链验过了但读不出网关身份」

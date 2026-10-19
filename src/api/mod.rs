@@ -28,6 +28,7 @@ mod install;
 mod rate_limit;
 mod rollout;
 mod version;
+mod wparse_proxy_api;
 
 use admin_ops::{
     admin_advance_upgrade_plan, admin_approve_upgrade_plan, admin_bind_gateway_customer,
@@ -47,6 +48,9 @@ use gateway_ops::{
     renew_gateway_credential, report_gateway_upgrade_result, submit_agent_status,
     submit_gateway_status, verify_gateway_credential,
 };
+use wparse_proxy_api::{
+    issue_proxy_token, poll_command, report_command_result, revoke_proxy_token,
+};
 
 /// 提取 peer 连接信息（限流按 IP 分桶用；忽略可伪造的 `x-real-ip` / `x-forwarded-for`）。
 ///
@@ -64,6 +68,8 @@ pub struct ApiState {
     pub rate_limits: Arc<Mutex<rate_limit::RateLimitState>>,
     /// 网关客户端证书 CA（CA-G）：`register` 据此按 CSR 签每网关一张客户端证书。
     pub gateway_ca: Arc<crate::infra::gateway_ca::GatewayCa>,
+    /// 规则发布兼容入口（命令队列 + proxy token）；未启用时为 `None`。
+    pub proxy: Option<Arc<crate::wparse_proxy::WparseProxy>>,
 }
 
 /// 控制中心是否要求 TLS：按 `public_url` scheme 推导（https → true，http → false）。
@@ -138,6 +144,7 @@ pub fn router(
     config: CenterConfig,
     store: Arc<dyn Store>,
     gateway_ca: Arc<crate::infra::gateway_ca::GatewayCa>,
+    proxy: Option<Arc<crate::wparse_proxy::WparseProxy>>,
 ) -> Router {
     let artifact_store = crate::infra::build_artifact_store(&config);
     router_for(ApiState {
@@ -146,6 +153,7 @@ pub fn router(
         artifact_store,
         rate_limits: Arc::new(Mutex::new(rate_limit::RateLimitState::default())),
         gateway_ca,
+        proxy,
     })
 }
 
@@ -250,6 +258,17 @@ pub fn router_for(state: ApiState) -> Router {
         .route(
             "/api/v1/admin/gateways/{gateway_id}/link-token",
             post(admin_rotate_gateway_link_token),
+        )
+        // 管理面：wparse-proxy token（WarpStation 设备 Token；明文仅返回一次）
+        .route(
+            "/api/v1/admin/gateways/{gateway_id}/wparse-proxy-token",
+            post(issue_proxy_token).delete(revoke_proxy_token),
+        )
+        // 网关面：规则发布命令通道（mTLS；gwlinkd 短轮询）
+        .route("/api/v1/gateway/commands", get(poll_command))
+        .route(
+            "/api/v1/gateway/commands/{command_id}/result",
+            post(report_command_result),
         )
         // 管理面：网关列表聚合（AdminViewGatewayList，GET /api/v1/admin/gateways）
         .route("/api/v1/admin/gateways", get(admin_view_gateway_list))

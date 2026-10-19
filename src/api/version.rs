@@ -64,6 +64,10 @@ mod tests {
                 hmac_secret: "test-hmac-secret".to_string(),
                 credential_ttl_seconds: 3600,
                 link_ttl_seconds: 900,
+                wparse_proxy: crate::config::WparseProxyConfig {
+                    enabled: false,
+                    listen_addr: "0.0.0.0:3101".to_string(),
+                },
                 log: Default::default(),
             },
             store: Arc::new(FileStore::new(&store_path)),
@@ -76,6 +80,7 @@ mod tests {
                     .expect("gateway ca")
                     .0,
             ),
+            proxy: None,
             rate_limits: Arc::new(Mutex::new(
                 super::super::rate_limit::RateLimitState::default(),
             )),

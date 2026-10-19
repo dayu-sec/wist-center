@@ -120,3 +120,33 @@ CREATE TABLE IF NOT EXISTS upgrade_plans (
   status TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- 规则发布命令队列（WarpStation → Center wparse-proxy → gwlinkd → 本机 wparse）。
+CREATE TABLE IF NOT EXISTS gateway_commands (
+  command_id TEXT PRIMARY KEY,
+  gateway_id TEXT NOT NULL,
+  method TEXT NOT NULL,
+  path TEXT NOT NULL,
+  body TEXT,
+  state TEXT NOT NULL,
+  attempts INT NOT NULL DEFAULT 0,
+  lease_expires_at TIMESTAMPTZ,
+  response_status INT,
+  response_body TEXT,
+  error TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_gateway_commands_pending
+  ON gateway_commands (gateway_id, state, created_at);
+
+-- 每网关的 wparse-proxy Bearer token（只存 sha256；明文只发一次）。
+CREATE TABLE IF NOT EXISTS gateway_wparse_tokens (
+  gateway_id TEXT PRIMARY KEY,
+  token_sha256 TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  rotated_at TIMESTAMPTZ,
+  revoked_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_gateway_wparse_tokens_hash
+  ON gateway_wparse_tokens (token_sha256);

@@ -2449,6 +2449,10 @@ mod tests {
                 hmac_secret: "test-hmac-secret".to_string(),
                 credential_ttl_seconds: 3600,
                 link_ttl_seconds: 900,
+                wparse_proxy: crate::config::WparseProxyConfig {
+                    enabled: false,
+                    listen_addr: "0.0.0.0:3101".to_string(),
+                },
                 log: Default::default(),
             },
             store: std::sync::Arc::new(store),
@@ -2457,6 +2461,7 @@ mod tests {
                 "http://127.0.0.1:3100",
             )),
             gateway_ca: test_gateway_ca(),
+            proxy: None,
             rate_limits: std::sync::Arc::new(std::sync::Mutex::new(
                 super::super::rate_limit::RateLimitState::default(),
             )),
@@ -4294,6 +4299,10 @@ mod tests {
                 hmac_secret: "test-hmac-secret".to_string(),
                 credential_ttl_seconds: 3600,
                 link_ttl_seconds: 900,
+                wparse_proxy: crate::config::WparseProxyConfig {
+                    enabled: false,
+                    listen_addr: "0.0.0.0:3101".to_string(),
+                },
                 log: Default::default(),
             },
             store: std::sync::Arc::new(store),
@@ -4302,6 +4311,7 @@ mod tests {
                 "http://127.0.0.1:3100",
             )),
             gateway_ca: test_gateway_ca(),
+            proxy: None,
             rate_limits: std::sync::Arc::new(std::sync::Mutex::new(
                 super::super::rate_limit::RateLimitState::default(),
             )),
@@ -4501,6 +4511,10 @@ mod tests {
                 hmac_secret: "test-hmac-secret".to_string(),
                 credential_ttl_seconds: 3600,
                 link_ttl_seconds: 900,
+                wparse_proxy: crate::config::WparseProxyConfig {
+                    enabled: false,
+                    listen_addr: "0.0.0.0:3101".to_string(),
+                },
                 log: Default::default(),
             },
             store: std::sync::Arc::new(store),
@@ -4509,6 +4523,7 @@ mod tests {
                 "http://127.0.0.1:3100",
             )),
             gateway_ca: test_gateway_ca(),
+            proxy: None,
             rate_limits: std::sync::Arc::new(std::sync::Mutex::new(
                 super::super::rate_limit::RateLimitState::default(),
             )),
@@ -4815,6 +4830,10 @@ mod tests {
                 hmac_secret: "test-hmac-secret".to_string(),
                 credential_ttl_seconds: 3600,
                 link_ttl_seconds: 900,
+                wparse_proxy: crate::config::WparseProxyConfig {
+                    enabled: false,
+                    listen_addr: "0.0.0.0:3101".to_string(),
+                },
                 log: Default::default(),
             },
             store: std::sync::Arc::new(store),
@@ -4823,6 +4842,7 @@ mod tests {
                 "http://127.0.0.1:3100",
             )),
             gateway_ca: test_gateway_ca(),
+            proxy: None,
             rate_limits: std::sync::Arc::new(std::sync::Mutex::new(
                 super::super::rate_limit::RateLimitState::default(),
             )),

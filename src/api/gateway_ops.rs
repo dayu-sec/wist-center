@@ -1032,7 +1032,7 @@ pub async fn renew_gateway_credential(
 /// 证书身份与请求体 `gateway_id` 是否一致、登记是否 Active、指纹是否在册、是否未过期。
 /// 任一不满足即 401，正文带稳定 `code`，供网关侧按码自愈（镜像网关给 agent 的口径）。
 #[allow(clippy::result_large_err)]
-async fn authorize_gateway_certificate(
+pub(super) async fn authorize_gateway_certificate(
     state: &ApiState,
     identity: Option<&VerifiedGatewayIdentity>,
     gateway_id: &str,
@@ -1305,6 +1305,10 @@ mod tests {
                 hmac_secret: "test-hmac-secret".to_string(),
                 credential_ttl_seconds: 3600,
                 link_ttl_seconds: 900,
+                wparse_proxy: crate::config::WparseProxyConfig {
+                    enabled: false,
+                    listen_addr: "0.0.0.0:3101".to_string(),
+                },
                 log: Default::default(),
             },
             store: std::sync::Arc::new(store),
@@ -1313,6 +1317,7 @@ mod tests {
                 "http://127.0.0.1:3100",
             )),
             gateway_ca: test_gateway_ca(),
+            proxy: None,
             rate_limits: std::sync::Arc::new(std::sync::Mutex::new(
                 super::super::rate_limit::RateLimitState::default(),
             )),
@@ -1364,6 +1369,10 @@ mod tests {
                 hmac_secret: "test-hmac-secret".to_string(),
                 credential_ttl_seconds: 3600,
                 link_ttl_seconds: 900,
+                wparse_proxy: crate::config::WparseProxyConfig {
+                    enabled: false,
+                    listen_addr: "0.0.0.0:3101".to_string(),
+                },
                 log: Default::default(),
             },
             store: std::sync::Arc::new(store),
@@ -1372,6 +1381,7 @@ mod tests {
                 "http://127.0.0.1:3100",
             )),
             gateway_ca: test_gateway_ca(),
+            proxy: None,
             rate_limits: std::sync::Arc::new(std::sync::Mutex::new(
                 super::super::rate_limit::RateLimitState::default(),
             )),
@@ -1410,6 +1420,10 @@ mod tests {
                 hmac_secret: "test-hmac-secret".to_string(),
                 credential_ttl_seconds: 3600,
                 link_ttl_seconds: 900,
+                wparse_proxy: crate::config::WparseProxyConfig {
+                    enabled: false,
+                    listen_addr: "0.0.0.0:3101".to_string(),
+                },
                 log: Default::default(),
             },
             store: std::sync::Arc::new(store),
@@ -1418,6 +1432,7 @@ mod tests {
                 "http://127.0.0.1:3100",
             )),
             gateway_ca: test_gateway_ca(),
+            proxy: None,
             rate_limits: std::sync::Arc::new(std::sync::Mutex::new(
                 super::super::rate_limit::RateLimitState::default(),
             )),
@@ -3088,6 +3103,10 @@ mod tests {
                 hmac_secret: "test-hmac-secret".to_string(),
                 credential_ttl_seconds: 3600,
                 link_ttl_seconds: 900,
+                wparse_proxy: crate::config::WparseProxyConfig {
+                    enabled: false,
+                    listen_addr: "0.0.0.0:3101".to_string(),
+                },
                 log: Default::default(),
             },
             store: std::sync::Arc::new(file_store),
@@ -3096,6 +3115,7 @@ mod tests {
                 "http://127.0.0.1:3100",
             )),
             gateway_ca: test_gateway_ca(),
+            proxy: None,
             rate_limits: std::sync::Arc::new(std::sync::Mutex::new(
                 super::super::rate_limit::RateLimitState::default(),
             )),

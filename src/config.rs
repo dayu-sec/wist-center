@@ -142,8 +142,19 @@ pub struct CenterConfig {
     /// 来源：配置文件的 `security.link_ttl_seconds` 或
     /// env：`WARP_INSIGHT_CENTER_LINK_TTL_SECONDS`。默认 15 分钟。
     pub link_ttl_seconds: i64,
+    /// 规则发布兼容入口（WarpStation 设备面）：独立 HTTPS listener + 命令队列。
+    /// 见设计文档 §6；需要 `database_url`（FileStore 模式下自动禁用）。
+    pub wparse_proxy: WparseProxyConfig,
     /// `[log]` 段：本进程运行日志（级别 / 格式 / 落点 / 轮转）。
     pub log: wist_log::LogSection,
+}
+
+/// 规则发布兼容入口配置（`[wparse_proxy]`）。
+#[derive(Debug, Clone)]
+pub struct WparseProxyConfig {
+    pub enabled: bool,
+    /// 容器内监听地址；默认 `0.0.0.0:3101`（与 compose 的 `${WPARSE_PROXY_PORT}:3101` 对应）。
+    pub listen_addr: String,
 }
 
 /// S3 兼容对象存储配置（MinIO 等）。
@@ -202,6 +213,7 @@ struct RawCenterConfig {
     artifacts: RawArtifactsConfig,
     packages: RawPackagesConfig,
     enrollment: RawEnrollmentConfig,
+    wparse_proxy: RawWparseProxyConfig,
     log: wist_log::LogSection,
 }
 
@@ -263,6 +275,12 @@ struct RawPackageSource {
 struct RawEnrollmentConfig {
     /// 每项 `gateway_id:token`；串成逗号列表后复用 parse_gateway_credentials。
     gateway_credentials: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawWparseProxyConfig {
+    enabled: Option<bool>,
+    listen_addr: Option<String>,
 }
 
 /// 默认配置文件路径：**当前工作目录**下的 `wist-center.toml`（与 gateway 同口径）。
@@ -460,6 +478,13 @@ impl CenterConfig {
             link_ttl_seconds: security
                 .link_ttl_seconds
                 .unwrap_or(DEFAULT_LINK_TTL_SECONDS),
+            wparse_proxy: WparseProxyConfig {
+                enabled: raw.wparse_proxy.enabled.unwrap_or(false),
+                listen_addr: raw
+                    .wparse_proxy
+                    .listen_addr
+                    .unwrap_or_else(|| "0.0.0.0:3101".to_string()),
+            },
             log,
         })
     }
@@ -726,15 +751,13 @@ fn normalize_package_sources(
             )));
         }
         let github_repo = normalize_optional(item.github_repo).map(|repo| {
-            let repo = repo
-                .strip_prefix("https://github.com/")
+            repo.strip_prefix("https://github.com/")
                 .or_else(|| repo.strip_prefix("http://github.com/"))
                 .or_else(|| repo.strip_prefix("github.com/"))
                 .unwrap_or(&repo)
                 .trim_end_matches('/')
                 .trim_end_matches(".git")
-                .to_string();
-            repo
+                .to_string()
         });
         if let Some(repo) = &github_repo {
             let parts: Vec<&str> = repo.split('/').collect();
@@ -744,23 +767,23 @@ fn normalize_package_sources(
                 )));
             }
         }
+        // bucket / region / prefix 都会拼进 `https://<bucket>.cos.<region>.myqcloud.com/<prefix>/...`。
+        // 这些字段来自管理员配置，但仍然不应能改变 URL 的 host / 注入 query。
         let cos_bucket = normalize_optional(item.cos_bucket);
-        if let Some(bucket) = &cos_bucket {
-            // bucket / region / prefix 都会拼进 `https://<bucket>.cos.<region>.myqcloud.com/<prefix>/...`。
-            // 这些字段来自管理员配置，但仍然不应能改变 URL 的 host / 注入 query。
-            if bucket.contains(['/', '@', ':']) || bucket.contains(char::is_whitespace) {
-                return Err(config_validation(format!(
-                    "packages.sources[].cos_bucket must be a bare bucket name: {bucket}"
-                )));
-            }
+        if let Some(bucket) = &cos_bucket
+            && (bucket.contains(['/', '@', ':']) || bucket.contains(char::is_whitespace))
+        {
+            return Err(config_validation(format!(
+                "packages.sources[].cos_bucket must be a bare bucket name: {bucket}"
+            )));
         }
         let cos_region = normalize_optional(item.cos_region);
-        if let Some(region) = &cos_region {
-            if region.contains(['/', '@', ':']) || region.contains(char::is_whitespace) {
-                return Err(config_validation(format!(
-                    "packages.sources[].cos_region must be a bare region (e.g. ap-hongkong): {region}"
-                )));
-            }
+        if let Some(region) = &cos_region
+            && (region.contains(['/', '@', ':']) || region.contains(char::is_whitespace))
+        {
+            return Err(config_validation(format!(
+                "packages.sources[].cos_region must be a bare region (e.g. ap-hongkong): {region}"
+            )));
         }
         let cos_prefix = normalize_optional(item.cos_prefix)
             .map(|prefix| prefix.trim_matches('/').to_string())
@@ -771,12 +794,12 @@ fn normalize_package_sources(
                     .and_then(|repo| repo.rsplit('/').next())
                     .map(str::to_string)
             });
-        if let Some(prefix) = &cos_prefix {
-            if prefix.contains(['?', '#']) {
-                return Err(config_validation(format!(
-                    "packages.sources[].cos_prefix must not contain '?' or '#': {prefix}"
-                )));
-            }
+        if let Some(prefix) = &cos_prefix
+            && prefix.contains(['?', '#'])
+        {
+            return Err(config_validation(format!(
+                "packages.sources[].cos_prefix must not contain '?' or '#': {prefix}"
+            )));
         }
         if cos_bucket.is_some() && cos_prefix.is_none() {
             return Err(config_validation(
@@ -1464,5 +1487,45 @@ max_bytes = 1048576
         // prefix 不能注入 query / fragment。
         assert!(normalize_package_sources(vec![cos("b", "demo?x=1", None)]).is_err());
         assert!(normalize_package_sources(vec![cos("b", "demo#frag", None)]).is_err());
+    }
+
+    #[test]
+    fn parses_wparse_proxy_section() {
+        let path = write_temp_config(
+            r#"
+[server]
+listen_addr = "127.0.0.1:3999"
+public_url = "https://center.example.com"
+admin_token = "tok"
+
+[security]
+hmac_secret = "hmac"
+
+[wparse_proxy]
+enabled = true
+listen_addr = "0.0.0.0:3101"
+"#,
+        );
+        let config = CenterConfig::load_from_path(&path).expect("config loads");
+        assert!(config.wparse_proxy.enabled);
+        assert_eq!(config.wparse_proxy.listen_addr, "0.0.0.0:3101");
+    }
+
+    #[test]
+    fn wparse_proxy_defaults_to_disabled() {
+        let path = write_temp_config(
+            r#"
+[server]
+listen_addr = "127.0.0.1:3999"
+public_url = "https://center.example.com"
+admin_token = "tok"
+
+[security]
+hmac_secret = "hmac"
+"#,
+        );
+        let config = CenterConfig::load_from_path(&path).expect("config loads");
+        assert!(!config.wparse_proxy.enabled);
+        assert_eq!(config.wparse_proxy.listen_addr, "0.0.0.0:3101");
     }
 }

@@ -90,7 +90,61 @@ async fn run_main() -> Result<(), Box<dyn Error + Send + Sync>> {
             .map_err(|err| -> Box<dyn Error + Send + Sync> { err.into() })?,
     );
     let gateway_ca_pem = gateway_ca.ca_certificate_pem().to_string();
-    let app = wist_center::api::router(config, store, gateway_ca);
+
+    // 规则发布兼容入口（WarpStation 设备面）。只有 PG 才能保证命令队列的原子性；
+    // FileStore / 未配 database_url 时自动降级为「未启用」。
+    let proxy = match (&config.database_url, config.wparse_proxy.enabled) {
+        (Some(url), true) => match wist_center::wparse_proxy::WparseProxy::connect(url).await {
+            Ok(proxy) => Some(Arc::new(proxy)),
+            Err(err) => {
+                log::warn!("wparse-proxy disabled: {err}");
+                None
+            }
+        },
+        (None, true) => {
+            log::warn!("wparse-proxy disabled: [store].database_url is required");
+            None
+        }
+        _ => None,
+    };
+    let proxy_tls = server_tls.clone();
+    let proxy_addr = config.wparse_proxy.listen_addr.clone();
+    let app = wist_center::api::router(config, store, gateway_ca, proxy.clone());
+
+    // 独立 listener：服务器证书 + **不校客户端证书**（WarpStation 持 Bearer proxy token，
+    // 没有、也不应该持有网关 mTLS 客户端证书）。
+    if let Some(proxy) = proxy {
+        let proxy_app = wist_center::wparse_proxy::router(proxy);
+        match proxy_tls {
+            Some((cert_path, key_path)) => {
+                let tls_config = wist_center::infra::load_server_only_config(&cert_path, &key_path)
+                    .map_err(|err| -> Box<dyn Error + Send + Sync> { err.into() })?;
+                let listener = TcpListener::bind(&proxy_addr).await?;
+                log::info!("wparse-proxy listening on https://{proxy_addr}");
+                tokio::spawn(async move {
+                    if let Err(err) = serve_tls(listener, proxy_app, tls_config).await {
+                        log::error!("wparse-proxy listener stopped: {err}");
+                    }
+                });
+            }
+            None => {
+                let listener = TcpListener::bind(&proxy_addr).await?;
+                log::warn!(
+                    "wparse-proxy listening on http://{proxy_addr} (server TLS is not configured)"
+                );
+                tokio::spawn(async move {
+                    if let Err(err) = axum::serve(
+                        listener,
+                        proxy_app.into_make_service_with_connect_info::<SocketAddr>(),
+                    )
+                    .await
+                    {
+                        log::error!("wparse-proxy listener stopped: {err}");
+                    }
+                });
+            }
+        }
+    }
     let listener = TcpListener::bind(&addr).await?;
     match server_tls {
         Some((cert_path, key_path)) => {

@@ -34,6 +34,8 @@ codes! {
     CERTIFICATE_NOT_REGISTERED => "certificate_not_registered",
     CERTIFICATE_REQUIRED => "certificate_required",
     CLIENT_CERTIFICATE_PERSIST_FAILED => "client_certificate_persist_failed",
+    COMMAND_NOT_FOUND => "command_not_found",
+    COMMAND_STORE_UNAVAILABLE => "command_store_unavailable",
     COS_PATH_REQUIRED => "cos_path_required",
     COS_RESOLVE_FAILED => "cos_resolve_failed",
     CREDENTIAL_ID_GENERATION_FAILED => "credential_id_generation_failed",
@@ -121,6 +123,9 @@ codes! {
     UPGRADE_PLAN_LOAD_FAILED => "upgrade_plan_load_failed",
     VERSION_MISMATCH => "version_mismatch",
     VERSION_UNDERIVABLE => "version_underivable",
+    WPARSE_PROXY_TOKEN_ISSUE_FAILED => "wparse_proxy_token_issue_failed",
+    WPARSE_PROXY_TOKEN_NOT_FOUND => "wparse_proxy_token_not_found",
+    WPARSE_PROXY_UNAVAILABLE => "wparse_proxy_unavailable",
 }
 
 #[cfg(test)]
