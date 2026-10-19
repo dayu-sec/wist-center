@@ -5,6 +5,31 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.18.0-alpha] - 2026-10-19
+
+### 新增
+
+- **规则发布兼容入口 `[wparse_proxy]`**：WarpStation 可以通过中心代理，把规则/配置发布到
+  **不开放入站端口**的网关。中心提供独立 HTTPS listener（默认 `0.0.0.0:3101`）与命令队列，
+  网关侧由 gwlinkd 短轮询取命令并调用本机 wparse 管理面。
+- **proxy token 管理**：`POST/DELETE /api/v1/admin/gateways/{gateway_id}/wparse-proxy-token`；
+  只存 SHA-256，签发/轮换后旧 token 立即失效，明文只在签发时返回一次。
+- **网关命令通道（mTLS）**：`GET /api/v1/gateway/commands`（原子租约）、
+  `POST /api/v1/gateway/commands/{command_id}/result`（结果回传），证书身份与命令归属强绑定。
+- **发布请求校验与保护**：`group ∈ {models, infra}`、`update=true`、版本号白名单；
+  同一 `(gateway, version, group)` 的 reload 幂等复用；每网关 60 次/分钟限流、
+  最多 32 条在途命令（超限 429），pending 60s 过期、租约 30s、最多重试 1 次。
+
+### 修复
+
+- `packages.sources` 配置归一化改为 let-chain 写法，消除 `clippy::collapsible_if` /
+  `clippy::let_and_return` 告警（行为不变）。
+
+### 测试
+
+- 新增 19 个测试（token 轮换/撤销、租约与唤醒、幂等、pending 过期、队列上限、限流窗口、
+  HTTP handler 级 401/400/422/429/回传）。全量 212 passed / 2 ignored。
+
 ## [0.17.2-alpha] - 2026-10-18
 
 ### 新增
