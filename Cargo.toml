@@ -23,7 +23,7 @@ wist-error =  "0.1"
 
 #wist-control = { path = "../wist-control" }
 #wist-error = { path = "../wist-error" }
-orion-error = { version = "0.8", features = ["derive", "serde_json"] }
+orion-error = { version = "0.9", features = ["derive", "serde_json"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
