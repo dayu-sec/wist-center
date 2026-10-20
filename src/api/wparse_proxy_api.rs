@@ -39,6 +39,12 @@ pub struct CommandResultBody {
     pub body: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
+    /// 任务执行记录目录（网关本机）；老 gwlinkd 不带。
+    #[serde(default)]
+    pub log_dir: Option<String>,
+    /// 任务执行记录摘要（网关侧已脱敏、已截断）；老 gwlinkd 不带。
+    #[serde(default)]
+    pub log_excerpt: Option<String>,
 }
 
 fn proxy_unavailable() -> Response {
@@ -145,6 +151,8 @@ pub async fn report_command_result(
         status_code: input.status_code,
         body: input.body.unwrap_or_default(),
         error: input.error,
+        log_dir: input.log_dir,
+        log_excerpt: crate::api::bounded_log_excerpt(input.log_excerpt),
     };
     match proxy.complete_command(&command_id, result).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),

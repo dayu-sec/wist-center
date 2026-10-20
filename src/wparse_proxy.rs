@@ -72,6 +72,10 @@ pub struct CommandResult {
     pub status_code: u16,
     pub body: String,
     pub error: Option<String>,
+    /// 任务执行记录目录（网关本机路径；失败才有）。
+    pub log_dir: Option<String>,
+    /// 任务执行记录摘要（有界、网关侧已脱敏；失败才有）。
+    pub log_excerpt: Option<String>,
 }
 
 /// 一条已租出的命令（gwlinkd 拉取后执行）。
@@ -315,6 +319,8 @@ impl WparseProxy {
                     response_status = $3,
                     response_body = $4,
                     error = $5,
+                    log_dir = $6,
+                    log_excerpt = $7,
                     lease_expires_at = NULL,
                     updated_at = NOW()
               WHERE command_id = $1 AND state = 'leased'",
@@ -324,6 +330,8 @@ impl WparseProxy {
         .bind(i32::from(result.status_code))
         .bind(&result.body)
         .bind(&result.error)
+        .bind(&result.log_dir)
+        .bind(&result.log_excerpt)
         .execute(&self.pool)
         .await
         .map_err(|err| format!("complete command: {err}"))?
@@ -585,11 +593,19 @@ fn validate_reload(
 fn upstream_response(result: CommandResult) -> Response {
     let status = StatusCode::from_u16(result.status_code).unwrap_or(StatusCode::BAD_GATEWAY);
     let body = if result.body.trim().is_empty() && result.error.is_some() {
-        json!({
-            "success": false,
-            "error": { "code": "upstream_error", "message": result.error }
-        })
-        .to_string()
+        // 上游没给 body（传输失败 / 网关侧拒绝）时，把任务日志目录 + 摘要一并告诉调用方：
+        // WarpStation 直面的就是这一段，否则它只能看到一句错误。
+        let mut error = json!({
+            "code": "upstream_error",
+            "message": result.error,
+        });
+        if let Some(dir) = result.log_dir.as_deref() {
+            error["log_dir"] = json!(dir);
+        }
+        if let Some(excerpt) = result.log_excerpt.as_deref() {
+            error["log_excerpt"] = json!(excerpt);
+        }
+        json!({"success": false, "error": error}).to_string()
     } else {
         result.body
     };
@@ -640,11 +656,17 @@ CREATE TABLE IF NOT EXISTS gateway_commands (
   response_status INT,
   response_body TEXT,
   error TEXT,
+  -- 任务执行记录（失败时才带）：网关本机目录 + 有界摘要（写入时已脱敏）。
+  log_dir TEXT,
+  log_excerpt TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_gateway_commands_pending
   ON gateway_commands (gateway_id, state, created_at);
+-- 老库补列（0.19.3 新增）。
+ALTER TABLE gateway_commands ADD COLUMN IF NOT EXISTS log_dir TEXT;
+ALTER TABLE gateway_commands ADD COLUMN IF NOT EXISTS log_excerpt TEXT;
 CREATE TABLE IF NOT EXISTS gateway_wparse_tokens (
   gateway_id TEXT PRIMARY KEY,
   token_sha256 TEXT NOT NULL,
@@ -659,6 +681,55 @@ CREATE INDEX IF NOT EXISTS idx_gateway_wparse_tokens_hash
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_upstream_response_carries_the_log_pointer_and_excerpt() {
+        let result = CommandResult {
+            status_code: 502,
+            body: String::new(),
+            error: Some("wparse 上游返回 502".to_string()),
+            log_dir: Some("/var/lib/gwlinkd/tasks/wparse-cmd_1-20261020".to_string()),
+            log_excerpt: Some("# output\n< transport error (3 ms)".to_string()),
+        };
+        let response = upstream_response(result);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let sent: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(sent["success"], false);
+        assert_eq!(sent["error"]["code"], "upstream_error");
+        assert_eq!(
+            sent["error"]["log_dir"],
+            "/var/lib/gwlinkd/tasks/wparse-cmd_1-20261020"
+        );
+        assert!(
+            sent["error"]["log_excerpt"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("transport error"),
+            "{sent}"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_upstream_response_is_passed_through_verbatim() {
+        // 成功时 body 是给 WarpStation 的机器载荷：不能塞任何额外字段。
+        let body = r#"{"accepted":true,"request_id":"cmd_1"}"#;
+        let result = CommandResult {
+            status_code: 200,
+            body: body.to_string(),
+            error: None,
+            log_dir: Some("/tmp/tasks/x".to_string()),
+            log_excerpt: Some("# output\nshould not leak".to_string()),
+        };
+        let response = upstream_response(result);
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        assert_eq!(String::from_utf8_lossy(&bytes), body);
+    }
 
     fn reload(group: Option<&str>, update: Option<bool>, version: Option<&str>) -> ReloadBody {
         ReloadBody {
@@ -835,6 +906,8 @@ mod tests {
             status_code: 200,
             body: r#"{"accepted":true}"#.to_string(),
             error: None,
+            log_dir: None,
+            log_excerpt: None,
         };
         assert!(
             proxy
@@ -894,6 +967,8 @@ mod tests {
                     status_code: 200,
                     body: "{}".to_string(),
                     error: None,
+                    log_dir: None,
+                    log_excerpt: None,
                 },
             )
             .await
@@ -1061,6 +1136,8 @@ mod tests {
                 status_code: 200,
                 body: body.to_string(),
                 error: None,
+                log_dir: None,
+                log_excerpt: None,
             },
             Some(("GET", STATUS_PATH)),
         );
@@ -1166,6 +1243,8 @@ mod tests {
                 status_code: 200,
                 body: upstream.to_string(),
                 error: None,
+                log_dir: None,
+                log_excerpt: None,
             },
             Some(("POST", RELOAD_PATH)),
         );

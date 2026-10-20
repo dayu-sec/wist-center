@@ -5,6 +5,25 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.19.3-alpha] - 2026-10-20
+
+### 新增
+
+- **失败任务的日志内容随回执入库、并在管理面展示**（契约：`wist-control 0.16.1`）：
+  - `POST /api/v1/gateway/upgrade-result` 接收 `log_dir` / `log_excerpt`（都可选）；
+    `log_dir` 优先用结构化字段，老网关继续从 `detail` 里的 `日志: <dir>` 考底解析。
+  - 计划条目的 `entries[]` 多一个 `log_excerpt`（空值不序列化，老数据不变形）。
+  - `POST /api/v1/gateway/commands/{id}/result` 同样接收两个字段，落 `gateway_commands`
+    的 `log_dir` / `log_excerpt` 列；上游没给 body 时，回给调用方（WarpStation）的
+    `upstream_error` 里也会带这两个字段 —— 否则它只能看到一句错误。
+- **服务端第二道闸**：上报的摘要超过 16 KiB 就按字符边界截断（不信任上报方的大小）。
+- `gateway_commands` 加两列；老库由 `ALTER TABLE ... IF NOT EXISTS` 自动补。
+
+### 测试
+
+新增：失败响应带 `log_dir` / `log_excerpt`、成功响应**原样透传**（不往机器载荷里塞字段）、
+条目视图暴露摘要且空值不出现、摘要有界且不切坏 UTF-8。全量 `223 passed`（2 ignored）。
+
 ## [0.19.2-alpha] - 2026-10-20
 
 ### 新增

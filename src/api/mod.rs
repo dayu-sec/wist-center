@@ -30,6 +30,29 @@ mod rollout;
 mod version;
 mod wparse_proxy_api;
 
+/// 网关上报的日志摘要上限（字节）。
+///
+/// gwlinkd 自己已经截到 8 KiB；这里是**服务端的第二道闸** —— 不信任上报方的大小
+/// （一个被改的网关可以把整库撑成 TB）。超了就按字符边界截，不让半个 UTF-8 字入库。
+pub(crate) const MAX_LOG_EXCERPT_BYTES: usize = 16 * 1024;
+
+/// 截断并清洗上报的日志摘要（空串 → `None`）。
+pub(crate) fn bounded_log_excerpt(excerpt: Option<String>) -> Option<String> {
+    let mut text = excerpt?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    if text.len() > MAX_LOG_EXCERPT_BYTES {
+        let mut cut = MAX_LOG_EXCERPT_BYTES;
+        while cut > 0 && !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+        text.push_str("\n…\n");
+    }
+    Some(text)
+}
+
 use admin_ops::{
     admin_advance_upgrade_plan, admin_approve_upgrade_plan, admin_bind_gateway_customer,
     admin_create_gateway_instance, admin_create_upgrade_plan, admin_dispatch_agent_fleet_command,
@@ -638,6 +661,27 @@ mod scope_tests {
             status(admin, Method::POST, "/api/v1/gateway/status").await,
             StatusCode::NOT_FOUND
         );
+    }
+
+    #[test]
+    fn bounded_log_excerpt_caps_untrusted_input() {
+        assert_eq!(bounded_log_excerpt(None), None);
+        assert_eq!(bounded_log_excerpt(Some("   \n".into())), None);
+        assert_eq!(
+            bounded_log_excerpt(Some("boom".into())).as_deref(),
+            Some("boom")
+        );
+
+        // 超限时按字符边界截断（`字` 占 3 字节，16 KiB 不是 3 的倍数）。
+        let huge = "字".repeat(MAX_LOG_EXCERPT_BYTES);
+        let capped = bounded_log_excerpt(Some(huge)).expect("capped");
+        assert!(
+            capped.len() <= MAX_LOG_EXCERPT_BYTES + 4,
+            "{}",
+            capped.len()
+        );
+        assert!(capped.is_char_boundary(capped.len()));
+        assert!(capped.ends_with("…\n"), "{capped}");
     }
 
     #[test]

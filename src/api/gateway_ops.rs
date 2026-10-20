@@ -627,14 +627,20 @@ pub async fn report_gateway_upgrade_result(
     );
     // 回填计划的逐网关条目：状态折算 + 终态按闸门推进。回执已收到，回填失败只记日志，
     // 不影响回 ack（条目会留在原状，等下次同网关结果或人工推进对账）。
-    // 任务日志目录：gwlinkd P0 把它写在 `detail` 末尾（`；日志: <dir>`），这里归一化成字段。
-    let log_dir = rollout::parse_task_log_dir(&input.detail);
+    // 任务日志：优先用回执里的结构化字段；老网关只在 `detail` 末尾带 `；日志: <dir>`，
+    // 那就解析它（兼容口径）。
+    let log_dir = input
+        .log_dir
+        .clone()
+        .or_else(|| rollout::parse_task_log_dir(&input.detail));
+    let log_excerpt = super::bounded_log_excerpt(input.log_excerpt.clone());
     if let Err(err) = rollout::reconcile_gateway_upgrade_result(
         &state,
         &input.gateway_id,
         &input.status,
         &input.detail,
         log_dir.as_deref(),
+        log_excerpt.as_deref(),
     )
     .await
     {

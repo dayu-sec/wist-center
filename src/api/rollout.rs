@@ -102,6 +102,9 @@ pub struct RolloutPlanEntryView {
     /// 任务执行日志目录（网关本机路径；回执里带的 `日志: <dir>`）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log_dir: Option<String>,
+    /// 任务执行日志摘要（失败回执才带）。管理面直接展开看，不必去网关捞文件。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_excerpt: Option<String>,
     pub updated_at: DateTime,
 }
 
@@ -127,6 +130,7 @@ fn entry_view(entry: &UpgradePlanEntryRecord) -> RolloutPlanEntryView {
         status: entry.status.clone(),
         detail: entry.detail.clone(),
         log_dir: entry.log_dir.clone(),
+        log_excerpt: entry.log_excerpt.clone(),
         updated_at: entry.updated_at.clone(),
     }
 }
@@ -332,6 +336,7 @@ pub(super) fn build_plan(input: &CreateRolloutPlanRequest) -> Result<UpgradePlan
             status: "pending".to_string(),
             detail: String::new(),
             log_dir: None,
+            log_excerpt: None,
             updated_at: now.clone(),
         })
         .collect();
@@ -404,6 +409,7 @@ pub(super) fn build_retry_plan(
             status: "pending".to_string(),
             detail: String::new(),
             log_dir: None,
+            log_excerpt: None,
             updated_at: now.clone(),
         })
         .collect();
@@ -623,6 +629,7 @@ pub(super) async fn reconcile_gateway_upgrade_result(
     status: &str,
     detail: &str,
     log_dir: Option<&str>,
+    log_excerpt: Option<&str>,
 ) -> Result<(), String> {
     let plans = state
         .store
@@ -655,6 +662,9 @@ pub(super) async fn reconcile_gateway_upgrade_result(
         entry.detail = detail.to_string();
         if let Some(log_dir) = log_dir {
             entry.log_dir = Some(log_dir.to_string());
+        }
+        if let Some(log_excerpt) = log_excerpt {
+            entry.log_excerpt = Some(log_excerpt.to_string());
         }
         entry.updated_at = DateTime::now();
         if matches!(entry_status, "succeeded" | "failed") {
@@ -690,8 +700,33 @@ mod tests {
             status: status.to_string(),
             detail: String::new(),
             log_dir: None,
+            log_excerpt: None,
             updated_at: DateTime::now(),
         }
+    }
+
+    #[test]
+    fn entry_view_exposes_the_log_excerpt() {
+        let mut entry = entry("gw-1", "failed");
+        entry.detail = "executor exit status: 1".to_string();
+        entry.log_dir = Some("/var/lib/gwlinkd/tasks/upgrade-p-1".to_string());
+        entry.log_excerpt = Some("# output\nexit status: 1".to_string());
+
+        let view = entry_view(&entry);
+        assert_eq!(
+            view.log_dir.as_deref(),
+            Some("/var/lib/gwlinkd/tasks/upgrade-p-1")
+        );
+        assert_eq!(
+            view.log_excerpt.as_deref(),
+            Some("# output\nexit status: 1")
+        );
+
+        // 老网关不带：序列化里连键都不出现（管理面不会渲染空块）。
+        let bare = entry_view(&self::entry("gw-2", "succeeded"));
+        let json = serde_json::to_string(&bare).expect("json");
+        assert!(!json.contains("log_excerpt"), "{json}");
+        assert!(!json.contains("log_dir"), "{json}");
     }
 
     #[test]
