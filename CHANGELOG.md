@@ -5,6 +5,18 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.19.4-alpha] - 2026-10-20
+
+### 新增
+
+- **失败回执带 `task_id`**（契约：`wist-control 0.16.2`）：计划条目与命令记录都能说出
+  「这是哪一次执行」—— 同一份计划重试会换 `tasks/<kind>-<task_id>-<ts>/`，只有目录路径
+  会看串。
+  - `POST /api/v1/gateway/upgrade-result` 接收 `task_id`，落进条目并出现在 `entries[]`；
+  - `POST /api/v1/gateway/commands/{id}/result` 接收 `task_id`，落 `gateway_commands.task_id`，
+    并在 `upstream_error` 里回给调用方；
+  - 服务端仍对摘要做 16 KiB 上限与字符边界截断。
+
 ## [0.19.3-alpha] - 2026-10-20
 
 ### 新增

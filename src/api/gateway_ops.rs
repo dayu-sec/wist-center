@@ -639,6 +639,7 @@ pub async fn report_gateway_upgrade_result(
         &input.gateway_id,
         &input.status,
         &input.detail,
+        input.task_id.as_deref(),
         log_dir.as_deref(),
         log_excerpt.as_deref(),
     )

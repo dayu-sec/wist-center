@@ -72,6 +72,8 @@ pub struct CommandResult {
     pub status_code: u16,
     pub body: String,
     pub error: Option<String>,
+    /// 本次任务 ID（网关 `tasks/<kind>-<task_id>-<ts>/` 里的那个）。
+    pub task_id: Option<String>,
     /// 任务执行记录目录（网关本机路径；失败才有）。
     pub log_dir: Option<String>,
     /// 任务执行记录摘要（有界、网关侧已脱敏；失败才有）。
@@ -319,8 +321,9 @@ impl WparseProxy {
                     response_status = $3,
                     response_body = $4,
                     error = $5,
-                    log_dir = $6,
-                    log_excerpt = $7,
+                    task_id = $6,
+                    log_dir = $7,
+                    log_excerpt = $8,
                     lease_expires_at = NULL,
                     updated_at = NOW()
               WHERE command_id = $1 AND state = 'leased'",
@@ -330,6 +333,7 @@ impl WparseProxy {
         .bind(i32::from(result.status_code))
         .bind(&result.body)
         .bind(&result.error)
+        .bind(&result.task_id)
         .bind(&result.log_dir)
         .bind(&result.log_excerpt)
         .execute(&self.pool)
@@ -599,6 +603,9 @@ fn upstream_response(result: CommandResult) -> Response {
             "code": "upstream_error",
             "message": result.error,
         });
+        if let Some(task_id) = result.task_id.as_deref() {
+            error["task_id"] = json!(task_id);
+        }
         if let Some(dir) = result.log_dir.as_deref() {
             error["log_dir"] = json!(dir);
         }
@@ -656,7 +663,8 @@ CREATE TABLE IF NOT EXISTS gateway_commands (
   response_status INT,
   response_body TEXT,
   error TEXT,
-  -- 任务执行记录（失败时才带）：网关本机目录 + 有界摘要（写入时已脱敏）。
+  -- 任务执行记录（失败时才带）：任务 ID + 网关本机目录 + 有界摘要（写入时已脱敏）。
+  task_id TEXT,
   log_dir TEXT,
   log_excerpt TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -664,7 +672,8 @@ CREATE TABLE IF NOT EXISTS gateway_commands (
 );
 CREATE INDEX IF NOT EXISTS idx_gateway_commands_pending
   ON gateway_commands (gateway_id, state, created_at);
--- 老库补列（0.19.3 新增）。
+-- 老库补列（0.19.3 新增；0.19.4 补 task_id）。
+ALTER TABLE gateway_commands ADD COLUMN IF NOT EXISTS task_id TEXT;
 ALTER TABLE gateway_commands ADD COLUMN IF NOT EXISTS log_dir TEXT;
 ALTER TABLE gateway_commands ADD COLUMN IF NOT EXISTS log_excerpt TEXT;
 CREATE TABLE IF NOT EXISTS gateway_wparse_tokens (
@@ -688,6 +697,7 @@ mod tests {
             status_code: 502,
             body: String::new(),
             error: Some("wparse 上游返回 502".to_string()),
+            task_id: Some("wparse-cmd_1-20261020-143000".to_string()),
             log_dir: Some("/var/lib/gwlinkd/tasks/wparse-cmd_1-20261020".to_string()),
             log_excerpt: Some("# output\n< transport error (3 ms)".to_string()),
         };
@@ -699,6 +709,7 @@ mod tests {
         let sent: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
         assert_eq!(sent["success"], false);
         assert_eq!(sent["error"]["code"], "upstream_error");
+        assert_eq!(sent["error"]["task_id"], "wparse-cmd_1-20261020-143000");
         assert_eq!(
             sent["error"]["log_dir"],
             "/var/lib/gwlinkd/tasks/wparse-cmd_1-20261020"
@@ -720,6 +731,7 @@ mod tests {
             status_code: 200,
             body: body.to_string(),
             error: None,
+            task_id: Some("wparse-cmd_1-20261020-143000".to_string()),
             log_dir: Some("/tmp/tasks/x".to_string()),
             log_excerpt: Some("# output\nshould not leak".to_string()),
         };
@@ -906,6 +918,7 @@ mod tests {
             status_code: 200,
             body: r#"{"accepted":true}"#.to_string(),
             error: None,
+            task_id: None,
             log_dir: None,
             log_excerpt: None,
         };
@@ -967,6 +980,7 @@ mod tests {
                     status_code: 200,
                     body: "{}".to_string(),
                     error: None,
+                    task_id: None,
                     log_dir: None,
                     log_excerpt: None,
                 },
@@ -1136,6 +1150,7 @@ mod tests {
                 status_code: 200,
                 body: body.to_string(),
                 error: None,
+                task_id: None,
                 log_dir: None,
                 log_excerpt: None,
             },
@@ -1243,6 +1258,7 @@ mod tests {
                 status_code: 200,
                 body: upstream.to_string(),
                 error: None,
+                task_id: None,
                 log_dir: None,
                 log_excerpt: None,
             },

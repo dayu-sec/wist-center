@@ -39,6 +39,9 @@ pub struct CommandResultBody {
     pub body: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
+    /// 本次任务 ID；老 gwlinkd 不带。
+    #[serde(default)]
+    pub task_id: Option<String>,
     /// 任务执行记录目录（网关本机）；老 gwlinkd 不带。
     #[serde(default)]
     pub log_dir: Option<String>,
@@ -151,6 +154,7 @@ pub async fn report_command_result(
         status_code: input.status_code,
         body: input.body.unwrap_or_default(),
         error: input.error,
+        task_id: input.task_id,
         log_dir: input.log_dir,
         log_excerpt: crate::api::bounded_log_excerpt(input.log_excerpt),
     };

@@ -99,6 +99,9 @@ pub struct RolloutPlanEntryView {
     pub work_id: Option<String>,
     pub status: String,
     pub detail: String,
+    /// 本次任务 ID（网关 `tasks/<kind>-<task_id>-<ts>/` 里的那个）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
     /// 任务执行日志目录（网关本机路径；回执里带的 `日志: <dir>`）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log_dir: Option<String>,
@@ -129,6 +132,7 @@ fn entry_view(entry: &UpgradePlanEntryRecord) -> RolloutPlanEntryView {
         work_id: None,
         status: entry.status.clone(),
         detail: entry.detail.clone(),
+        task_id: entry.task_id.clone(),
         log_dir: entry.log_dir.clone(),
         log_excerpt: entry.log_excerpt.clone(),
         updated_at: entry.updated_at.clone(),
@@ -335,6 +339,7 @@ pub(super) fn build_plan(input: &CreateRolloutPlanRequest) -> Result<UpgradePlan
             gateway_id: gateway_id.clone(),
             status: "pending".to_string(),
             detail: String::new(),
+            task_id: None,
             log_dir: None,
             log_excerpt: None,
             updated_at: now.clone(),
@@ -408,6 +413,7 @@ pub(super) fn build_retry_plan(
             gateway_id: gateway_id.clone(),
             status: "pending".to_string(),
             detail: String::new(),
+            task_id: None,
             log_dir: None,
             log_excerpt: None,
             updated_at: now.clone(),
@@ -628,6 +634,7 @@ pub(super) async fn reconcile_gateway_upgrade_result(
     gateway_id: &str,
     status: &str,
     detail: &str,
+    task_id: Option<&str>,
     log_dir: Option<&str>,
     log_excerpt: Option<&str>,
 ) -> Result<(), String> {
@@ -660,6 +667,9 @@ pub(super) async fn reconcile_gateway_upgrade_result(
         let entry_status = wist_release::rollout::entry_status_for(status);
         entry.status = entry_status.to_string();
         entry.detail = detail.to_string();
+        if let Some(task_id) = task_id {
+            entry.task_id = Some(task_id.to_string());
+        }
         if let Some(log_dir) = log_dir {
             entry.log_dir = Some(log_dir.to_string());
         }
@@ -699,6 +709,7 @@ mod tests {
             gateway_id: target.to_string(),
             status: status.to_string(),
             detail: String::new(),
+            task_id: None,
             log_dir: None,
             log_excerpt: None,
             updated_at: DateTime::now(),
@@ -709,10 +720,15 @@ mod tests {
     fn entry_view_exposes_the_log_excerpt() {
         let mut entry = entry("gw-1", "failed");
         entry.detail = "executor exit status: 1".to_string();
+        entry.task_id = Some("upgrade-plan-1-20261020-143000".to_string());
         entry.log_dir = Some("/var/lib/gwlinkd/tasks/upgrade-p-1".to_string());
         entry.log_excerpt = Some("# output\nexit status: 1".to_string());
 
         let view = entry_view(&entry);
+        assert_eq!(
+            view.task_id.as_deref(),
+            Some("upgrade-plan-1-20261020-143000")
+        );
         assert_eq!(
             view.log_dir.as_deref(),
             Some("/var/lib/gwlinkd/tasks/upgrade-p-1")
@@ -727,6 +743,7 @@ mod tests {
         let json = serde_json::to_string(&bare).expect("json");
         assert!(!json.contains("log_excerpt"), "{json}");
         assert!(!json.contains("log_dir"), "{json}");
+        assert!(!json.contains("task_id"), "{json}");
     }
 
     #[test]
