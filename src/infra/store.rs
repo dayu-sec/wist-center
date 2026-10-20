@@ -123,6 +123,9 @@ pub struct UpgradePlanEntryRecord {
     pub status: String,
     #[serde(default)]
     pub detail: String,
+    /// 任务执行日志目录（网关本机路径；从回执的 `日志: <dir>` 归一化而来）。
+    #[serde(default)]
+    pub log_dir: Option<String>,
     pub updated_at: DateTime,
 }
 
@@ -253,6 +256,7 @@ pub fn normalize_upgrade_plan(plan: &mut UpgradePlanRecord) {
                 gateway_id: gateway_id.clone(),
                 status: "pending".to_string(),
                 detail: String::new(),
+                log_dir: None,
                 updated_at: updated_at.clone(),
             })
             .collect();

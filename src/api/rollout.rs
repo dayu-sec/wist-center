@@ -99,6 +99,9 @@ pub struct RolloutPlanEntryView {
     pub work_id: Option<String>,
     pub status: String,
     pub detail: String,
+    /// 任务执行日志目录（网关本机路径；回执里带的 `日志: <dir>`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_dir: Option<String>,
     pub updated_at: DateTime,
 }
 
@@ -123,8 +126,24 @@ fn entry_view(entry: &UpgradePlanEntryRecord) -> RolloutPlanEntryView {
         work_id: None,
         status: entry.status.clone(),
         detail: entry.detail.clone(),
+        log_dir: entry.log_dir.clone(),
         updated_at: entry.updated_at.clone(),
     }
+}
+
+/// 从回执 `detail` 里提取任务日志目录。
+///
+/// P0 阶段 gwlinkd 把它以 `；日志: <dir>` 追加在 `detail` 末尾；中心在这里归一化成独立字段
+/// （不改上报协议）。等 `ReportGatewayUpgradeResult.log_dir` 字段上线后，本函数降为兜底。
+pub(super) fn parse_task_log_dir(detail: &str) -> Option<String> {
+    let marker = "日志: ";
+    let idx = detail.rfind(marker)?;
+    let rest = &detail[idx + marker.len()..];
+    let dir = rest
+        .split_whitespace()
+        .next()?
+        .trim_end_matches(['；', ';', '。', ',']);
+    (!dir.is_empty()).then(|| dir.to_string())
 }
 
 /// 计划本体视图（create / list / approve / advance 的返回）。
@@ -312,6 +331,7 @@ pub(super) fn build_plan(input: &CreateRolloutPlanRequest) -> Result<UpgradePlan
             gateway_id: gateway_id.clone(),
             status: "pending".to_string(),
             detail: String::new(),
+            log_dir: None,
             updated_at: now.clone(),
         })
         .collect();
@@ -383,6 +403,7 @@ pub(super) fn build_retry_plan(
             gateway_id: gateway_id.clone(),
             status: "pending".to_string(),
             detail: String::new(),
+            log_dir: None,
             updated_at: now.clone(),
         })
         .collect();
@@ -601,6 +622,7 @@ pub(super) async fn reconcile_gateway_upgrade_result(
     gateway_id: &str,
     status: &str,
     detail: &str,
+    log_dir: Option<&str>,
 ) -> Result<(), String> {
     let plans = state
         .store
@@ -631,6 +653,9 @@ pub(super) async fn reconcile_gateway_upgrade_result(
         let entry_status = wist_release::rollout::entry_status_for(status);
         entry.status = entry_status.to_string();
         entry.detail = detail.to_string();
+        if let Some(log_dir) = log_dir {
+            entry.log_dir = Some(log_dir.to_string());
+        }
         entry.updated_at = DateTime::now();
         if matches!(entry_status, "succeeded" | "failed") {
             progress_plan_after_terminal_result(&mut plan);
@@ -664,8 +689,20 @@ mod tests {
             gateway_id: target.to_string(),
             status: status.to_string(),
             detail: String::new(),
+            log_dir: None,
             updated_at: DateTime::now(),
         }
+    }
+
+    #[test]
+    fn parses_task_log_dir_from_detail() {
+        assert_eq!(
+            parse_task_log_dir("取包失败；日志: /var/x/tasks/upgrade-plan-1-2026"),
+            Some("/var/x/tasks/upgrade-plan-1-2026".to_string())
+        );
+        assert_eq!(parse_task_log_dir("日志: /a/b；"), Some("/a/b".to_string()));
+        assert_eq!(parse_task_log_dir("没有日志"), None);
+        assert_eq!(parse_task_log_dir("日志: "), None);
     }
 
     fn plan_with(

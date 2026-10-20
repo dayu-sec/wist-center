@@ -5,6 +5,16 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.19.2-alpha] - 2026-10-20
+
+### 新增
+
+- **升级任务日志目录进结构化字段**：网关回执的 `detail` 末尾（gwlinkd 以 `；日志: <dir>` 追加）
+  在中心归一化成 `log_dir`，随 `GET /api/v1/admin/rollout-plans/{id}` 的 `entries[]` 返回
+  （字段名 `log_dir`，`None` 时省略）。上报协议不变 —— 等 gwlinkd 的
+  `ReportGatewayUpgradeResult.log_dir` 上线后，这个解析降为兜底。
+- 条目记录 `UpgradePlanEntryRecord` 增加 `log_dir`（`#[serde(default)]`，旧数据兼容）。
+
 ## [0.19.1-alpha] - 2026-10-20
 
 ### 修复
