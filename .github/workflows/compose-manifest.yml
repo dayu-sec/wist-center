@@ -1,0 +1,171 @@
+name: Compose manifest (repair)
+
+# 手动补合多架构 manifest。
+#
+# 什么时候用：release.yml 里 docker-amd64 / docker-arm64 已经 push-by-digest 成功，
+# 但 docker-manifest 卡住或失败（例如 GitHub Actions 服务降级，step 长时间 pending），
+# 导致 tag 没建出来。此时不必 `Re-run all jobs`（那会把三份二进制重编一遍），
+# 用本 workflow 直接从已有 digest 把 tag 补上，通常 1~2 分钟（跨区推 TCR 的耗时可忽略）。
+#
+# 取 digest 两种方式，二选一：
+#   1) run_id      —— 从那次 Release run 的 digest-amd64 / digest-arm64 artifact 里读
+#                     （artifact 只保留 1 天，跨天补合请用方式 2）；
+#   2) amd64_digest / arm64_digest —— 直接填 `sha256:...` 或纯 hex。
+#
+# tag 规则与 release.yml 完全一致：预发布 tag（含 `-`）只推该 tag，不覆盖 :latest。
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要补合的 tag（如 v0.18.1-alpha），需已有同名 GitHub Release"
+        required: true
+        type: string
+      run_id:
+        description: "Release run id（从它的 digest-* artifact 取 digest）"
+        required: false
+        type: string
+      amd64_digest:
+        description: "linux/amd64 digest（sha256:... 或纯 hex）；仅当 run_id 未填时生效"
+        required: false
+        type: string
+      arm64_digest:
+        description: "linux/arm64 digest（sha256:... 或纯 hex）；仅当 run_id 未填时生效"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+  actions: read # 跨 run 下载 artifact 需要
+
+concurrency:
+  group: wist-center-manifest-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  compose:
+    name: Compose multi-arch manifest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      # 先卡 tag 格式：少写 `v` 或带空格会造出一个 stack 永远拉不到的 tag。
+      - name: Validate tag
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          case "${TAG}" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::tag 必须形如 v1.2.3 或 v1.2.3-alpha，收到：${TAG}"; exit 1 ;;
+          esac
+
+      # 方式 1：从已有 run 的 artifact 取 digest。
+      - name: Download digests from run
+        if: ${{ inputs.run_id != '' }}
+        uses: actions/download-artifact@v8
+        with:
+          pattern: digest-*
+          path: /tmp/digests
+          merge-multiple: true
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # 方式 2：手工填 digest（artifact 已过期时）。
+      - name: Digests from inputs
+        if: ${{ inputs.run_id == '' }}
+        env:
+          AMD64: ${{ inputs.amd64_digest }}
+          ARM64: ${{ inputs.arm64_digest }}
+        run: |
+          set -euo pipefail
+          if [ -z "${AMD64}" ] || [ -z "${ARM64}" ]; then
+            echo "::error::run_id 与 amd64_digest/arm64_digest 必须给一组"
+            exit 1
+          fi
+          mkdir -p /tmp/digests
+          printf '%s' "${AMD64}" | sed 's/^sha256://' > /tmp/digests/amd64
+          printf '%s' "${ARM64}" | sed 's/^sha256://' > /tmp/digests/arm64
+
+      - name: Validate digests
+        run: |
+          set -euo pipefail
+          ls -l /tmp/digests
+          count=$(find /tmp/digests -type f | wc -l | tr -d ' ')
+          [ "${count}" -eq 2 ] || { echo "::error::期望 2 个架构 digest，实际 ${count}"; exit 1; }
+          # 每个文件必须是 64 位小写 hex（格式错时 imagetools 的报错很难懂，提前挡掉）
+          for f in /tmp/digests/*; do
+            name="$(basename "$f")"
+            case "${name}" in
+              *[!0-9a-f]*) echo "::error::digest 必须是 64 位小写 hex，收到：${name}"; exit 1 ;;
+            esac
+            [ "${#name}" -eq 64 ] || { echo "::error::digest 长度应为 64，实际 ${#name}：${name}"; exit 1; }
+          done
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to TCR
+        uses: docker/login-action@v4
+        with:
+          registry: dy-sec.tencentcloudcr.com
+          username: ${{ secrets.TCR_USERNAME }}
+          password: ${{ secrets.TCR_PASSWORD }}
+
+      - name: Compute image tags
+        id: meta
+        env:
+          TAG: ${{ inputs.tag }}
+          GHCR: ghcr.io/${{ github.repository }}
+          TCR: dy-sec.tencentcloudcr.com/cloud/wist-center
+        run: |
+          set -euo pipefail
+          tags="$(printf '%s\n%s' "${GHCR}:${TAG}" "${TCR}:${TAG}")"
+          case "${TAG}" in
+            *-*) ;; # 预发布：不碰 :latest
+            *)
+              tags="$(printf '%s\n%s' "$tags" "${GHCR}:latest")"
+              tags="$(printf '%s\n%s' "$tags" "${TCR}:latest")"
+              ;;
+          esac
+          printf 'tags<<__EOF__\n%s\n__EOF__\n' "$tags" >> "$GITHUB_OUTPUT"
+
+      - name: Create multi-arch manifests
+        timeout-minutes: 5
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          IMAGE: ghcr.io/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          digests=()
+          for f in /tmp/digests/*; do
+            digests+=("${IMAGE}@sha256:$(basename "$f")")
+          done
+          args=()
+          while IFS= read -r tag; do
+            [ -n "$tag" ] && args+=(-t "$tag")
+          done <<< "${TAGS}"
+
+          # 只读合并 + 推 tag，几分钟内可安全重试；网络抖动时不要人工重跑整个 workflow。
+          ok=0
+          for i in 1 2 3; do
+            if docker buildx imagetools create "${args[@]}" "${digests[@]}"; then
+              ok=1
+              break
+            fi
+            if [ "${i}" -lt 3 ]; then
+              echo "::warning::imagetools create 第 ${i} 次失败，5s 后重试"
+              sleep 5
+            fi
+          done
+          [ "${ok}" -eq 1 ] || { echo "::error::imagetools create 连续 3 次失败"; exit 1; }
+
+          while IFS= read -r tag; do
+            [ -n "$tag" ] && docker buildx imagetools inspect "$tag"
+          done <<< "${TAGS}"

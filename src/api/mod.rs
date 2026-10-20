@@ -173,7 +173,7 @@ fn state_of(
 /// `/api/v1/admin/**`。新增路由**不会**自动出现在任何一面，必须显式加进 [`ListenerScope::allows`]。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ListenerScope {
-    /// 公网：`/api/v1/gateway/**` + `/api/v1/version`。
+    /// 公网：`/api/v1/gateway/**` + `/api/v1/releases/artifact/**` + `/api/v1/version`。
     Gateway,
     /// 内网：`/api/v1/admin/**` + `/api/v1/version`。
     Admin,
@@ -187,7 +187,13 @@ impl ListenerScope {
         }
         match self {
             ListenerScope::Gateway => {
-                path == "/api/v1/gateway" || path.starts_with("/api/v1/gateway/")
+                path == "/api/v1/gateway"
+                    || path.starts_with("/api/v1/gateway/")
+                    // 制品下载：gwlinkd 的升级流程要从中心取包
+                    // （`/api/v1/releases/artifact/{component}/{version}/{filename}`）。
+                    // 它不是管理面 —— 只按已发布的 component/version/filename 读文件，
+                    // 且路由层自己做段校验（拒 `..`、分隔符）。
+                    || path.starts_with("/api/v1/releases/artifact/")
             }
             ListenerScope::Admin => path == "/api/v1/admin" || path.starts_with("/api/v1/admin/"),
         }
@@ -486,6 +492,10 @@ mod scope_tests {
             .route("/api/v1/version", get(|| async { "v" }))
             .route("/api/v1/gateway/status", post(|| async { "gw" }))
             .route("/api/v1/admin/gateways", get(|| async { "admin" }))
+            .route(
+                "/api/v1/releases/artifact/{component}/{version}/{filename}",
+                get(|| async { "artifact" }),
+            )
             .layer(from_fn(move |req: Request, next: Next| {
                 scope_guard(scope, req, next)
             }))
@@ -520,6 +530,21 @@ mod scope_tests {
         assert_eq!(
             status(gw, Method::GET, "/api/v1/admin/gateways").await,
             StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_face_exposes_artifact_downloads() {
+        let path = "/api/v1/releases/artifact/wist-gwlinkd/v0.15.0-alpha/pkg.tar.gz";
+        assert_eq!(
+            status(ListenerScope::Gateway, Method::GET, path).await,
+            StatusCode::OK,
+            "网关面必须能下载升级制品（gwlinkd 升级链路）"
+        );
+        assert_eq!(
+            status(ListenerScope::Admin, Method::GET, path).await,
+            StatusCode::NOT_FOUND,
+            "制品下载按设计只在网关面"
         );
     }
 

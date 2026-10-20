@@ -32,6 +32,11 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
+      # 按 target 分缓存：musl 的产物在 target/<triple>/ 下，和宿主 build 不互相污染。
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
       - name: Install musl toolchain
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
@@ -70,6 +75,11 @@ jobs:
         with:
           toolchain: stable
           targets: aarch64-apple-darwin
+
+      # macOS 编译最慢且在关键路径上（release job 要等它），这里缓存收益最大。
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-apple-darwin
 
       - name: Cargo build
         run: cargo build --release --target aarch64-apple-darwin
@@ -202,6 +212,8 @@ jobs:
           retention-days: 1
 
   # 2c. 合并两个架构的 digest → 多架构 manifest；ghcr 先出，TCR 同一次推送。
+  # 本 job 卡住/失败时可单独补跑：见 compose-manifest.yml（workflow_dispatch），
+  # 直接用已 push 的 digest 补 tag，不必重跑整条 Release。
   docker-manifest:
     name: Compose multi-arch manifest
     needs: [docker-amd64, docker-arm64]

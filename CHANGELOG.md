@@ -5,6 +5,19 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.19.1-alpha] - 2026-10-20
+
+### 修复
+
+- **网关面把制品下载也挡成了 404**：0.19.0 的面分离把公网 listener 收窄成
+  `/api/v1/gateway/**` + `/api/v1/version`，漏掉了 `GET
+  /api/v1/releases/artifact/{component}/{version}/{filename}`（gwlinkd 升级、网关侧任何制品下载
+  都走它）。表现：文件确实在 `artifacts/` 里，但请求返回 `HTTP 404`，
+  `gops`/gwlinkd 报「取制品失败 … returned HTTP 404 Not Found」。
+  管理面同样不放行该前缀，于是两个 listener 都没人服务这条路由。
+  现在把 `/api/v1/releases/artifact/` 纳入**网关面**白名单；管理面仍不暴露（浏览器不需要）。
+  路径段校验仍在路由层（拒 `..`、分隔符、非法段）。
+
 ## [0.19.0-alpha] - 2026-10-20
 
 ### 新增
