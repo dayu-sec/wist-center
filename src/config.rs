@@ -57,6 +57,7 @@ const LAYER: wist_config::LayerSpec = wist_config::LayerSpec {
 const DEFAULT_LISTEN: &str = "127.0.0.1:3100";
 const DEFAULT_STORE_PATH: &str = "state/warp-insight-center-store.json";
 const ENV_LISTEN: &str = "WARP_INSIGHT_CENTER_LISTEN";
+const ENV_ADMIN_ADDR: &str = "WARP_INSIGHT_CENTER_ADMIN_ADDR";
 const ENV_STORE_PATH: &str = "WARP_INSIGHT_CENTER_STORE_PATH";
 const ENV_GATEWAY_CREDENTIALS: &str = "WARP_INSIGHT_CENTER_GATEWAY_CREDENTIALS";
 const ENV_DATABASE_URL: &str = "WARP_INSIGHT_CENTER_DATABASE_URL";
@@ -90,7 +91,11 @@ const DEFAULT_LINK_TTL_SECONDS: i64 = 15 * 60;
 
 #[derive(Debug, Clone)]
 pub struct CenterConfig {
+    /// 网关面监听地址（**公网**）：只挂 `/api/v1/gateway/**` + `/api/v1/version`，mTLS。
     pub listen_addr: String,
+    /// 管理面监听地址（**内网**）：只挂 `/api/v1/admin/**` + `/api/v1/version`，不校客户端证书。
+    /// 缺省（`None`）= 不拆监听器（两者共用 `listen_addr`），保留旧行为。
+    pub admin_addr: Option<String>,
     pub store_path: PathBuf,
     /// 服务端 TLS 证书/私钥（PEM）。**两者都配** → 起 HTTPS（服务器证书 = CA-S 签）并
     /// 校网关客户端证书（CA-G）；**都未配** → 明文 HTTP（dev / 反代兑底）。来源：
@@ -220,6 +225,7 @@ struct RawCenterConfig {
 #[derive(Debug, Default, Deserialize)]
 struct RawServerConfig {
     listen_addr: Option<String>,
+    admin_addr: Option<String>,
     public_url: Option<String>,
     protocol_version: Option<String>,
     admin_token: Option<String>,
@@ -430,6 +436,7 @@ impl CenterConfig {
             listen_addr: serve
                 .listen_addr
                 .unwrap_or_else(|| DEFAULT_LISTEN.to_string()),
+            admin_addr: normalize_optional(serve.admin_addr),
             server_cert_path,
             server_key_path,
             store_path: absolutize_path(
@@ -491,6 +498,16 @@ impl CenterConfig {
 
     fn validate(&self) -> Result<(), ConfigError> {
         require_non_empty("server.listen_addr", &self.listen_addr)?;
+        // 管理面监听器：配了就不得与网关面重叠（同一个端口无法绑定两次）。
+        // 只校验形式；真正的“公网/内网”由部署侧的 bind IP 与防火墙决定。
+        if let Some(admin) = self.admin_addr.as_deref() {
+            require_non_empty("server.admin_addr", admin)?;
+            if admin.trim() == self.listen_addr.trim() {
+                return Err(config_validation(
+                    "server.admin_addr must differ from server.listen_addr",
+                ));
+            }
+        };
         require_non_empty("server.public_url", &self.public_url)?;
         require_non_empty("server.protocol_version", &self.protocol_version)?;
         require_non_empty("security.hmac_secret", &self.hmac_secret)?;
@@ -564,6 +581,7 @@ pub fn resolved_gateway_client_ca_paths(config_path: &Path) -> (PathBuf, PathBuf
 fn expand_raw_env(raw: &mut RawCenterConfig, env: &EnvDict) -> Result<(), ConfigError> {
     for value in [
         &mut raw.server.listen_addr,
+        &mut raw.server.admin_addr,
         &mut raw.server.public_url,
         &mut raw.server.protocol_version,
         &mut raw.server.admin_token,
@@ -592,6 +610,7 @@ fn expand_raw_env(raw: &mut RawCenterConfig, env: &EnvDict) -> Result<(), Config
 fn apply_env_overrides(raw: &mut RawCenterConfig) {
     // 标量：env 有值（非空白）才覆盖；env 置空视为"没给"，保留文件值。
     override_scalar(&mut raw.server.listen_addr, ENV_LISTEN);
+    override_scalar(&mut raw.server.admin_addr, ENV_ADMIN_ADDR);
     override_scalar(&mut raw.server.public_url, ENV_PUBLIC_URL);
     override_scalar(&mut raw.server.protocol_version, ENV_PROTOCOL_VERSION);
     override_scalar(&mut raw.artifacts.gateway_image, ENV_GATEWAY_IMAGE);

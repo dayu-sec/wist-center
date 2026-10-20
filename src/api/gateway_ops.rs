@@ -1288,6 +1288,7 @@ mod tests {
         ApiState {
             config: crate::config::CenterConfig {
                 listen_addr: "127.0.0.1:3100".to_string(),
+                admin_addr: None,
                 store_path: path,
                 server_cert_path: None,
                 server_key_path: None,
@@ -1352,6 +1353,7 @@ mod tests {
         ApiState {
             config: crate::config::CenterConfig {
                 listen_addr: "127.0.0.1:3100".to_string(),
+                admin_addr: None,
                 store_path: path,
                 server_cert_path: None,
                 server_key_path: None,
@@ -1403,6 +1405,7 @@ mod tests {
         ApiState {
             config: crate::config::CenterConfig {
                 listen_addr: "127.0.0.1:3100".to_string(),
+                admin_addr: None,
                 store_path: path.clone(),
                 server_cert_path: None,
                 server_key_path: None,
@@ -3086,6 +3089,7 @@ mod tests {
         let state = ApiState {
             config: crate::config::CenterConfig {
                 listen_addr: "127.0.0.1:3100".to_string(),
+                admin_addr: None,
                 store_path: std::env::temp_dir().join(format!("wic-register-revoked-{nanos}.json")),
                 server_cert_path: None,
                 server_key_path: None,

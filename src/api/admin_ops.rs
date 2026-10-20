@@ -2432,6 +2432,7 @@ mod tests {
         ApiState {
             config: CenterConfig {
                 listen_addr: "127.0.0.1:3100".to_string(),
+                admin_addr: None,
                 store_path: std::env::temp_dir().join("unused.json"),
                 server_cert_path: None,
                 server_key_path: None,
@@ -4282,6 +4283,7 @@ mod tests {
         let state = ApiState {
             config: CenterConfig {
                 listen_addr: "127.0.0.1:3100".to_string(),
+                admin_addr: None,
                 store_path: std::env::temp_dir().join(format!("wic-never-{nanos}.json")),
                 server_cert_path: None,
                 server_key_path: None,
@@ -4494,6 +4496,7 @@ mod tests {
         ApiState {
             config: CenterConfig {
                 listen_addr: "127.0.0.1:3100".to_string(),
+                admin_addr: None,
                 store_path: std::env::temp_dir().join("unused.json"),
                 server_cert_path: None,
                 server_key_path: None,
@@ -4811,6 +4814,7 @@ mod tests {
         let state = ApiState {
             config: CenterConfig {
                 listen_addr: "127.0.0.1:3100".to_string(),
+                admin_addr: None,
                 store_path: std::env::temp_dir().join(format!("wic-create-tb-{nanos}.json")),
                 server_cert_path: None,
                 server_key_path: None,

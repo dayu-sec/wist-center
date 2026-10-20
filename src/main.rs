@@ -109,7 +109,55 @@ async fn run_main() -> Result<(), Box<dyn Error + Send + Sync>> {
     };
     let proxy_tls = server_tls.clone();
     let proxy_addr = config.wparse_proxy.listen_addr.clone();
-    let app = wist_center::api::router(config, store, gateway_ca, proxy.clone());
+
+    // 管理面 listener（**内网**）：只有配了 `[server].admin_addr` 才拆。
+    // 与网关面完全隔开：不同端口、不同路由白名单、**不校客户端证书**（浏览器没有网关证书）。
+    // 未配置时保持旧行为（两者共用 `listen_addr`）。
+    let admin_addr = config.admin_addr.clone();
+    if let Some(admin_addr) = admin_addr.clone() {
+        let admin_app = wist_center::api::admin_router(
+            config.clone(),
+            store.clone(),
+            gateway_ca.clone(),
+            proxy.clone(),
+        );
+        match server_tls.clone() {
+            Some((cert_path, key_path)) => {
+                let tls_config = wist_center::infra::load_server_only_config(&cert_path, &key_path)
+                    .map_err(|err| -> Box<dyn Error + Send + Sync> { err.into() })?;
+                let listener = TcpListener::bind(&admin_addr).await?;
+                log::info!("wist-center admin API listening on https://{admin_addr}");
+                tokio::spawn(async move {
+                    if let Err(err) = serve_tls(listener, admin_app, tls_config).await {
+                        log::error!("admin listener stopped: {err}");
+                    }
+                });
+            }
+            None => {
+                let listener = TcpListener::bind(&admin_addr).await?;
+                log::warn!(
+                    "wist-center admin API listening on http://{admin_addr} (server TLS is not configured)"
+                );
+                tokio::spawn(async move {
+                    if let Err(err) = axum::serve(
+                        listener,
+                        admin_app.into_make_service_with_connect_info::<SocketAddr>(),
+                    )
+                    .await
+                    {
+                        log::error!("admin listener stopped: {err}");
+                    }
+                });
+            }
+        }
+    }
+
+    let app = if admin_addr.is_some() {
+        // 拆了面：网关 listener 只挂 `/api/v1/gateway/**` + `/api/v1/version`。
+        wist_center::api::gateway_router(config, store, gateway_ca, proxy.clone())
+    } else {
+        wist_center::api::router(config, store, gateway_ca, proxy.clone())
+    };
 
     // 独立 listener：服务器证书 + **不校客户端证书**（WarpStation 持 Bearer proxy token，
     // 没有、也不应该持有网关 mTLS 客户端证书）。

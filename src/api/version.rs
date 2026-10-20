@@ -47,6 +47,7 @@ mod tests {
         super::super::ApiState {
             config: CenterConfig {
                 listen_addr: "127.0.0.1:3100".to_string(),
+                admin_addr: None,
                 store_path: store_path.clone(),
                 server_cert_path: None,
                 server_key_path: None,

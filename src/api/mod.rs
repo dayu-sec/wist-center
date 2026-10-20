@@ -146,15 +146,105 @@ pub fn router(
     gateway_ca: Arc<crate::infra::gateway_ca::GatewayCa>,
     proxy: Option<Arc<crate::wparse_proxy::WparseProxy>>,
 ) -> Router {
+    router_for(state_of(config, store, gateway_ca, proxy))
+}
+
+/// 构造共享状态（两个监听面各用一份，字段都是 `Arc` / `Clone`）。
+fn state_of(
+    config: CenterConfig,
+    store: Arc<dyn Store>,
+    gateway_ca: Arc<crate::infra::gateway_ca::GatewayCa>,
+    proxy: Option<Arc<crate::wparse_proxy::WparseProxy>>,
+) -> ApiState {
     let artifact_store = crate::infra::build_artifact_store(&config);
-    router_for(ApiState {
+    ApiState {
         config,
         store,
         artifact_store,
         rate_limits: Arc::new(Mutex::new(rate_limit::RateLimitState::default())),
         gateway_ca,
         proxy,
-    })
+    }
+}
+
+/// 监听面：决定一个 listener 只允许哪些路由（**默认拒绝**）。
+///
+/// 公网 listener 只挂网关面，管理面永远不在公网上——即使 admin token 泄露，攻击面也不包含
+/// `/api/v1/admin/**`。新增路由**不会**自动出现在任何一面，必须显式加进 [`ListenerScope::allows`]。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListenerScope {
+    /// 公网：`/api/v1/gateway/**` + `/api/v1/version`。
+    Gateway,
+    /// 内网：`/api/v1/admin/**` + `/api/v1/version`。
+    Admin,
+}
+
+impl ListenerScope {
+    /// 前缀白名单。`/api/v1/version` 两侧都放（页面左下角版本号，未登录也要答）。
+    fn allows(self, path: &str) -> bool {
+        if path == "/api/v1/version" {
+            return true;
+        }
+        match self {
+            ListenerScope::Gateway => {
+                path == "/api/v1/gateway" || path.starts_with("/api/v1/gateway/")
+            }
+            ListenerScope::Admin => path == "/api/v1/admin" || path.starts_with("/api/v1/admin/"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ListenerScope::Gateway => "gateway",
+            ListenerScope::Admin => "admin",
+        }
+    }
+}
+
+/// 公网面：只挂网关路由（mTLS 由调用方的 TLS 配置保证）。
+pub fn gateway_router(
+    config: CenterConfig,
+    store: Arc<dyn Store>,
+    gateway_ca: Arc<crate::infra::gateway_ca::GatewayCa>,
+    proxy: Option<Arc<crate::wparse_proxy::WparseProxy>>,
+) -> Router {
+    scoped_router(
+        state_of(config, store, gateway_ca, proxy),
+        ListenerScope::Gateway,
+    )
+}
+
+/// 内网面：只挂管理路由（浏览器不带客户端证书，用服务器证书 TLS + Bearer admin token）。
+pub fn admin_router(
+    config: CenterConfig,
+    store: Arc<dyn Store>,
+    gateway_ca: Arc<crate::infra::gateway_ca::GatewayCa>,
+    proxy: Option<Arc<crate::wparse_proxy::WparseProxy>>,
+) -> Router {
+    scoped_router(
+        state_of(config, store, gateway_ca, proxy),
+        ListenerScope::Admin,
+    )
+}
+
+/// 在完整路由外面套一层前缀闸：不在本面白名单里的路径一律 404（统一错误信封）。
+fn scoped_router(state: ApiState, scope: ListenerScope) -> Router {
+    router_for(state).layer(from_fn(move |req: Request, next: Next| {
+        scope_guard(scope, req, next)
+    }))
+}
+
+async fn scope_guard(scope: ListenerScope, req: Request, next: Next) -> Response {
+    let path = req.uri().path().to_string();
+    if scope.allows(&path) {
+        next.run(req).await
+    } else {
+        log::warn!(
+            "route not exposed on the {} listener: {path}",
+            scope.as_str()
+        );
+        ApiError::not_found(codes::ROUTE_NOT_FOUND, "route not found").into_response()
+    }
 }
 
 /// 以给定 state 构建路由（测试与运行共用）。
@@ -381,4 +471,86 @@ pub fn router_for(state: ApiState) -> Router {
         .fallback(fallback_not_found)
         .method_not_allowed_fallback(fallback_method_not_allowed)
         .with_state(state)
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::StatusCode;
+    use tower::ServiceExt;
+
+    /// 只练“面”的路由闸门，不构建完整 ApiState（store / CA 与分流无关）。
+    fn probe_router(scope: ListenerScope) -> Router {
+        Router::new()
+            .route("/api/v1/version", get(|| async { "v" }))
+            .route("/api/v1/gateway/status", post(|| async { "gw" }))
+            .route("/api/v1/admin/gateways", get(|| async { "admin" }))
+            .layer(from_fn(move |req: Request, next: Next| {
+                scope_guard(scope, req, next)
+            }))
+    }
+
+    async fn status(scope: ListenerScope, method: Method, path: &str) -> StatusCode {
+        probe_router(scope)
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn gateway_face_exposes_only_gateway_routes() {
+        let gw = ListenerScope::Gateway;
+        assert_eq!(
+            status(gw, Method::POST, "/api/v1/gateway/status").await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(gw, Method::GET, "/api/v1/version").await,
+            StatusCode::OK
+        );
+        // 管理面在公网 listener 上必须 404（即使路径存在）。
+        assert_eq!(
+            status(gw, Method::GET, "/api/v1/admin/gateways").await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_face_exposes_only_admin_routes() {
+        let admin = ListenerScope::Admin;
+        assert_eq!(
+            status(admin, Method::GET, "/api/v1/admin/gateways").await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(admin, Method::GET, "/api/v1/version").await,
+            StatusCode::OK
+        );
+        // 网关面路由不在管理 listener 上（反向隔离，避免管理口被当成网关口用）。
+        assert_eq!(
+            status(admin, Method::POST, "/api/v1/gateway/status").await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn scope_prefix_matching_has_no_false_positives() {
+        // 只有精确前缀或 `/` 分隔的子路径算命中：`gatewayfoo` 不能被 `gateway` 放行。
+        assert!(ListenerScope::Gateway.allows("/api/v1/gateway"));
+        assert!(ListenerScope::Gateway.allows("/api/v1/gateway/status"));
+        assert!(!ListenerScope::Gateway.allows("/api/v1/gatewayfoo"));
+        assert!(!ListenerScope::Gateway.allows("/api/v1/admin/gateways"));
+        assert!(ListenerScope::Admin.allows("/api/v1/admin"));
+        assert!(ListenerScope::Admin.allows("/api/v1/admin/gateways"));
+        assert!(!ListenerScope::Admin.allows("/api/v1/adminx"));
+        assert!(!ListenerScope::Admin.allows("/api/v1/gateway/status"));
+    }
 }
