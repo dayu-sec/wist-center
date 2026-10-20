@@ -548,6 +548,80 @@ mod scope_tests {
         );
     }
 
+    /// 从源码里抽 `.route("<path>"` 的字面量（兼容 `.route(` 后换行）。
+    fn route_literals(source: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = source;
+        while let Some(idx) = rest.find(".route(") {
+            rest = &rest[idx + ".route(".len()..];
+            let Some(start) = rest.find('"') else {
+                continue;
+            };
+            let after = &rest[start + 1..];
+            let Some(end) = after.find('"') else { continue };
+            let path = &after[..end];
+            if path.starts_with("/api/") {
+                out.push(path.to_string());
+            }
+            rest = &after[end + 1..];
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// **回归保障**：`router_for` 里注册的每一条 `/api/...` 路由必须落在某个面的白名单里。
+    ///
+    /// 0.19.0 的事故就是这么漏的：`/api/v1/releases/artifact/...` 两个面都没放行，
+    /// 文件明明在磁盘上，请求永远 404 —— 直到真去下载才发现。
+    /// 这里直接扫源码的 `.route("…")` 字面量：以后新增一条路由却忘了分配面，
+    /// 或者写成既不是 `/api/v1/admin/` 也不是 `/api/v1/gateway/` 的前缀，测试当场失败。
+    #[test]
+    fn every_registered_api_route_is_assigned_to_a_face() {
+        let paths = route_literals(include_str!("mod.rs"));
+        assert!(
+            paths.len() >= 40,
+            "只扫到 {} 条路由，解析逻辑可能失效了",
+            paths.len()
+        );
+
+        let mut unassigned = Vec::new();
+        for path in &paths {
+            if !ListenerScope::Gateway.allows(path) && !ListenerScope::Admin.allows(path) {
+                unassigned.push(path.clone());
+            }
+            // 方向性：管理面路由绝不能落到公网 listener 上。
+            if path.starts_with("/api/v1/admin") {
+                assert!(
+                    !ListenerScope::Gateway.allows(path),
+                    "管理面路由 {path} 不能出现在网关面"
+                );
+            }
+        }
+        assert!(
+            unassigned.is_empty(),
+            "这些路由两个 listener 都不放行（会被静默 404）：{unassigned:#?}\n\
+             要么把它归到 /api/v1/admin 或 /api/v1/gateway 前缀，\
+             要么明确加进 ListenerScope 的白名单"
+        );
+    }
+
+    /// 白名单里的每个“额外前缀”都必须有真实路由 —— 否则就是一个永远等不到请求的门。
+    #[test]
+    fn scope_allowlist_has_no_dead_entries() {
+        let paths = route_literals(include_str!("mod.rs"));
+        for prefix in [
+            "/api/v1/gateway/",
+            "/api/v1/admin/",
+            "/api/v1/releases/artifact/",
+        ] {
+            assert!(
+                paths.iter().any(|p| p.starts_with(prefix)),
+                "白名单前缀 {prefix} 没有任何路由"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn admin_face_exposes_only_admin_routes() {
         let admin = ListenerScope::Admin;
