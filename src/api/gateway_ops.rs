@@ -33,11 +33,6 @@ use super::{
 const GATEWAY_AUTH_SCOPE: &str = "gateway";
 /// 注册自携带 token 鉴权，无网关身份可查，独立限流桶防 token 暴力枚举。
 const GATEWAY_REGISTER_SCOPE: &str = "gateway-register";
-/// gwlinkd 自身的组件名（与 `wist-gwlinkd::upgrade::SELF_COMPONENT` 同值）。
-///
-/// 升级计划里出现它时中心会带上 `artifact_sha256` —— 自更新在进程内直接覆盖自己的二进制，
-/// 需要和地址**同源**的摘要做校验；其余 ① 升级组件仍保持「不带摘要」的既有行为。
-const GWLINKD_COMPONENT: &str = "wist-gwlinkd";
 
 /// 允许 Gateway Web 以 Authorization Header 直接调用初始化端点。
 /// 该端点不使用 Cookie，因此使用通配来源不会扩大用户会话权限；Token 仍只在 Header 中传输。
@@ -390,24 +385,18 @@ async fn upgrade_plan_for(
         None => None,
     };
     let artifact_url = resolved.as_ref().map(|record| record.artifact_url.clone());
-    // 摘要：②「Agent 包下发」必须带（网关逐平台校验）；① 升级默认不带（gops / tool-copy
-    // 各有既有校验），但 **gwlinkd 自更新例外**：它在进程内直接覆盖自己，
-    // 必须拿到与地址同源的摘要做校验。
-    let self_update = target
+    // 摘要：只要发布记录里有，就**一律**带给网关 —— 校验方都是用得上就用：
+    //   · ② 包下发（agent / 知识库）：网关逐平台校验；
+    //   · `wist-gwlinkd` 自更新：进程内直接覆盖自己；
+    //   · **宿主工具（`install = "tool-copy"`，如 galaxy-ops / galaxy-flow）**：就地把二进制
+    //     覆盖掉，而制品名不是内容寻址（`pkg-<hex16>`）→ 不显式给摘要就**无内容校验**，
+    //     只剩 mTLS（而 gops 又是后续升级的执行者，属于自举信任）；
+    //   · 其余走 gops 的组件：网关先取到本地并按同一摘要校验，用不上就忽略（不损失什么）。
+    // 空串当没有（否则网关侧 `parse_digest` 会把空串报成「形态不对」）。
+    let artifact_sha256 = resolved
         .as_ref()
-        .is_some_and(|(component, _)| component == GWLINKD_COMPONENT);
-    let artifact_sha256 = if plan.action == ACTION_PUSH_AGENT_PACKAGE
-        || plan.action == ACTION_PUSH_KNOWLEDGE_PACKAGE
-        || self_update
-    {
-        resolved
-            .as_ref()
-            .and_then(|record| record.package_sha256.clone())
-            // 老记录可能没有摘要：**空串当没有**（否则网关侧 `parse_digest` 会把空串报成「形态不对」）。
-            .filter(|sha| !sha.trim().is_empty())
-    } else {
-        None
-    };
+        .and_then(|record| record.package_sha256.clone())
+        .filter(|sha| !sha.trim().is_empty());
     // ②「Agent 包下发」：带该版本的**全部平台**制品 —— 网关替 **Agent 机队**托管各平台的包
     // （机队平台可能 ≠ 网关自己主机的平台）；① 升级不带（网关本机一个平台，用上面的单值 artifact_url）。
     let artifacts = if plan.action == ACTION_PUSH_AGENT_PACKAGE {
@@ -2062,7 +2051,7 @@ mod tests {
     /// 发布 ②：`push-agent-package` 的下发目标带 **action** 与 **摘要**（`artifact_sha256`）；
     /// ① `upgrade` 只带地址、**不**带摘要（不改其既有取件/校验行为）。
     #[tokio::test]
-    async fn push_agent_package_plan_carries_action_and_digest_but_upgrade_does_not() {
+    async fn push_agent_package_plan_carries_action_and_digest_and_upgrade_carries_digest_too() {
         let digest = "3f9a1c0d5e7b2a6489f0c1d2e3a4b5c6d7e8f9012345678abcdef0123456789";
 
         // ②：agentd 包**多平台**发布（各带摘要）→ 计划 action = push-agent-package，带**全平台**清单。
@@ -2125,8 +2114,10 @@ mod tests {
             plan.artifacts
         );
 
-        // ①：同一条发布也给得出摘要，但 `upgrade` 计划**不**回带摘要（地址照旧）。
-        let state = provision_state("link-tok-upgrade-no-digest");
+        // ①：同一条发布也给得出摘要 —— `upgrade` 计划**也**回带摘要（地址照旧）。
+        // 为什么现在要带：① 里也有 `install = "tool-copy"` 的组件（galaxy-ops / galaxy-flow
+        // 是宿主二进制），就地覆盖时制品名不是内容寻址 → 不给摘要就没有内容校验。
+        let state = provision_state("link-tok-upgrade-digest");
         let stack_url = "https://center.example/api/v1/releases/artifact/wist-gateway-stack/0.1.28/wist-gateway-stack-0.1.28.tar.gz";
         state
             .store
@@ -2152,7 +2143,11 @@ mod tests {
             .expect("plan");
         assert_eq!(plan.action.as_deref(), Some("upgrade"));
         assert_eq!(plan.artifact_url.as_deref(), Some(stack_url));
-        assert_eq!(plan.artifact_sha256, None, "① upgrade 不回带摘要");
+        assert_eq!(
+            plan.artifact_sha256.as_deref(),
+            Some(digest),
+            "① upgrade 也要带摘要（与地址同源）"
+        );
         assert!(
             plan.artifacts.is_empty(),
             "① upgrade 不带多平台清单：网关本机一个平台，用单值 artifact_url"
@@ -2290,6 +2285,93 @@ mod tests {
         assert!(
             plan.artifacts.is_empty(),
             "① 升级不带多平台清单（网关本机一个平台，用单值 artifact_url）"
+        );
+    }
+
+    /// 多平台组件的**摘要必须与被选中的那条制品同源**（不能把 mac 制品的摘要配给 linux 地址）。
+    #[tokio::test]
+    async fn a_multi_platform_plan_pairs_the_digest_with_the_chosen_artifact() {
+        let state = provision_state("link-tok-platform-digest");
+        let mac_digest = "1111111111111111111111111111111111111111111111111111111111111111";
+        let linux_digest = "2222222222222222222222222222222222222222222222222222222222222222";
+        let mac_url = "https://center.example/artifacts/galaxy-ops/2.10.0/mac.tar.gz";
+        let linux_url = "https://center.example/artifacts/galaxy-ops/2.10.0/linux.tar.gz";
+        for (url, digest, platform) in [
+            (mac_url, mac_digest, "aarch64-apple-darwin"),
+            (linux_url, linux_digest, "x86_64-unknown-linux-musl"),
+        ] {
+            state
+                .store
+                .publish_release("galaxy-ops", "2.10.0", url, Some(digest), Some(platform))
+                .await
+                .expect("publish release");
+        }
+        seed_rolling_plan(
+            &state,
+            "upgrade",
+            r#"{"targets":[{"component":"galaxy-ops","target_version":"2.10.0"}]}"#,
+            "gw-p",
+        )
+        .await;
+
+        for (platform, url, digest) in [
+            ("aarch64-apple-darwin", mac_url, mac_digest),
+            ("x86_64-unknown-linux-musl", linux_url, linux_digest),
+        ] {
+            let plan = super::upgrade_plan_for(&state, "gw-p", Some(platform))
+                .await
+                .expect("plan");
+            assert_eq!(
+                plan.artifact_url.as_deref(),
+                Some(url),
+                "platform={platform}"
+            );
+            assert_eq!(
+                plan.artifact_sha256.as_deref(),
+                Some(digest),
+                "摘要必须跟着被选中的制品走（platform={platform}）"
+            );
+        }
+    }
+
+    /// ① 里的**宿主工具**（`install = "tool-copy"`，如 galaxy-ops）也带摘要。
+    ///
+    /// 那一路是 gwlinkd 进程内直接把宿主二进制覆盖掉（不回滚、不过 gops），而制品名不是
+    /// 内容寻址（`pkg-<hex16>`）—— 不显式给摘要就**没有任何内容校验**，只剩 mTLS。
+    #[tokio::test]
+    async fn a_tool_component_upgrade_plan_carries_its_digest() {
+        let state = provision_state("link-tok-tool-digest");
+        let url = "https://center.example/artifacts/galaxy-ops/2.10.0/galaxy-ops-2.10.0-aarch64-apple-darwin.tar.gz";
+        let digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        state
+            .store
+            .publish_release(
+                "galaxy-ops",
+                "2.10.0",
+                url,
+                Some(digest),
+                Some("aarch64-apple-darwin"),
+            )
+            .await
+            .expect("publish galaxy-ops release");
+        seed_rolling_plan(
+            &state,
+            "upgrade",
+            r#"{"targets":[{"component":"galaxy-ops","target_version":"2.10.0"}]}"#,
+            "gw-p",
+        )
+        .await;
+
+        let plan = super::upgrade_plan_for(&state, "gw-p", Some("aarch64-apple-darwin"))
+            .await
+            .expect("plan");
+        assert_eq!(plan.action.as_deref(), Some("upgrade"));
+        assert_eq!(plan.component.as_deref(), Some("galaxy-ops"));
+        assert_eq!(plan.artifact_url.as_deref(), Some(url));
+        assert_eq!(
+            plan.artifact_sha256.as_deref(),
+            Some(digest),
+            "宿主工具就地覆盖宿主二进制：必须带摘要"
         );
     }
 
