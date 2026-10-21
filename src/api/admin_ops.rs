@@ -2373,6 +2373,7 @@ pub async fn admin_dispatch_agent_fleet_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::{
@@ -2476,11 +2477,15 @@ mod tests {
 
     /// 建 N 个**已登记**网关（`gw-001..gw-00N`）的 store —— 建计划的目标存在性校验要用。
     fn gateway_store(count: usize) -> FileStore {
+        // 文件名要**进程内唯一**：只用纳秒会在并行测试里撞同一份 store
+        // （撞上就会把别的用例造的网关读进来，报“默认视图多出 gw-003”这种假失败）。
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("wic-rollout-test-{nanos}.json"));
+        let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!("wic-rollout-test-{nanos}-{seq}.json"));
         let store = FileStore::new(&path);
         let seeds: Vec<GatewayCredentialSeed> = (1..=count)
             .map(|i| GatewayCredentialSeed {
