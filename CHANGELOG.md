@@ -5,6 +5,22 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.19.5-alpha] - 2026-10-21
+
+### 新增
+
+- **网关状态带上 gwlinkd 自身版本**（契约：`wist-control 0.17.0`）：以前中心只能看到「网关版本 /
+  gops / gx」，看不到**宿主侧常驻** gwlinkd 的版本。现在 `ReportGatewayStatus.gwlinkd_version`
+  随状态上报落库（文件库 + PostgreSQL），并在网关详情与 `GatewayRuntimeStatus` 接口里与前者并列；
+  同时暴露 Prometheus `gateway_gwlinkd_info{gwlinkd_version}` —— 自更新后能直接筛出还跑旧
+  gwlinkd 的网关。
+
+### 兼容
+
+- 依赖 `wist-control 0.17`；字段可选：老 gwlinkd 不带该键 → 落库 NULL、页面显示「—」。
+- 新列在 `docker/initdb/01_schema.sql`（幂等 `ALTER`）：`PgStore::connect` 每次启动执行整份
+  schema，正常会在重启时自动补列；生产库若无 DDL 权限，需运维手动补跑该文件。
+
 ## [0.19.4-alpha] - 2026-10-20
 
 ### 新增
