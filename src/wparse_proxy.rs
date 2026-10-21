@@ -35,6 +35,17 @@ const RELOAD_PATH: &str = "/admin/v1/reloads/model";
 const STATUS_WAIT: Duration = Duration::from_secs(5);
 const RELOAD_WAIT: Duration = Duration::from_secs(15);
 const LEASE_SECONDS: i64 = 30;
+/// 体检命令的租约：必须**大于** gwlinkd 侧允许的最大控制命令超时（300s），
+/// 否则中心会把还在跑的命令判成过期 → 重派一条，同一台机器上跑两份。
+///
+/// 所有**控制类**命令（`diagnose` / `restart-*`）都用这个租约；`proxy` 仍用 [`LEASE_SECONDS`]。
+const CONTROL_LEASE_SECONDS: i64 = 360;
+const _: () = assert!(
+    CONTROL_LEASE_SECONDS > 300,
+    "控制命令租约必须大于 gwlinkd 的最大执行超时（300s）"
+);
+/// 单条回执 body 的上限（体检报告 ~5–50 KB，超过 1 MiB 视为异常输入）。
+const MAX_RESULT_BODY_BYTES: usize = 1024 * 1024;
 const MAX_ATTEMPTS: i32 = 2;
 const MAX_BODY_BYTES: usize = 4096;
 /// 每个 gateway 的 proxy 请求上限（固定窗口 1 分钟）。
@@ -43,6 +54,15 @@ const RATE_LIMIT_PER_MINUTE: u32 = 60;
 const PENDING_TTL_SECONDS: i64 = 60;
 /// 每 gateway 的 pending + leased 上限（设计 §6.5）。
 const MAX_PENDING_PER_GATEWAY: i64 = 32;
+
+/// 命令类型：wparse 管理面转发（缺省）。
+pub const KIND_PROXY: &str = "proxy";
+/// 命令类型：本机体检（gwlinkd 跑 `gops run diagnose --json`）。
+pub const KIND_DIAGNOSE: &str = "diagnose";
+/// 命令类型：重启网关容器（`gops run stop` + `run start`）。
+pub const KIND_RESTART_GATEWAY: &str = "restart-gateway";
+/// 命令类型：重启 gwlinkd 自己（服务管理器拉起，先回执后重启）。
+pub const KIND_RESTART_GWLINKD: &str = "restart-gwlinkd";
 
 /// 入队失败：队列满（429）与存储错误（500）必须区分。
 #[derive(Debug)]
@@ -80,10 +100,53 @@ pub struct CommandResult {
     pub log_excerpt: Option<String>,
 }
 
+/// 最近一次体检（`kind=diagnose`）的状态与报告。
+///
+/// `report` 就是 gwlinkd 回传的 `gops run diagnose --json` 原文（已解析）；
+/// `state` 是队列状态（pending / leased / done / failed / expired），页面据此区分“没跑”与“跑了有问题”。
+#[derive(Debug, Clone)]
+pub struct DiagnoseRecord {
+    pub command_id: String,
+    pub state: String,
+    pub response_status: Option<i32>,
+    pub report: Option<serde_json::Value>,
+    pub error: Option<String>,
+    pub requested_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// 回执 body 的上限保护：超过 1 MiB 就不存原文（避免异常输入把库撑坏）。
+///
+/// 不截断——半个 JSON 比没有更误导；直接换成可读的标记对象。
+pub(crate) fn bounded_result_body(raw: String) -> String {
+    if raw.len() <= MAX_RESULT_BODY_BYTES {
+        return raw;
+    }
+    serde_json::json!({
+        "truncated": true,
+        "reason": "body too large",
+        "bytes": raw.len(),
+    })
+    .to_string()
+}
+
+/// 一条控制命令的当前状态（页面轮询重启结果用）。
+#[derive(Debug, Clone)]
+pub struct ControlStatus {
+    pub command_id: String,
+    pub kind: String,
+    pub state: String,
+    pub response_status: Option<i32>,
+    pub error: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// 一条已租出的命令（gwlinkd 拉取后执行）。
 #[derive(Debug, Clone)]
 pub struct LeasedCommand {
     pub command_id: String,
+    /// `proxy`（wparse 管理面转发）/ `diagnose`（本机体检）。
+    pub kind: String,
     pub method: String,
     pub path: String,
     pub body: Option<String>,
@@ -253,23 +316,28 @@ impl WparseProxy {
         .map_err(|err| format!("expire stale leases: {err}"))?;
 
         let row = sqlx::query(
-            "UPDATE gateway_commands
+            "WITH picked AS (
+                 SELECT command_id, kind
+                   FROM gateway_commands
+                  WHERE gateway_id = $1 AND state = 'pending'
+                  ORDER BY created_at
+                  LIMIT 1
+                  FOR UPDATE SKIP LOCKED
+             )
+             UPDATE gateway_commands c
                 SET state = 'leased',
                     attempts = attempts + 1,
-                    lease_expires_at = NOW() + make_interval(secs => $2),
+                    lease_expires_at = NOW() + make_interval(
+                        secs => CASE p.kind WHEN 'proxy' THEN $2 ELSE $3 END
+                    ),
                     updated_at = NOW()
-              WHERE command_id = (
-                    SELECT command_id
-                      FROM gateway_commands
-                     WHERE gateway_id = $1 AND state = 'pending'
-                     ORDER BY created_at
-                     LIMIT 1
-                     FOR UPDATE SKIP LOCKED
-              )
-          RETURNING command_id, method, path, body, lease_expires_at",
+               FROM picked p
+              WHERE c.command_id = p.command_id
+          RETURNING c.command_id, c.kind, c.method, c.path, c.body, c.lease_expires_at",
         )
         .bind(gateway_id)
         .bind(LEASE_SECONDS)
+        .bind(CONTROL_LEASE_SECONDS)
         .fetch_optional(&self.pool)
         .await
         .map_err(|err| format!("lease command: {err}"))?;
@@ -278,14 +346,16 @@ impl WparseProxy {
             return Ok(None);
         };
         log::info!(
-            "event=WparseCommandLeased gateway_id={} command_id={} method={} path={}",
+            "event=WparseCommandLeased gateway_id={} command_id={} kind={} method={} path={}",
             gateway_id,
             row.get::<String, _>("command_id"),
+            row.get::<String, _>("kind"),
             row.get::<String, _>("method"),
             row.get::<String, _>("path"),
         );
         Ok(Some(LeasedCommand {
             command_id: row.get("command_id"),
+            kind: row.get("kind"),
             method: row.get("method"),
             path: row.get("path"),
             body: row.get("body"),
@@ -394,6 +464,137 @@ impl WparseProxy {
             Some(id) => Ok(id),
             None => Err(EnqueueError::QueueFull),
         }
+    }
+
+    /// 入队一条**控制类**命令（体检）。
+    ///
+    /// 幂等：同 gateway + 同 kind 已有 pending/leased 的命令时直接复用（连点两次不会跑两次）。
+    /// 控制类命令不带 `method` / `path` / `body` —— 执行细则在 gwlinkd 侧（配置驱动）。
+    pub async fn enqueue_control(
+        &self,
+        gateway_id: &str,
+        kind: &str,
+    ) -> Result<(String, bool), EnqueueError> {
+        // 同一 (gateway, kind) 的“查重 + 插入”必须原子：两个并发点击不能各插一条。
+        // 用事务级 advisory lock（锁随事务结束自动释放，不需要维护额外表）。
+        let lock_key = format!("gateway_commands:{gateway_id}:{kind}");
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|err| EnqueueError::Store(format!("begin control enqueue: {err}")))?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(&lock_key)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| EnqueueError::Store(format!("lock control enqueue: {err}")))?;
+
+        let existing: Option<String> = sqlx::query_scalar(
+            "SELECT command_id
+               FROM gateway_commands
+              WHERE gateway_id = $1 AND kind = $2 AND state IN ('pending', 'leased')
+              ORDER BY created_at
+              LIMIT 1",
+        )
+        .bind(gateway_id)
+        .bind(kind)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|err| EnqueueError::Store(format!("find pending control command: {err}")))?;
+        if let Some(command_id) = existing {
+            tx.commit()
+                .await
+                .map_err(|err| EnqueueError::Store(format!("commit control enqueue: {err}")))?;
+            return Ok((command_id, true));
+        }
+
+        let command_id = new_secret_token("cmd").map_err(EnqueueError::Store)?;
+        // 单语句完成「计数 + 插入」：pending/leased 超上限就不插入。
+        let inserted: Option<String> = sqlx::query_scalar(
+            "INSERT INTO gateway_commands
+                 (command_id, gateway_id, kind, method, path, body, state, created_at, updated_at)
+             SELECT $1, $2, $3, '', '', NULL, 'pending', NOW(), NOW()
+              WHERE (SELECT COUNT(*) FROM gateway_commands
+                      WHERE gateway_id = $2 AND state IN ('pending', 'leased')) < $4
+             RETURNING command_id",
+        )
+        .bind(&command_id)
+        .bind(gateway_id)
+        .bind(kind)
+        .bind(MAX_PENDING_PER_GATEWAY)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|err| EnqueueError::Store(format!("enqueue control command: {err}")))?;
+        tx.commit()
+            .await
+            .map_err(|err| EnqueueError::Store(format!("commit control enqueue: {err}")))?;
+        match inserted {
+            Some(id) => Ok((id, false)),
+            None => Err(EnqueueError::QueueFull),
+        }
+    }
+
+    /// 最近一次体检记录（页面展示用）：不管成功/失败/在飞，取最新一条。
+    pub async fn latest_diagnose(&self, gateway_id: &str) -> ProxyResult<Option<DiagnoseRecord>> {
+        let row = sqlx::query(
+            "SELECT command_id, state, response_status, response_body, error,
+                    created_at, updated_at
+               FROM gateway_commands
+              WHERE gateway_id = $1 AND kind = $2
+              ORDER BY created_at DESC, command_id DESC
+              LIMIT 1",
+        )
+        .bind(gateway_id)
+        .bind(KIND_DIAGNOSE)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| format!("load latest diagnose: {err}"))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let body: Option<String> = row.get("response_body");
+        Ok(Some(DiagnoseRecord {
+            command_id: row.get("command_id"),
+            state: row.get("state"),
+            response_status: row.get("response_status"),
+            report: body
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok()),
+            error: row.get("error"),
+            requested_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
+        }))
+    }
+
+    /// 控制类命令的当前状态（管理面展示用；**归属校验**：不是该网关的命令一律 `None`）。
+    pub async fn control_status(
+        &self,
+        gateway_id: &str,
+        command_id: &str,
+    ) -> ProxyResult<Option<ControlStatus>> {
+        let row = sqlx::query(
+            "SELECT gateway_id, command_id, kind, state, response_status, error, updated_at
+               FROM gateway_commands
+              WHERE command_id = $1",
+        )
+        .bind(command_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| format!("load command status: {err}"))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        if row.get::<String, _>("gateway_id") != gateway_id {
+            return Ok(None);
+        }
+        Ok(Some(ControlStatus {
+            command_id: row.get("command_id"),
+            kind: row.get("kind"),
+            state: row.get("state"),
+            response_status: row.get("response_status"),
+            error: row.get("error"),
+            updated_at: row.get("updated_at"),
+        }))
     }
 
     /// 幂等：同一 gateway + 同一 `(version, group)` 的 reload 复用 pending/leased 命令。
@@ -625,7 +826,7 @@ fn upstream_response(result: CommandResult) -> Response {
     response
 }
 
-fn enqueue_error(err: EnqueueError) -> Response {
+pub(crate) fn enqueue_error(err: EnqueueError) -> Response {
     match err {
         EnqueueError::QueueFull => proxy_error(
             StatusCode::TOO_MANY_REQUESTS,
@@ -690,6 +891,33 @@ CREATE INDEX IF NOT EXISTS idx_gateway_wparse_tokens_hash
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_carries_the_command_kind_column() {
+        // schema 是 `include_str!` 编进二进制的（启动时 apply），所以它是**运行时契约**——
+        // 代码里引用了 kind，schema 里却漏了，只会在部署后才炸。这里提前卡住。
+        let schema = include_str!("../docker/initdb/01_schema.sql");
+        assert!(
+            schema.contains("kind TEXT NOT NULL DEFAULT 'proxy'"),
+            "gateway_commands 缺 kind 列（或默认值变了）"
+        );
+        assert!(
+            schema.contains("ADD COLUMN IF NOT EXISTS kind"),
+            "老库补列语句缺失：升级后会因缺列而报错"
+        );
+    }
+
+    #[test]
+    fn result_body_is_only_replaced_when_oversized() {
+        let small = "{\"summary\":{\"fail\":1}}".to_string();
+        assert_eq!(bounded_result_body(small.clone()), small);
+
+        let huge = "x".repeat(MAX_RESULT_BODY_BYTES + 1);
+        let out = bounded_result_body(huge);
+        let value: serde_json::Value = serde_json::from_str(&out).expect("marker 必须是合法 JSON");
+        assert_eq!(value["truncated"], serde_json::json!(true));
+        assert_eq!(value["bytes"], serde_json::json!(MAX_RESULT_BODY_BYTES + 1));
+    }
 
     #[tokio::test]
     async fn failed_upstream_response_carries_the_log_pointer_and_excerpt() {

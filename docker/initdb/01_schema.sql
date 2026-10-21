@@ -130,6 +130,8 @@ CREATE TABLE IF NOT EXISTS upgrade_plans (
 CREATE TABLE IF NOT EXISTS gateway_commands (
   command_id TEXT PRIMARY KEY,
   gateway_id TEXT NOT NULL,
+  -- 命令类型：`proxy`（wparse 管理面转发，缺省）/ `diagnose`（本机体检）。
+  kind TEXT NOT NULL DEFAULT 'proxy',
   method TEXT NOT NULL,
   path TEXT NOT NULL,
   body TEXT,
@@ -153,6 +155,8 @@ CREATE INDEX IF NOT EXISTS idx_gateway_commands_pending
 ALTER TABLE gateway_commands ADD COLUMN IF NOT EXISTS task_id TEXT;
 ALTER TABLE gateway_commands ADD COLUMN IF NOT EXISTS log_dir TEXT;
 ALTER TABLE gateway_commands ADD COLUMN IF NOT EXISTS log_excerpt TEXT;
+-- 老库补列（0.19.6 新增）：控制类命令 kind（`proxy` / `diagnose`）。
+ALTER TABLE gateway_commands ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'proxy';
 
 -- 每网关的 wparse-proxy Bearer token（只存 sha256；明文只发一次）。
 CREATE TABLE IF NOT EXISTS gateway_wparse_tokens (

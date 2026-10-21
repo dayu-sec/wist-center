@@ -72,6 +72,7 @@ use gateway_ops::{
     submit_gateway_status, verify_gateway_credential,
 };
 use wparse_proxy_api::{
+    admin_command_status, admin_latest_diagnose, admin_restart_gateway, admin_run_diagnose,
     issue_proxy_token, poll_command, report_command_result, revoke_proxy_token,
 };
 
@@ -388,6 +389,20 @@ pub fn router_for(state: ApiState) -> Router {
         .route(
             "/api/v1/gateway/commands/{command_id}/result",
             post(report_command_result),
+        )
+        // 管理面：触发一次体检 / 取最近一次报告（kind=diagnose 走同一条命令队列）。
+        .route(
+            "/api/v1/admin/gateways/{gateway_id}/diagnose",
+            post(admin_run_diagnose).get(admin_latest_diagnose),
+        )
+        // 管理面：下发重启指令 / 查控制命令状态。
+        .route(
+            "/api/v1/admin/gateways/{gateway_id}/restart",
+            post(admin_restart_gateway),
+        )
+        .route(
+            "/api/v1/admin/gateways/{gateway_id}/commands/{command_id}",
+            get(admin_command_status),
         )
         // 管理面：网关列表聚合（AdminViewGatewayList，GET /api/v1/admin/gateways）
         .route("/api/v1/admin/gateways", get(admin_view_gateway_list))

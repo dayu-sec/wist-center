@@ -58,6 +58,28 @@ fn proxy_unavailable() -> Response {
     .into_response()
 }
 
+/// 管理面公共前置：网关必须存在。
+///
+/// 返回 `Some(response)` = 直接回给调用方（404/500）；`None` = 前置通过。
+/// 用 `Option` 而不是 `Result<(), Response>`：后者会让 clippy 报 `result_large_err`。
+async fn ensure_gateway_exists(state: &ApiState, gateway_id: &str) -> Option<Response> {
+    match state.store.get_gateway(gateway_id).await {
+        Ok(Some(_)) => None,
+        Ok(None) => {
+            Some(ApiError::not_found(codes::GATEWAY_NOT_FOUND, "gateway not found").into_response())
+        }
+        Err(err) => Some(
+            ApiError::internal_with(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                codes::GATEWAY_STORE_UNAVAILABLE,
+                "failed to load gateway",
+                err.display_chain(),
+            )
+            .into_response(),
+        ),
+    }
+}
+
 /// 网关轮询：租一条 pending 命令。没有命令 → `204 No Content`。
 pub async fn poll_command(
     State(state): State<ApiState>,
@@ -91,6 +113,7 @@ pub async fn poll_command(
                 StatusCode::OK,
                 Json(json!({
                     "command_id": command.command_id,
+                    "kind": command.kind,
                     "method": command.method,
                     "path": command.path,
                     "body": body,
@@ -152,7 +175,7 @@ pub async fn report_command_result(
 
     let result = CommandResult {
         status_code: input.status_code,
-        body: input.body.unwrap_or_default(),
+        body: crate::wparse_proxy::bounded_result_body(input.body.unwrap_or_default()),
         error: input.error,
         task_id: input.task_id,
         log_dir: input.log_dir,
@@ -175,6 +198,213 @@ pub async fn report_command_result(
     }
 }
 
+/// 管理面：让某网关跑一次体检（`gops run diagnose --json`）。
+///
+/// 走同一条命令队列：gwlinkd 短轮询取走、在本机执行、把报告作为 body 回执。
+/// 返回 202 + `command_id`；页面用 `GET .../diagnose` 取最近一次报告。
+/// 幂等：该网关已有在飞的体检命令时直接复用，不会重复跑。
+pub async fn admin_run_diagnose(
+    State(state): State<ApiState>,
+    client: PeerConnectInfo,
+    headers: HeaderMap,
+    Path(gateway_id): Path<String>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = super::admin_auth::require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    if let Some(response) = ensure_gateway_exists(&state, &gateway_id).await {
+        return response;
+    }
+    let Some(proxy) = state.proxy.as_ref() else {
+        return proxy_unavailable();
+    };
+    match proxy
+        .enqueue_control(&gateway_id, crate::wparse_proxy::KIND_DIAGNOSE)
+        .await
+    {
+        Ok((command_id, reused)) => {
+            log::info!(
+                "event=GatewayDiagnoseEnqueued gateway_id={} command_id={} reused={}",
+                gateway_id,
+                command_id,
+                reused
+            );
+            (
+                StatusCode::ACCEPTED,
+                Json(json!({
+                    "gateway_id": gateway_id,
+                    "command_id": command_id,
+                    "kind": "diagnose",
+                    "reused": reused,
+                    "state": "pending",
+                })),
+            )
+                .into_response()
+        }
+        Err(err) => crate::wparse_proxy::enqueue_error(err).into_response(),
+    }
+}
+
+/// 管理面：最近一次体检（含报告原文）。
+///
+/// `report` 是 gwlinkd 回传的 `gops run diagnose --json`（已解析）；
+/// `state` 是队列状态，区分“没跑”（pending/leased）、“跑了”（done）与“执行失败”（failed/expired）。
+pub async fn admin_latest_diagnose(
+    State(state): State<ApiState>,
+    client: PeerConnectInfo,
+    headers: HeaderMap,
+    Path(gateway_id): Path<String>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = super::admin_auth::require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    let Some(proxy) = state.proxy.as_ref() else {
+        return proxy_unavailable();
+    };
+    match proxy.latest_diagnose(&gateway_id).await {
+        Ok(Some(record)) => Json(diagnose_record_json(&gateway_id, &record)).into_response(),
+        Ok(None) => {
+            ApiError::not_found(codes::COMMAND_NOT_FOUND, "no diagnose report").into_response()
+        }
+        Err(err) => ApiError::internal_with(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            codes::COMMAND_STORE_UNAVAILABLE,
+            "failed to load diagnose report",
+            err,
+        )
+        .into_response(),
+    }
+}
+
+/// 体检记录的对外形状（纯函数：便于单测，不碰 DB）。
+fn diagnose_record_json(
+    gateway_id: &str,
+    record: &crate::wparse_proxy::DiagnoseRecord,
+) -> serde_json::Value {
+    json!({
+        "gateway_id": gateway_id,
+        "command_id": record.command_id,
+        "state": record.state,
+        "response_status": record.response_status,
+        "report": record.report,
+        "error": record.error,
+        "requested_at": record.requested_at.to_rfc3339(),
+        "updated_at": record.updated_at.to_rfc3339(),
+    })
+}
+
+/// 管理面：下发重启指令（`gateway` 容器 / `gwlinkd` 宿主常驻）。
+///
+/// 走同一条命令队列：gwlinkd 用 mTLS 短轮询取走并执行，结果写回 `gateway_commands`。
+/// **不在这里等结果**（重启会断掉执行者本身）：返回 202 + `command_id`，页面轮询
+/// `GET .../commands/{command_id}` 看状态。
+#[derive(Debug, Deserialize)]
+pub struct RestartRequest {
+    /// `gateway` | `gwlinkd`
+    pub target: String,
+}
+
+/// `target` → 命令 kind（纯函数，便于单测；大小写不敏感）。
+fn restart_kind_for(target: &str) -> Option<&'static str> {
+    match target.trim().to_ascii_lowercase().as_str() {
+        "gateway" => Some(crate::wparse_proxy::KIND_RESTART_GATEWAY),
+        "gwlinkd" => Some(crate::wparse_proxy::KIND_RESTART_GWLINKD),
+        _ => None,
+    }
+}
+
+pub async fn admin_restart_gateway(
+    State(state): State<ApiState>,
+    client: PeerConnectInfo,
+    headers: HeaderMap,
+    Path(gateway_id): Path<String>,
+    ApiJson(input): ApiJson<RestartRequest>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = super::admin_auth::require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    let Some(kind) = restart_kind_for(&input.target) else {
+        return ApiError::bad_request(
+            codes::INVALID_REQUEST_BODY,
+            format!(
+                "unknown target `{}` (expected `gateway` or `gwlinkd`)",
+                input.target
+            ),
+        )
+        .into_response();
+    };
+    if let Some(response) = ensure_gateway_exists(&state, &gateway_id).await {
+        return response;
+    }
+    let Some(proxy) = state.proxy.as_ref() else {
+        return proxy_unavailable();
+    };
+    match proxy.enqueue_control(&gateway_id, kind).await {
+        Ok((command_id, reused)) => {
+            log::info!(
+                "event=GatewayRestartEnqueued gateway_id={} kind={} command_id={} reused={}",
+                gateway_id,
+                kind,
+                command_id,
+                reused
+            );
+            (
+                StatusCode::ACCEPTED,
+                Json(json!({
+                    "gateway_id": gateway_id,
+                    "command_id": command_id,
+                    "kind": kind,
+                    "reused": reused,
+                    "state": "pending",
+                })),
+            )
+                .into_response()
+        }
+        Err(err) => crate::wparse_proxy::enqueue_error(err).into_response(),
+    }
+}
+
+/// 管理面：查一条控制命令的状态（页面轮询重启结果用）。
+pub async fn admin_command_status(
+    State(state): State<ApiState>,
+    client: PeerConnectInfo,
+    headers: HeaderMap,
+    Path((gateway_id, command_id)): Path<(String, String)>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = super::admin_auth::require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    let Some(proxy) = state.proxy.as_ref() else {
+        return proxy_unavailable();
+    };
+    match proxy.control_status(&gateway_id, &command_id).await {
+        Ok(Some(status)) => Json(json!({
+            "gateway_id": gateway_id,
+            "command_id": status.command_id,
+            "kind": status.kind,
+            "state": status.state,
+            "response_status": status.response_status,
+            "error": status.error,
+            "updated_at": status.updated_at.to_rfc3339(),
+        }))
+        .into_response(),
+        Ok(None) => {
+            ApiError::not_found(codes::COMMAND_NOT_FOUND, "command not found").into_response()
+        }
+        Err(err) => ApiError::internal_with(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            codes::COMMAND_STORE_UNAVAILABLE,
+            "failed to load command status",
+            err,
+        )
+        .into_response(),
+    }
+}
+
 /// 管理面：签发 / 轮换某网关的 proxy token（明文只返回一次）。
 pub async fn issue_proxy_token(
     State(state): State<ApiState>,
@@ -186,21 +416,8 @@ pub async fn issue_proxy_token(
     if let Err(response) = super::admin_auth::require_admin_bearer(&state, &headers, &client_key) {
         return response;
     }
-    match state.store.get_gateway(&gateway_id).await {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            return ApiError::not_found(codes::GATEWAY_NOT_FOUND, "gateway not found")
-                .into_response();
-        }
-        Err(err) => {
-            return ApiError::internal_with(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                codes::GATEWAY_STORE_UNAVAILABLE,
-                "failed to load gateway",
-                err.display_chain(),
-            )
-            .into_response();
-        }
+    if let Some(response) = ensure_gateway_exists(&state, &gateway_id).await {
+        return response;
     }
     let Some(proxy) = state.proxy.as_ref() else {
         return proxy_unavailable();
@@ -244,5 +461,54 @@ pub async fn revoke_proxy_token(
             err,
         )
         .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wparse_proxy::DiagnoseRecord;
+    use chrono::{TimeZone, Utc};
+
+    fn record(report: Option<serde_json::Value>) -> DiagnoseRecord {
+        DiagnoseRecord {
+            command_id: "cmd_1".to_string(),
+            state: "done".to_string(),
+            response_status: Some(1),
+            report,
+            error: None,
+            requested_at: Utc.with_ymd_and_hms(2026, 10, 21, 10, 0, 0).unwrap(),
+            updated_at: Utc.with_ymd_and_hms(2026, 10, 21, 10, 0, 5).unwrap(),
+        }
+    }
+
+    #[test]
+    fn restart_targets_map_to_control_kinds() {
+        assert_eq!(restart_kind_for("gateway"), Some("restart-gateway"));
+        assert_eq!(restart_kind_for(" GWLinkd "), Some("restart-gwlinkd"));
+        assert_eq!(restart_kind_for("all"), None, "不支持批量重启");
+        assert_eq!(restart_kind_for(""), None);
+    }
+
+    #[test]
+    fn diagnose_record_json_passes_the_report_through_verbatim() {
+        let report = json!({
+            "schema_version": "1",
+            "summary": {"ok": 1, "warn": 0, "fail": 1, "exit_code": 1},
+            "checks": [{"code": "wparse.work_drift", "status": "fail"}]
+        });
+        let out = diagnose_record_json("gw-1", &record(Some(report.clone())));
+        assert_eq!(out["gateway_id"], json!("gw-1"));
+        assert_eq!(out["state"], json!("done"));
+        assert_eq!(out["response_status"], json!(1));
+        assert_eq!(out["report"], report, "报告不能被改写");
+        assert_eq!(out["requested_at"], json!("2026-10-21T10:00:00+00:00"));
+    }
+
+    #[test]
+    fn diagnose_record_json_keeps_a_missing_report_null() {
+        // 还在飞 / 执行失败时没有报告：占位 null，前端好判。
+        let out = diagnose_record_json("gw-1", &record(None));
+        assert!(out["report"].is_null());
     }
 }
