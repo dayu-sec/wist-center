@@ -380,6 +380,9 @@ pub struct StoredGateway {
     pub gops_version: Option<String>,
     #[serde(default)]
     pub gx_version: Option<String>,
+    /// gwlinkd（宿主侧常驻）**自身**版本（与上面 `version` 分开：那是网关容器的）。
+    #[serde(default)]
+    pub gwlinkd_version: Option<String>,
     #[serde(default)]
     pub status: Option<String>,
     #[serde(default)]
@@ -460,6 +463,7 @@ impl StoredGateway {
             version: None,
             gops_version: None,
             gx_version: None,
+            gwlinkd_version: None,
             status: None,
             health: None,
             memory_bytes: None,
@@ -521,6 +525,8 @@ pub struct GatewayStatusUpdate {
     pub version: String,
     pub gops_version: Option<String>,
     pub gx_version: Option<String>,
+    /// gwlinkd（宿主侧常驻）自身版本；老 gwlinkd 不带 → None。
+    pub gwlinkd_version: Option<String>,
     pub status: String,
     pub health: String,
     pub memory_bytes: Option<i64>,
@@ -1382,6 +1388,7 @@ impl Store for FileStore {
                     stored.version = Some(update.version.clone());
                     stored.gops_version = update.gops_version.clone();
                     stored.gx_version = update.gx_version.clone();
+                    stored.gwlinkd_version = update.gwlinkd_version.clone();
                     stored.status = Some(update.status.clone());
                     stored.health = Some(update.health.clone());
                     stored.memory_bytes = update.memory_bytes;
@@ -1767,6 +1774,40 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    /// 一次状态上报的最小更新（工具 / gwlinkd 版本、富化字段均可按需覆盖）。
+    fn status_update(gateway_id: &str, status: &str) -> GatewayStatusUpdate {
+        GatewayStatusUpdate {
+            gateway_id: gateway_id.to_string(),
+            instance_id: "i".to_string(),
+            version: "0.1.26".to_string(),
+            gops_version: None,
+            gx_version: None,
+            gwlinkd_version: None,
+            status: status.to_string(),
+            health: "ok".to_string(),
+            memory_bytes: None,
+            cpu_percent: None,
+            public_base_url: None,
+            last_seen_at: DateTime::now(),
+            uptime_seconds: None,
+            agent_count: None,
+            online_agents: None,
+            offline_agents: None,
+            last_seen_lag_seconds: None,
+            store_bytes: None,
+            ingest_accepted_total: None,
+            ingest_rejected_total: None,
+            last_ingest_at: None,
+            memory_total_bytes: None,
+            load_1m: None,
+            load_5m: None,
+            load_15m: None,
+            disk_usage_percent: None,
+            disk_total_bytes: None,
+            disk_available_bytes: None,
+        }
+    }
+
     #[test]
     fn seed_provisions_missing_gateways_only() {
         let path = test_store_path();
@@ -1905,38 +1946,6 @@ mod tests {
     /// 时自动解除 —— 不用人工记得取消归档；只是掉线的那种上报（offline）不会自己冒回来。
     #[tokio::test]
     async fn archive_is_a_marker_and_clears_when_the_gateway_comes_back() {
-        fn status_update(gateway_id: &str, status: &str) -> GatewayStatusUpdate {
-            GatewayStatusUpdate {
-                gateway_id: gateway_id.to_string(),
-                instance_id: "i".to_string(),
-                version: "0.1.26".to_string(),
-                gops_version: None,
-                gx_version: None,
-                status: status.to_string(),
-                health: "ok".to_string(),
-                memory_bytes: None,
-                cpu_percent: None,
-                public_base_url: None,
-                last_seen_at: DateTime::now(),
-                uptime_seconds: None,
-                agent_count: None,
-                online_agents: None,
-                offline_agents: None,
-                last_seen_lag_seconds: None,
-                store_bytes: None,
-                ingest_accepted_total: None,
-                ingest_rejected_total: None,
-                last_ingest_at: None,
-                memory_total_bytes: None,
-                load_1m: None,
-                load_5m: None,
-                load_15m: None,
-                disk_usage_percent: None,
-                disk_total_bytes: None,
-                disk_available_bytes: None,
-            }
-        }
-
         let path = test_store_path();
         let store = FileStore::new(&path);
         store
@@ -2036,8 +2045,56 @@ mod tests {
                 .archived_at
                 .is_none()
         );
+    }
 
-        let _ = fs::remove_file(path);
+    /// gwlinkd 的**自身**版本与网关（容器）版本分开落库：中心页面两个都要能显示，
+    /// 老 gwlinkd 不带该键时保持 `None`（页面显示「—」，不冒充）。
+    #[tokio::test]
+    async fn gateway_status_keeps_the_gwlinkd_version_apart_from_the_gateway_version() {
+        let path = test_store_path();
+        let store = FileStore::new(&path);
+        store
+            .seed(&[GatewayCredentialSeed {
+                gateway_id: "gw-001".to_string(),
+                token: "tok-a".to_string(),
+                expires_at: None,
+            }])
+            .expect("seed");
+
+        let mut update = status_update("gw-001", "online");
+        update.gops_version = Some("2.4.0".to_string());
+        update.gx_version = Some("0.17.0".to_string());
+        update.gwlinkd_version = Some("0.16.1".to_string());
+        store.upsert_gateway_status(&update).await.expect("status");
+
+        let stored = store
+            .get_gateway("gw-001")
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(
+            stored.version.as_deref(),
+            Some("0.1.26"),
+            "网关容器版本原样保留"
+        );
+        assert_eq!(stored.gwlinkd_version.as_deref(), Some("0.16.1"));
+
+        // 后来的上报没带这个键（老 gwlinkd）→ 清空，不沿用旧值（版本是事实，不是累积）。
+        let mut legacy = status_update("gw-001", "online");
+        legacy.gwlinkd_version = None;
+        store
+            .upsert_gateway_status(&legacy)
+            .await
+            .expect("status legacy");
+        assert_eq!(
+            store
+                .get_gateway("gw-001")
+                .await
+                .expect("get")
+                .expect("exists")
+                .gwlinkd_version,
+            None
+        );
     }
 
     /// 网关对外域名：注册时落下；状态上报带 `None`（老网关）时**保留**已落值，带值时覆盖。
@@ -2050,6 +2107,7 @@ mod tests {
                 version: "0.1.26".to_string(),
                 gops_version: None,
                 gx_version: None,
+                gwlinkd_version: None,
                 status: "online".to_string(),
                 health: "ok".to_string(),
                 memory_bytes: None,

@@ -2293,6 +2293,7 @@ fn gateway_runtime_status(stored: &StoredGateway) -> GatewayRuntimeStatus {
         version: stored.version.clone().unwrap_or_default(),
         gops_version: stored.gops_version.clone(),
         gx_version: stored.gx_version.clone(),
+        gwlinkd_version: stored.gwlinkd_version.clone(),
         // 注意：`status` 已在上面按新鲜度归一，这里不再回退原始字符串。
         health: stored
             .health
@@ -2844,6 +2845,7 @@ mod tests {
                     version: "0.6.0".to_string(),
                     gops_version: None,
                     gx_version: None,
+                    gwlinkd_version: None,
                     status: "online".to_string(),
                     health: "ok".to_string(),
                     memory_bytes: None,

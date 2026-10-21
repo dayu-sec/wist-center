@@ -476,6 +476,13 @@ fn render_prometheus_lines(update: &GatewayStatusUpdate) -> String {
             escape_label(gx_version)
         ));
     }
+    // gwlinkd 自身版本：排自更新进度靠它（哪几台还跑旧宿主常驻）；老 gwlinkd 不带则不推。
+    if let Some(gwlinkd_version) = update.gwlinkd_version.as_deref() {
+        text.push_str(&format!(
+            "gateway_gwlinkd_info{{{labels},gwlinkd_version=\"{}\"}} 1 {ts}\n",
+            escape_label(gwlinkd_version)
+        ));
+    }
     push_metric(
         &mut text,
         "gateway_memory_bytes",
@@ -652,6 +659,7 @@ mod tests {
             version: "v2.4.1".to_string(),
             gops_version: Some("2.4.0".to_string()),
             gx_version: Some("0.17.0".to_string()),
+            gwlinkd_version: Some("0.16.0".to_string()),
             status: status.to_string(),
             health: health.to_string(),
             memory_bytes: Some(536_870_912),
@@ -697,6 +705,9 @@ mod tests {
         )));
         assert!(text.contains(&format!(
             "gateway_gx_info{{gateway_id=\"gw-001\",instance_id=\"inst-1\",gx_version=\"0.17.0\"}} 1 {ts}"
+        )));
+        assert!(text.contains(&format!(
+            "gateway_gwlinkd_info{{gateway_id=\"gw-001\",instance_id=\"inst-1\",gwlinkd_version=\"0.16.0\"}} 1 {ts}"
         )));
     }
 
@@ -794,8 +805,11 @@ mod tests {
         update.disk_available_bytes = None;
         update.gops_version = None;
         update.gx_version = None;
+        update.gwlinkd_version = None;
         let text = render_prometheus_lines(&update);
         assert!(text.contains("gateway_up{"));
+        assert!(!text.contains("gateway_gops_info{"));
+        assert!(!text.contains("gateway_gwlinkd_info{"));
         assert!(!text.contains("gateway_memory_bytes{"));
         assert!(!text.contains("gateway_cpu_percent{"));
         assert!(!text.contains("gateway_uptime_seconds{"));

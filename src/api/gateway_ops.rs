@@ -900,6 +900,7 @@ pub async fn submit_gateway_status(
                 version: input.version.clone(),
                 gops_version: input.gops_version.clone(),
                 gx_version: input.gx_version.clone(),
+                gwlinkd_version: input.gwlinkd_version.clone(),
                 status: input.status.clone(),
                 health: input.health.clone(),
                 memory_bytes: input.memory_bytes,

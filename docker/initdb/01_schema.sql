@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS gateways (
   version TEXT,
   gops_version TEXT,
   gx_version TEXT,
+  gwlinkd_version TEXT,
   status TEXT,
   health TEXT,
   memory_bytes BIGINT,
@@ -47,6 +48,10 @@ ALTER TABLE gateways ADD COLUMN IF NOT EXISTS public_base_url TEXT;
 -- 老网关 / 老 gwlinkd 不带这两个键 → 保持 NULL（页面显示「—」，不冒充已安装）。
 ALTER TABLE gateways ADD COLUMN IF NOT EXISTS gops_version TEXT;
 ALTER TABLE gateways ADD COLUMN IF NOT EXISTS gx_version TEXT;
+
+-- 幂等补列（既有库）：gwlinkd（宿主侧常驻）**自身**版本（网关容器版本在上面 `version`）。
+-- 老 gwlinkd 不带这个键 → 保持 NULL（页面显示「—」）。
+ALTER TABLE gateways ADD COLUMN IF NOT EXISTS gwlinkd_version TEXT;
 
 -- 幂等补列（既有库）：归档时刻（NULL = 未归档）。归档是**标记**：默认视图不再显示这台网关，
 -- 状态/历史全留；只归档离线网关，重新上线（换证注册或重新上报 online）时自动清空。

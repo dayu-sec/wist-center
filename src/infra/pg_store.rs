@@ -65,6 +65,7 @@ struct GatewayRow {
     version: Option<String>,
     gops_version: Option<String>,
     gx_version: Option<String>,
+    gwlinkd_version: Option<String>,
     status: Option<String>,
     health: Option<String>,
     memory_bytes: Option<i64>,
@@ -144,6 +145,7 @@ impl GatewayRow {
             version: self.version,
             gops_version: self.gops_version,
             gx_version: self.gx_version,
+            gwlinkd_version: self.gwlinkd_version,
             status: self.status,
             health: self.health,
             memory_bytes: self.memory_bytes,
@@ -262,7 +264,7 @@ fn parse_optional_timestamptz(value: &Option<String>) -> Option<chrono::DateTime
 
 const GATEWAY_COLUMNS: &str = "gateway_id, instance_id, credential_token_hash, \
                                credential_status, credential_expires_at, link_token_hash, \
-                               link_token_expires_at, version, gops_version, gx_version, status, health, memory_bytes, cpu_percent, \
+                               link_token_expires_at, version, gops_version, gx_version, gwlinkd_version, status, health, memory_bytes, cpu_percent, \
                                public_base_url, \
                                uptime_seconds, agent_count, online_agents, offline_agents, last_seen_lag_seconds, \
                                store_bytes, ingest_accepted_total, ingest_rejected_total, last_ingest_at, \
@@ -327,6 +329,7 @@ impl Store for PgStore {
         sqlx::query(
             "UPDATE gateways \
              SET instance_id = $2, version = $3, gops_version = $26, gx_version = $27, \
+                 gwlinkd_version = $28, \
                  status = $4, health = $5, \
                  memory_bytes = $6, cpu_percent = $7, \
                  public_base_url = COALESCE($25, public_base_url), \
@@ -374,6 +377,7 @@ impl Store for PgStore {
         .bind(update.public_base_url.as_deref())
         .bind(update.gops_version.as_deref())
         .bind(update.gx_version.as_deref())
+        .bind(update.gwlinkd_version.as_deref())
         .execute(&self.pool)
         .await
         .source_raw_err(StoreReason::Sql, "upsert gateway status")?;
@@ -1078,6 +1082,7 @@ mod tests {
                 version: "v9.9.9".to_string(),
                 gops_version: None,
                 gx_version: None,
+                gwlinkd_version: Some("0.16.1".to_string()),
                 status: "online".to_string(),
                 health: "healthy".to_string(),
                 memory_bytes: Some(1_073_741_824),
@@ -1111,6 +1116,11 @@ mod tests {
             .expect("still present");
         assert_eq!(updated.instance_id, "it-instance");
         assert_eq!(updated.version.as_deref(), Some("v9.9.9"));
+        assert_eq!(
+            updated.gwlinkd_version.as_deref(),
+            Some("0.16.1"),
+            "gwlinkd 自身版本要能随上报落库并读回（PG 列 + 绑定占位符）"
+        );
         assert_eq!(updated.status.as_deref(), Some("online"));
         assert_eq!(updated.health.as_deref(), Some("healthy"));
         assert_eq!(
