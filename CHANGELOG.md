@@ -5,6 +5,27 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.19.6-alpha] - 2026-10-21
+
+### 新增
+
+- **网关控制命令**（复用既有命令队列，不新开入站端口）：
+  - `POST /api/v1/admin/gateways/{id}/diagnose`：让网关跑一次运行时体检（202 + `command_id`）；
+  - `GET  /api/v1/admin/gateways/{id}/diagnose`：最近一次体检（`report` 即 `gops run diagnose --json` 原文）；
+  - `POST /api/v1/admin/gateways/{id}/restart`（body `{"target":"gateway"\|"gwlinkd"}`）；
+  - `GET  /api/v1/admin/gateways/{id}/commands/{command_id}`：控制命令状态。
+- `gateway_commands.kind`：`proxy`（缺省）/ `diagnose` / `restart-gateway` / `restart-gwlinkd`；
+  网关轮询响应带 `kind`（老 gwlinkd 忽略该字段，新 gwlinkd 缺省按 `proxy`）。
+- 控制命令**幂等**：同网关同 kind 已有 pending/leased 时复用（事务 + advisory lock），
+  连点两次不会跑两次。
+
+### 兼容与注意
+
+- 控制命令租约 **360s**（`proxy` 仍 30s）：体检/重启最长可跑 300s；租约短于执行时间会被判过期重派，
+  同一台机器上跑两份。该关系由编译期断言锁住。
+- `kind` 列在 `docker/initdb/01_schema.sql`（幂等 `ALTER`），启动时随 schema 自动补列。
+- 回执 body 超过 1 MiB 会被替换成 `{"truncated":true}` 标记（不存异常大输入）。
+
 ## [0.19.5-alpha] - 2026-10-21
 
 ### 新增
