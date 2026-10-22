@@ -5,6 +5,22 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.20.0-alpha] - 2026-10-22
+
+### 新增
+
+- **规则 / 配置发布入口**（`wparse-rules` / `wparse-infra`）：在发布页选 tag、选目标网关即可发布；
+  tag 候选支持 CNB / GitHub / manual，发布复用 wparse-proxy 命令队列，网关侧无需升级。
+  配置段 `[wparse_release]` 可分别配置两个 repo；token 复用 `${SEC_WP_GIT_PUB_TOKEN}`
+  （CNB 访问令牌需要 `repo-release:r`）。
+- **gwlinkd 安装/升级后自检**：安装完成自动跑一次 `wist-gwlinkd diagnose`，直接暴露信任锚、
+  中心可达、环回面问题；只提示，不阻断安装。
+
+### 兼容
+
+- 未配置 `[wparse_release]` 时功能关闭；WarpStation 原有发布路径不受影响。
+- **gwlinkd / gateway 零改动**：发布命令仍是 `kind=proxy` + `POST /admin/v1/reloads/model`。
+
 ## [0.19.7-alpha] - 2026-10-21
 
 ### 变更
