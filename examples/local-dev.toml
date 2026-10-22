@@ -96,6 +96,7 @@ object_storage_secret_key = ""
 
 # 规则 / 配置发布入口（`wparse-rules` / `wparse-infra`）。
 # 开发态默认关闭；要试 tag 候选 / 发布时打开并按下面示例补 repo。
+# 发布与其它组件同一道审批：publish 只建 `draft` 计划，批准后才入队（需要 PG）。
 [wparse_release]
 enabled = false
 tag_cache_seconds = 60

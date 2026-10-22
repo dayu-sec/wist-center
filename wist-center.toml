@@ -74,6 +74,7 @@ object_storage_secret_key = ""
 
 # 规则 / 配置发布入口（`wparse-rules` / `wparse-infra`）。
 # tag 列表是只读能力；真正发布要求 [wparse_proxy].enabled = true 且 [store].database_url 可用。
+# 发布走与其它组件同一道审批：publish 只建 `draft` 计划，到「发布执行」页批准后才入队。
 #
 # provider：`cnb`（CNB OpenAPI）/ `github`（GitHub REST）/ `manual`（断网现场只手填）。
 # token 只从 `${SEC_...}` 解析（推荐复用 .wist 的 wp_git_pub_token；CNB 需 repo-release:r）；

@@ -123,6 +123,7 @@ codes! {
     UPGRADE_PLAN_LOAD_FAILED => "upgrade_plan_load_failed",
     VERSION_MISMATCH => "version_mismatch",
     VERSION_UNDERIVABLE => "version_underivable",
+    WPARSE_PLAN_DISPATCH_FAILED => "wparse_plan_dispatch_failed",
     WPARSE_PROXY_TOKEN_ISSUE_FAILED => "wparse_proxy_token_issue_failed",
     WPARSE_PROXY_TOKEN_NOT_FOUND => "wparse_proxy_token_not_found",
     WPARSE_PROXY_UNAVAILABLE => "wparse_proxy_unavailable",

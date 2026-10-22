@@ -1862,6 +1862,15 @@ pub async fn admin_approve_upgrade_plan(
     }
     plan.approved_by = Some("admin".to_string());
     plan.approved_at = Some(DateTime::now());
+    if plan.action == rollout::ACTION_WPARSE_RELEASE {
+        // `wparse-release` 的计划只当**审批闸门**：批准这一刻由中心自己把命令投进
+        // wparse-proxy 队列（网关不会去拉这个动作的计划，见 `rollout::active_plan_for_gateway`），
+        // 落库顺序（先 rolling 再入队）由 [`rollout::persist_and_dispatch_wparse`] 负责。
+        if let Err(error) = rollout::persist_and_dispatch_wparse(&state, &mut plan).await {
+            return error.into_response();
+        }
+        return Json(rollout::plan_view(&plan)).into_response();
+    }
     if let Err(err) = state.store.save_upgrade_plan(&plan).await {
         return super::error::internal_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1911,6 +1920,13 @@ pub async fn admin_advance_upgrade_plan(
         .into_response();
     }
     rollout::advance_plan(&mut plan);
+    if plan.action == rollout::ACTION_WPARSE_RELEASE {
+        // 进入新阶段后同样由中心入队（其余动作由网关自己拉）；末阶段收尾后这里是个空操作。
+        if let Err(error) = rollout::persist_and_dispatch_wparse(&state, &mut plan).await {
+            return error.into_response();
+        }
+        return Json(rollout::plan_view(&plan)).into_response();
+    }
     if let Err(err) = state.store.save_upgrade_plan(&plan).await {
         return super::error::internal_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2027,15 +2043,26 @@ pub async fn admin_retry_upgrade_plan(
         Ok(retry) => retry,
         Err(error) => return error.into_response(),
     };
-    match state.store.create_upgrade_plan(&retry).await {
-        Ok(plan) => (StatusCode::CREATED, Json(rollout::plan_view(&plan))).into_response(),
-        Err(err) => super::error::internal_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            super::codes::ROLLOUT_RETRY_CREATE_FAILED,
-            "failed to create retry rollout plan",
-            err.display_chain(),
-        ),
+    // 补跑计划已经是 `rolling`（重试就是「现在就重派」）；`wparse-release` 建完就要入队。
+    let mut created = match state.store.create_upgrade_plan(&retry).await {
+        Ok(plan) => plan,
+        Err(err) => {
+            return super::error::internal_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                super::codes::ROLLOUT_RETRY_CREATE_FAILED,
+                "failed to create retry rollout plan",
+                err.display_chain(),
+            );
+        }
+    };
+    if created.action == rollout::ACTION_WPARSE_RELEASE
+        && let Err(error) = rollout::persist_and_dispatch_wparse(&state, &mut created).await
+    {
+        // 计划已经建出来了：单台入队失败只会把那条标 `failed`（不会走到这里）；
+        // 走到这里说明 proxy 已关或仓库已被删 —— 把错误冒出来，计划留作 `rolling` 等人工处置。
+        return error.into_response();
     }
+    (StatusCode::CREATED, Json(rollout::plan_view(&created))).into_response()
 }
 
 /// 查看某份计划及其逐目标进度：`GET /api/v1/admin/rollout-plans/{plan_id}`（模型 `AdminViewUpgradePlan`）。

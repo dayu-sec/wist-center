@@ -181,8 +181,38 @@ pub async fn report_command_result(
         log_dir: input.log_dir,
         log_excerpt: crate::api::bounded_log_excerpt(input.log_excerpt),
     };
+    // 回填发布计划之前先拿一份快照：`complete_command` 会吃掉 `result`。
+    let snapshot = result.clone();
     match proxy.complete_command(&command_id, result).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            // 规则 / 配置发布：命令是计划批准时由中心入队的，这里把结果回填到那份计划的条目。
+            // 只认 `wparse-release` 计划，不影响网关自己执行的三种动作。
+            let outcome = if snapshot.error.is_some() {
+                "failed"
+            } else {
+                "done"
+            };
+            let detail = snapshot
+                .error
+                .clone()
+                .or_else(|| crate::api::bounded_log_excerpt(Some(snapshot.body.clone())))
+                .unwrap_or_default();
+            if let Err(err) = crate::api::rollout::reconcile_wparse_result(
+                &state,
+                &owner,
+                outcome,
+                &detail,
+                Some(&command_id),
+                snapshot.log_dir.as_deref(),
+                snapshot.log_excerpt.as_deref(),
+            )
+            .await
+            {
+                // 回填失败不该把「命令已经完成」这件事退回去：网关侧确实做完了。
+                log::warn!("event=WparsePlanReconcileFailed command_id={command_id} err={err}");
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => ApiError::conflict(
             codes::COMMAND_NOT_FOUND,
             "command is not leased (already completed or expired)",

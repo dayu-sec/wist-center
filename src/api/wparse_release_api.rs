@@ -3,9 +3,10 @@
 //! 两个入口（`wparse-rules` / `wparse-infra`）都以 **repo 配置** 驱动：
 //! - `GET  /api/v1/admin/wparse/repos`：列出入口与可用状态；
 //! - `GET  /api/v1/admin/wparse/repos/{name}/tags`：读 tag 候选（CNB / GitHub / manual）；
-//! - `POST /api/v1/admin/wparse/repos/{name}/publish`：选中 tag + 目标网关 → 入命令队列。
+//! - `POST /api/v1/admin/wparse/repos/{name}/publish`：选中 tag + 目标网关 → **建一份待审批的发布计划**。
 //!
-//! 发布动作**复用** wparse-proxy 的入队路径（[`crate::wparse_proxy::WparseProxy::publish_reload`]），
+//! 审批与 ①②③ 同一套：计划先落 `draft`，到「发布执行」页批准（`rollout-plans/approve`）后
+//! 才由中心经 wparse-proxy 入队（[`crate::wparse_proxy::WparseProxy::publish_reload`]），
 //! gwlinkd 的 `wparse_relay` 原样执行，不需要任何 gateway / gwlinkd 改动。
 
 use axum::{
@@ -165,13 +166,13 @@ pub async fn admin_publish_wparse_release(
         )
         .into_response();
     };
-    let Some(proxy) = state.proxy.as_ref() else {
+    if state.proxy.is_none() {
         return ApiError::unavailable(
             codes::WPARSE_PROXY_UNAVAILABLE,
             "wparse proxy is not enabled on this center",
         )
         .into_response();
-    };
+    }
 
     let tag = input.tag.trim();
     if !crate::wparse_proxy::valid_release_tag(tag) {
@@ -259,80 +260,57 @@ pub async fn admin_publish_wparse_release(
         .into_response();
     }
 
-    let mut dispatched = Vec::with_capacity(targets.len());
-    let mut failures = Vec::new();
-    let mut queue_full = false;
-    let mut store_error = None;
-    for gateway_id in &targets {
-        match proxy
-            .publish_reload(gateway_id, &repo.group, tag, reason, 15_000)
-            .await
-        {
-            Ok(enqueued) => dispatched.push(json!({
-                "gateway_id": gateway_id,
-                "command_id": enqueued.command_id,
-                "reused": enqueued.reused,
-                "state": "pending",
-            })),
-            Err(err) => {
-                match &err {
-                    crate::wparse_proxy::EnqueueError::QueueFull => queue_full = true,
-                    crate::wparse_proxy::EnqueueError::Store(message) => {
-                        store_error = Some(message.clone());
-                    }
-                }
-                failures.push(json!({
-                    "gateway_id": gateway_id,
-                    "error": err.to_string(),
-                }));
-            }
+    // 与 ①②③ 一致：先落一份 **`draft` 发布计划**，到「发布执行」页批准后才真正下发。
+    // 单阶段：规则 / 配置重载是幂等的，不需要灰度阶梯；批准即全量入队。
+    let plan_request = super::rollout::CreateRolloutPlanRequest {
+        action: super::rollout::ACTION_WPARSE_RELEASE.to_string(),
+        spec: super::rollout::wparse_release_spec(
+            repo.name.as_str(),
+            tag,
+            commit.as_deref(),
+            reason,
+        ),
+        target_ids: targets.clone(),
+        phase_count: 1,
+        deadline_at: None,
+        timeout_seconds: 0,
+        batch_size: 0,
+    };
+    let record = match super::rollout::build_plan(&plan_request) {
+        Ok(record) => record,
+        Err(error) => return error.into_response(),
+    };
+    let plan = match state.store.create_upgrade_plan(&record).await {
+        Ok(plan) => plan,
+        Err(err) => {
+            return ApiError::internal(
+                codes::ROLLOUT_CREATE_FAILED,
+                "failed to create wparse release plan",
+                err.display_chain(),
+            )
+            .into_response();
         }
-    }
+    };
 
     log::info!(
-        "event=WparseReleaseEnqueued repo={} group={} tag={} verified={} dispatched={} failed={}",
+        "event=WparseReleasePlanCreated plan_id={} repo={} group={} tag={} verified={} targets={}",
+        plan.plan_id,
         repo.name,
         repo.group,
         tag,
         tag_verified,
-        dispatched.len(),
-        failures.len()
+        targets.len()
     );
 
-    if dispatched.is_empty() {
-        if let Some(message) = store_error {
-            return ApiError::internal(
-                codes::COMMAND_STORE_UNAVAILABLE,
-                "failed to enqueue publish commands",
-                message,
-            )
-            .into_response();
-        }
-        if queue_full {
-            return ApiError::new(
-                StatusCode::TOO_MANY_REQUESTS,
-                codes::RATE_LIMITED,
-                "too many pending commands for the selected gateways",
-            )
-            .into_response();
-        }
-        return ApiError::unavailable(
-            codes::WPARSE_PROXY_UNAVAILABLE,
-            "failed to enqueue publish commands",
-        )
-        .into_response();
-    }
-
     (
-        StatusCode::ACCEPTED,
+        StatusCode::CREATED,
         Json(json!({
+            "plan": super::rollout::plan_view(&plan),
             "repo": repo.name,
             "group": repo.group,
             "tag": tag,
             "commit": commit,
             "tag_verified": tag_verified,
-            "targets": dispatched,
-            "errors": failures,
         })),
     )
         .into_response()

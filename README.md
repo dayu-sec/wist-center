@@ -173,10 +173,18 @@ Two admin entries read a repo's tag list and publish a selected tag through the 
 `gateway_commands` queue used by the wparse-proxy. gwlinkd's `wparse_relay` executes it with no
 gateway change: the command is still `kind=proxy` + `POST /admin/v1/reloads/model`.
 
+Publishing goes through the **same approval gate as every other release**: `POST …/publish` only
+creates a rollout plan (`action = wparse-release`, single phase, `status = draft`) and returns
+`201` with that plan. Nothing is queued yet. The plan shows up on the *release execution* page; once
+an operator approves it (`POST /api/v1/admin/rollout-plans/approve`), the center enqueues one reload
+per target and backfills each entry from the command result. This action is **center-executed**, so
+the gateway-facing `GET /api/v1/gateway/upgrade-plan` skips it.
+
 ```http
 GET  /api/v1/admin/wparse/repos
 GET  /api/v1/admin/wparse/repos/{name}/tags?limit=100&refresh=false
-POST /api/v1/admin/wparse/repos/{name}/publish
+POST /api/v1/admin/wparse/repos/{name}/publish        # 201 → { plan, repo, group, tag, commit, tag_verified }
+POST /api/v1/admin/rollout-plans/approve              # { plan_id } → draft becomes rolling + commands enqueued
 ```
 
 ```toml
@@ -208,8 +216,8 @@ tags_limit = 100
 The tag list is read-only and works even when `[wparse_proxy].enabled = false`; publishing requires
 both `[wparse_release].enabled` and an active wparse-proxy (PostgreSQL). Tokens are never returned by
 the API and are expanded from `${SEC_...}`, so the same `.wist` read token used by the Git Proxy can
-be reused. A successful publish returns `202` with one `command_id` per gateway; poll the existing
-`GET /api/v1/admin/gateways/{gateway_id}/commands/{command_id}` for the terminal state.
+be reused. Approval needs an active wparse-proxy as well — if the queue is unreachable the plan stays
+`draft` instead of silently becoming an approved plan that never dispatched anything.
 
 ### Environment variables
 

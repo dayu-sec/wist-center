@@ -17,6 +17,16 @@ use crate::infra::{UpgradePhaseRecord, UpgradePlanEntryRecord, UpgradePlanRecord
 
 use super::{ApiState, codes, error::ApiError};
 
+/// 「规则 / 配置 tag 发布」（`wparse-rules` / `wparse-infra`）。
+///
+/// 与三种运行时 / 内容动作的区别在**谁执行**：那三种由网关轮询计划自己动手（中心不物化）；
+/// 本动作反过来 —— 计划只当**审批闸门**，批准后由中心经 `wparse-proxy` 命令队列下发，
+/// 网关的 gwlinkd 只负责 relay。
+///
+/// 因此它**不放进共享 crate `wist-control`**：网关不认识这个动作，也不应该认识
+/// （网关侧拉计划时会跳过它，见 [`active_plan_for_gateway`]）。
+pub(super) const ACTION_WPARSE_RELEASE: &str = "wparse-release";
+
 // ── 入参（与网关**同形**；形状的单一真源是模型 `Control.RolloutApp.AdminInterface`） ──
 
 /// 创建灰度发布计划请求体。
@@ -190,6 +200,9 @@ struct UpgradeSpec {
     /// 「知识库包下发」专用：录入后是否立即激活（缺省 false）。其余动作忽略。
     #[serde(default)]
     activate: bool,
+    /// 「规则 / 配置 tag 发布」专用：入队时写进 wparse `reload` 的 `reason`。
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -222,6 +235,39 @@ pub(super) fn knowledge_activate(spec: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 「规则 / 配置 tag 发布」的 `spec`：与其它动作同形（`{"targets":[{component,target_version}]}`），
+/// 额外带 `reason`（写进入队命令的 wparse `reload.reason`）与 `commit`（**仅作展示 / 审计**，
+/// 下发时不用它 —— wparse 自己按 tag 解析；解析侧不需要读它，所以 `UpgradeSpec` 里没有这个字段）。
+pub(super) fn wparse_release_spec(
+    repo: &str,
+    tag: &str,
+    commit: Option<&str>,
+    reason: &str,
+) -> String {
+    let mut spec = serde_json::json!({
+        "targets": [{ "component": repo, "target_version": tag }],
+        "reason": reason,
+    });
+    if let Some(commit) = commit {
+        spec["commit"] = serde_json::Value::String(commit.to_string());
+    }
+    spec.to_string()
+}
+
+/// 入队时用的 wparse `reload.reason`：计划里存的 `reason`，缺省回落 `plan <plan_id>`。
+pub(super) fn wparse_release_reason(spec: &str) -> Option<String> {
+    serde_json::from_str::<UpgradeSpec>(spec)
+        .ok()?
+        .reason
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn rollout_plan_id(action: &str, now: &DateTime) -> String {
+    // 语义化：`plan-<action>-<yyyyMMdd-HHmmss>-<short>`（口径在共享 crate `wist-release::rollout`）。
+    wist_release::rollout::plan_id(action, &now.to_chrono().to_rfc3339())
+}
+
 // ── 建计划（服务端切阶段 + 全量条目落 `pending`） ──
 
 /// 已知动作的 `spec.targets` 校验：非空、组件非空、**目标版本必填**。
@@ -234,6 +280,7 @@ fn validate_target_spec(action: &str, spec: &str) -> Result<(), ApiError> {
         wist_control::ACTION_UPGRADE
             | wist_control::ACTION_PUSH_AGENT_PACKAGE
             | wist_control::ACTION_PUSH_KNOWLEDGE_PACKAGE
+            | ACTION_WPARSE_RELEASE
     ) {
         return Ok(());
     }
@@ -265,11 +312,6 @@ fn validate_target_spec(action: &str, spec: &str) -> Result<(), ApiError> {
         }
     }
     Ok(())
-}
-
-fn rollout_plan_id(action: &str, now: &DateTime) -> String {
-    // 语义化：`plan-<action>-<yyyyMMdd-HHmmss>-<short>`（口径在共享 crate `wist-release::rollout`）。
-    wist_release::rollout::plan_id(action, &now.to_chrono().to_rfc3339())
 }
 
 /// 把请求折算成落库的计划（含按**全量**目标铺好的 `pending` 条目）。
@@ -559,6 +601,13 @@ pub(super) fn progress_plan_after_terminal_result(plan: &mut UpgradePlanRecord) 
 
 // ── 网关侧读 / 回执（供 `gateway_ops` 用） ──
 
+/// 这份计划是否由**网关**自己执行？
+///
+/// `wparse-release` 由中心执行（批准那一刻直接入队），网关拉不到它；其余动作都由网关轮询执行。
+fn gateway_executes(action: &str) -> bool {
+    action != ACTION_WPARSE_RELEASE
+}
+
 /// 找出此刻**该网关该执行**的升级计划：`rolling` 且它落在 `current_phase` 阶段内。
 ///
 /// 计划列表是「新→旧」，取第一份命中的（与旧实现同序）。
@@ -573,6 +622,11 @@ pub(super) async fn active_plan_for_gateway(
         .map_err(|err| format!("failed to load upgrade plans: {err}"))?;
     for plan in plans {
         if plan.status != "rolling" {
+            continue;
+        }
+        // `wparse-release` 的执行方是**中心**（批准后直接入队），不是网关：
+        // 让网关拉到会有害（gwlinkd 会把 `wparse-rules` 当成要升级的组件去处理）。
+        if !gateway_executes(&plan.action) {
             continue;
         }
         let idx = plan.current_phase as usize;
@@ -629,8 +683,70 @@ pub(super) async fn mark_gateway_entry_dispatched(
 /// 回执里没有中心侧的 work_id（中心不物化），但一个网关此刻最多落在一份 `rolling` 计划的
 /// 当前阶段里 —— 按 `gateway_id` + 当前阶段定位就够了。找不到对应计划/条目时静默返回
 /// （不是计划物化出来的结果，无条目可回填）。
+///
+/// **只看网关自己执行的动作**：`wparse-release` 由中心入队、经 `wparse-proxy` 回填，
+/// 两个回执通道不能互相串台。
 pub(super) async fn reconcile_gateway_upgrade_result(
     state: &ApiState,
+    gateway_id: &str,
+    status: &str,
+    detail: &str,
+    task_id: Option<&str>,
+    log_dir: Option<&str>,
+    log_excerpt: Option<&str>,
+) -> Result<(), String> {
+    reconcile_plan_result(
+        state,
+        PlanActionFilter::GatewayExecuted,
+        gateway_id,
+        status,
+        detail,
+        task_id,
+        log_dir,
+        log_excerpt,
+    )
+    .await
+}
+
+/// `wparse-proxy` 命令回执回填：只认 `wparse-release` 计划。
+///
+/// 命令由中心自己入队（批准时），状态措辞也是中心侧的 `done` / `failed`，
+/// 归一化仍走同一份 `entry_status_for`。
+pub(super) async fn reconcile_wparse_result(
+    state: &ApiState,
+    gateway_id: &str,
+    status: &str,
+    detail: &str,
+    task_id: Option<&str>,
+    log_dir: Option<&str>,
+    log_excerpt: Option<&str>,
+) -> Result<(), String> {
+    reconcile_plan_result(
+        state,
+        PlanActionFilter::Only(ACTION_WPARSE_RELEASE),
+        gateway_id,
+        status,
+        detail,
+        task_id,
+        log_dir,
+        log_excerpt,
+    )
+    .await
+}
+
+/// 回执该匹配哪类计划：网关执行的动作（默认全部），或只看某一个动作。
+#[derive(Clone, Copy)]
+enum PlanActionFilter {
+    /// 网关轮询执行的三种动作 —— 必须排除 `wparse-release`（它由中心执行）。
+    GatewayExecuted,
+    /// 只看指定动作。
+    Only(&'static str),
+}
+
+#[allow(clippy::too_many_arguments)] // 与两个公开入口同形，拆结构体反而绕。
+async fn reconcile_plan_result(
+    state: &ApiState,
+    filter: PlanActionFilter,
     gateway_id: &str,
     status: &str,
     detail: &str,
@@ -647,6 +763,13 @@ pub(super) async fn reconcile_gateway_upgrade_result(
         if plan.status != "rolling" {
             continue;
         }
+        let matches_action = match filter {
+            PlanActionFilter::GatewayExecuted => plan.action != ACTION_WPARSE_RELEASE,
+            PlanActionFilter::Only(action) => plan.action == action,
+        };
+        if !matches_action {
+            continue;
+        }
         let idx = plan.current_phase as usize;
         if idx == 0 || idx > plan.phases.len() {
             continue;
@@ -655,13 +778,23 @@ pub(super) async fn reconcile_gateway_upgrade_result(
         if !phase.gateway_ids.iter().any(|id| id == gateway_id) {
             continue;
         }
-        let Some(entry) = plan
-            .entries
-            .iter_mut()
-            .find(|entry| entry.gateway_id == gateway_id)
-        else {
+        // 有 `task_id` 时优先按它定位：同一网关可能同时落在两份 `wparse-release` 计划里
+        // （刚批准一份、又重派了一份），只按 `gateway_id` 会回填到错的那份。
+        let entry_index = task_id
+            .and_then(|task_id| {
+                plan.entries
+                    .iter()
+                    .position(|entry| entry.task_id.as_deref() == Some(task_id))
+            })
+            .or_else(|| {
+                plan.entries
+                    .iter()
+                    .position(|entry| entry.gateway_id == gateway_id)
+            });
+        let Some(entry_index) = entry_index else {
             continue;
         };
+        let entry = &mut plan.entries[entry_index];
         // 条目状态与「是否推进」都按**归一化后**的状态判定：上报方（gwlinkd）用 `done` 等措辞，
         // 归一化在共享 crate `wist_release::rollout::entry_status_for`（`done → succeeded` 等）。
         let entry_status = wist_release::rollout::entry_status_for(status);
@@ -685,9 +818,163 @@ pub(super) async fn reconcile_gateway_upgrade_result(
             .save_upgrade_plan(&plan)
             .await
             .map_err(|err| format!("failed to store upgrade plan: {err}"))?;
-        return Ok(());
+        // 网关回执：一个网关此刻只落在一份计划的当前阶段里，取第一份命中即可。
+        // 命令回执不同：**同一条命令可能被多份 wparse 计划复用**（`publish_reload` 按 body 去重），
+        // 所以要把所有命中这条 `task_id` 的条目都回填完，否则后批准的那份会永远停在 `dispatched`。
+        if matches!(filter, PlanActionFilter::GatewayExecuted) {
+            return Ok(());
+        }
     }
     Ok(())
+}
+
+/// 入队前一次性备齐的东西：`None` 表示这份计划根本不需要入队（已收尾 / 无阶段）。
+///
+/// 拆出来是为了让调用方能把「校验」与「落库」「入队」按正确顺序编排：
+/// **先校验 → 再落库成 `rolling` → 再入队 → 再回写条目**。
+/// 顺序不能反：命令一旦进队列，gwlinkd 随时会取走并回执；如果那一刻计划还停在 `draft`，
+/// 回执回来就找不到可回填的 `rolling` 计划（`reconcile_*` 只认 rolling），
+/// 现场就成了「实际重载了，中心显示没发」。
+pub(super) struct WparseDispatch {
+    proxy: std::sync::Arc<crate::wparse_proxy::WparseProxy>,
+    group: String,
+    tag: String,
+    reason: String,
+}
+
+/// 「现在能不能给这份计划入队」—— **不落库、不入队**，失败时调用方可以原地退回。
+pub(super) fn prepare_wparse_dispatch(
+    state: &ApiState,
+    plan: &UpgradePlanRecord,
+) -> Result<Option<WparseDispatch>, String> {
+    // 末阶段被「推进」收尾后 `current_phase` 仍指向那一段，不挡就会把已跑完的目标再发一遍。
+    if plan.status != "rolling" {
+        return Ok(None);
+    }
+    let idx = plan.current_phase as usize;
+    if idx == 0 || idx > plan.phases.len() {
+        return Ok(None);
+    }
+    let Some(proxy) = state.proxy.as_ref() else {
+        return Err("wparse proxy is not enabled on this center".to_string());
+    };
+    let (repo_name, tag) = first_upgrade_target(&plan.spec)
+        .ok_or_else(|| format!("plan {} has no readable target", plan.plan_id))?;
+    let Some(repo) = state
+        .config
+        .wparse_release
+        .repos
+        .iter()
+        .find(|item| item.name == repo_name)
+    else {
+        return Err(format!(
+            "repo {repo_name} is no longer configured on this center"
+        ));
+    };
+    Ok(Some(WparseDispatch {
+        proxy: proxy.clone(),
+        group: repo.group.clone(),
+        tag,
+        reason: wparse_release_reason(&plan.spec)
+            .unwrap_or_else(|| format!("plan {}", plan.plan_id)),
+    }))
+}
+
+/// 把「当前阶段」的目标真正投进 `wparse-proxy` 命令队列（只改内存里的 `plan`，不落库、不报错）。
+///
+/// 单台入队失败（队列满 / 存储错）只把那一台标 `failed`：批准已经生效，不该因为一台发不出去
+/// 就把整份计划退回 —— 后续用「重试」重派即可。
+pub(super) async fn enqueue_wparse_phase(plan: &mut UpgradePlanRecord, dispatch: &WparseDispatch) {
+    let idx = plan.current_phase as usize;
+    if idx == 0 || idx > plan.phases.len() {
+        return;
+    }
+    let gateway_ids = plan.phases[idx - 1].gateway_ids.clone();
+    let mut queued = 0usize;
+    let mut failed = 0usize;
+    for gateway_id in gateway_ids {
+        let outcome = dispatch
+            .proxy
+            .publish_reload(
+                &gateway_id,
+                &dispatch.group,
+                &dispatch.tag,
+                &dispatch.reason,
+                15_000,
+            )
+            .await;
+        let Some(entry) = plan
+            .entries
+            .iter_mut()
+            .find(|entry| entry.gateway_id == gateway_id)
+        else {
+            continue;
+        };
+        entry.updated_at = DateTime::now();
+        match outcome {
+            Ok(enqueued) => {
+                queued += 1;
+                entry.status = "dispatched".to_string();
+                entry.task_id = Some(enqueued.command_id);
+                entry.detail = if enqueued.reused {
+                    "命令已在队列中（复用）".to_string()
+                } else {
+                    "已入队，等待网关执行".to_string()
+                };
+            }
+            Err(err) => {
+                failed += 1;
+                log::warn!(
+                    "event=WparseReleaseEnqueueFailed plan_id={} gateway_id={} err={}",
+                    plan.plan_id,
+                    gateway_id,
+                    err
+                );
+                entry.status = "failed".to_string();
+                entry.detail = format!("入队失败：{err}");
+            }
+        }
+    }
+    log::info!(
+        "event=WparseReleaseDispatched plan_id={} group={} tag={} phase={} queued={} failed={}",
+        plan.plan_id,
+        dispatch.group,
+        dispatch.tag,
+        plan.current_phase,
+        queued,
+        failed
+    );
+}
+
+/// `wparse-release` 的批准 / 推进 / 重试落库：**先校验 → 先存 rolling → 入队 → 再存条目**。
+///
+/// 只在 `wparse-release` 计划上调用（其它动作由网关自己拉，中心不物化）。
+#[allow(clippy::result_large_err)] // 与全仓一致：错误直接是可响应的 `ApiError`。
+pub(super) async fn persist_and_dispatch_wparse(
+    state: &ApiState,
+    plan: &mut UpgradePlanRecord,
+) -> Result<(), ApiError> {
+    // 校验在**第一次落库之前**：仓库被删 / proxy 关了这类错，计划应原地留在 `draft`。
+    let dispatch = prepare_wparse_dispatch(state, plan)
+        .map_err(|message| ApiError::unavailable(codes::WPARSE_PLAN_DISPATCH_FAILED, message))?;
+    store_plan(state, plan).await?;
+    let Some(dispatch) = dispatch else {
+        return Ok(());
+    };
+    enqueue_wparse_phase(plan, &dispatch).await;
+    store_plan(state, plan).await
+}
+
+/// 计划落库（失败时统一折成 `rollout_plan_store_failed`，便于现场排障）。
+#[allow(clippy::result_large_err)] // 同上。
+async fn store_plan(state: &ApiState, plan: &UpgradePlanRecord) -> Result<(), ApiError> {
+    state.store.save_upgrade_plan(plan).await.map_err(|err| {
+        ApiError::internal(
+            codes::ROLLOUT_PLAN_STORE_FAILED,
+            "failed to store rollout plan",
+            err.display_chain(),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -1093,5 +1380,49 @@ mod tests {
         // 非 rolling → 不可推进。
         plan.status = "completed".to_string();
         assert!(advance_gate_blocker(&plan).is_some());
+    }
+
+    #[test]
+    fn gateway_never_executes_wparse_release_plans() {
+        // 中心执行的动作不能让网关拉：否则 gwlinkd 会把 `wparse-rules` 当组件去装。
+        assert!(!gateway_executes(ACTION_WPARSE_RELEASE));
+        for action in [
+            wist_control::ACTION_UPGRADE,
+            wist_control::ACTION_PUSH_AGENT_PACKAGE,
+            wist_control::ACTION_PUSH_KNOWLEDGE_PACKAGE,
+        ] {
+            assert!(gateway_executes(action), "{action} 应由网关执行");
+        }
+    }
+
+    #[test]
+    fn wparse_release_spec_round_trips_through_the_plan() {
+        // 与其它动作同形（`targets[].component` + `target_version`），额外带 `reason`；
+        // 建计划时要能过 `validate_target_spec`，下发时要能反解出 repo / tag。
+        let spec = wparse_release_spec("wparse-rules", "v1.0.7", Some("8e36b594"), "plan-xyz");
+        let mut request = request(&["gw-001"], 1);
+        request.action = ACTION_WPARSE_RELEASE.to_string();
+        request.spec = spec.clone();
+        let plan = build_plan(&request).expect("wparse-release plan builds");
+        assert_eq!(plan.action, ACTION_WPARSE_RELEASE);
+        assert_eq!(
+            first_upgrade_target(&plan.spec),
+            Some(("wparse-rules".to_string(), "v1.0.7".to_string()))
+        );
+        assert_eq!(
+            wparse_release_reason(&plan.spec).as_deref(),
+            Some("plan-xyz")
+        );
+        // 单阶段：批准即全量，不需要灰度阶梯。
+        assert_eq!(plan.phases.len(), 1);
+    }
+
+    #[test]
+    fn wparse_release_refuses_an_empty_version() {
+        // 与其它动作同一道门槛：没有版本就派生不出目标，建的时候就拒。
+        let mut request = request(&["gw-001"], 1);
+        request.action = ACTION_WPARSE_RELEASE.to_string();
+        request.spec = wparse_release_spec("wparse-infra", "", None, "manual");
+        assert!(build_plan(&request).is_err());
     }
 }
