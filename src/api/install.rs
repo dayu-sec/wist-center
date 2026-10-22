@@ -514,6 +514,10 @@ else
   if [ "$(id -u)" != "0" ]; then RUN_AS_OPT="--run-as $DEPLOY_USER"; fi
   $SUDO "$GWLINKD_BIN" service install --system $RUN_AS_OPT --bin "$GWLINKD_BIN" --config "$GWLINKD_TOML" --pub-config "$GWLINKD_PUB" --force
   $SUDO "$GWLINKD_BIN" service status --system || true
+  # 自检（只提示，不阻断）：安装 / 升级完立刻把「信任锚 / 中心可达 / 环回面」的问题摆出来。
+  # 信任锚是**现场值**（identity/gwlinkd/.env），站点搬过目录时可能还指着旧路径 —— 这里能直接看到 FAIL。
+  log '自检：wist-gwlinkd diagnose'
+  "$GWLINKD_BIN" diagnose 2>&1 | sed 's/^/  /' || true
   log "wist-gwlinkd 已安装并常驻（user=${DEPLOY_USER}，config=${GWLINKD_TOML}，pub=${GWLINKD_PUB}）；到网关页「链接上级」完成接入（gateway_id=${GATEWAY_ID}）"
 fi
 
@@ -1401,6 +1405,10 @@ RUN_AS_OPT=''
 if [ "$(id -u)" != "0" ]; then RUN_AS_OPT="--run-as $DEPLOY_USER"; fi
 $SUDO "$GWLINKD_BIN" service install --system $RUN_AS_OPT --bin "$GWLINKD_BIN" --config "$GWLINKD_TOML" --pub-config "$GWLINKD_PUB" --force
 $SUDO "$GWLINKD_BIN" service status --system || true
+# 自检（只提示，不阻断）：安装 / 升级完立刻把「信任锚 / 中心可达 / 环回面」的问题摆出来。
+# 信任锚是**现场值**（identity/gwlinkd/.env），站点搬过目录时可能还指着旧路径 —— 这里能直接看到 FAIL。
+log '自检：wist-gwlinkd diagnose'
+"$GWLINKD_BIN" diagnose 2>&1 | sed 's/^/  /' || true
 log "wist-gwlinkd 已安装并常驻（user=${DEPLOY_USER}，config=${GWLINKD_TOML}，pub=${GWLINKD_PUB}）；到网关页「链接上级」完成接入（gateway_id=${GATEWAY_ID}）"
 log '完成。'
 "#;
