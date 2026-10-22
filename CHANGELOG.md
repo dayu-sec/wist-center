@@ -5,6 +5,34 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.21.0-alpha] - 2026-10-22
+
+### 新增
+
+- **规则 / 配置发布纳入统一审批**：`POST /api/v1/admin/wparse/repos/{name}/publish` 不再直接下发，
+  改为在中心落一份 `action = wparse-release` 的单阶段 `draft` 发布计划（`201` 返回 `plan`）；
+  操作员在「发布执行」页批准（`POST /api/v1/admin/rollout-plans/approve`）后，中心才逐台经
+  wparse-proxy 入队，并把命令结果回填到计划条目。
+- **发布计划「重试」支持该动作**：补跑计划建完即入队，单台失败不影响其它目标。
+- 命令回执会同时回填所有命中该 `command_id` 的条目：`publish_reload` 按 body 去重、同一条命令
+  可能被多份计划复用，避免后批准的计划永远停在 `dispatched`。
+
+### 变更
+
+- `publish` 响应改为 `{ plan, repo, group, tag, commit, tag_verified }`（原先的 `targets` / `errors`
+  已移除）；错误从「部分入队失败」收敛为「建计划失败」或「批准时入队失败」。
+- 批准 / 推进 / 重试的落库顺序固定为**校验 → 落库 `rolling` → 入队 → 回写条目**：
+  仓库被删或 proxy 未启用时计划留在 `draft`，不会出现「已批准但一条命令都没发」。
+
+### 兼容
+
+- **gwlinkd / gateway 零改动**：命令仍是 `kind=proxy` + `POST /admin/v1/reloads/model`，
+  由 gwlinkd 的 `wparse_relay` 原样执行。
+- `wparse-release` 由**中心执行**，网关侧 `GET /api/v1/gateway/upgrade-plan` 会跳过该动作
+  （否则 gwlinkd 会把 `wparse-rules` 当成要升级的组件）。
+- 需要 `[store].database_url`（PostgreSQL）与启用的 `[wparse_proxy]`，与 ①②③ 一致；
+  只读 tag 列表仍可在 proxy 关闭时使用。
+
 ## [0.20.1-alpha] - 2026-10-22
 
 ### 修复
