@@ -71,6 +71,14 @@ pub enum EnqueueError {
     Store(String),
 }
 
+/// 一次 reload 入队的结果。
+#[derive(Debug, Clone)]
+pub struct ReloadEnqueued {
+    pub command_id: String,
+    /// 同 `(gateway, version, group)` 已有在飞命令时复用。
+    pub reused: bool,
+}
+
 impl std::fmt::Display for EnqueueError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -597,9 +605,37 @@ impl WparseProxy {
         }))
     }
 
-    /// 幂等：同一 gateway + 同一 `(version, group)` 的 reload 复用 pending/leased 命令。
-    async fn reusable_reload(&self, gateway_id: &str, body: &str) -> ProxyResult<Option<String>> {
-        sqlx::query_scalar::<_, String>(
+    /// 入队一条 reload 命令（**wparse-proxy listener 与管理面发布入口共用**）。
+    ///
+    /// body 形状与 WarpStation 发来的完全一致；gwlinkd 的 relay 只认
+    /// `kind=proxy` + `POST /admin/v1/reloads/model`，不关心调用方是谁。
+    pub async fn publish_reload(
+        &self,
+        gateway_id: &str,
+        group: &str,
+        version: &str,
+        reason: &str,
+        timeout_ms: u64,
+    ) -> Result<ReloadEnqueued, EnqueueError> {
+        let body = reload_body(group, version, reason, timeout_ms);
+        // 同一 gateway + 同一 body 的「查重 + 插入」必须原子：两个并发发布（双击、两个管理员）
+        // 不能各插一条相同 reload。锁随事务结束自动释放，不需要额外表。
+        let lock_key = format!(
+            "gateway_commands:{gateway_id}:reload:{}",
+            crate::infra::sha256_hex(&body)
+        );
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|err| EnqueueError::Store(format!("begin reload enqueue: {err}")))?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(&lock_key)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| EnqueueError::Store(format!("lock reload enqueue: {err}")))?;
+
+        let existing: Option<String> = sqlx::query_scalar(
             "SELECT command_id
                FROM gateway_commands
               WHERE gateway_id = $1 AND method = 'POST' AND path = $2
@@ -609,10 +645,48 @@ impl WparseProxy {
         )
         .bind(gateway_id)
         .bind(RELOAD_PATH)
-        .bind(body)
-        .fetch_optional(&self.pool)
+        .bind(&body)
+        .fetch_optional(&mut *tx)
         .await
-        .map_err(|err| format!("lookup reusable reload: {err}"))
+        .map_err(|err| EnqueueError::Store(format!("find pending reload: {err}")))?;
+        if let Some(command_id) = existing {
+            tx.commit()
+                .await
+                .map_err(|err| EnqueueError::Store(format!("commit reload enqueue: {err}")))?;
+            return Ok(ReloadEnqueued {
+                command_id,
+                reused: true,
+            });
+        }
+
+        let command_id = new_secret_token("cmd").map_err(EnqueueError::Store)?;
+        // 单语句完成「计数 + 插入」：pending/leased 超上限就不插入。
+        let inserted: Option<String> = sqlx::query_scalar(
+            "INSERT INTO gateway_commands
+                 (command_id, gateway_id, method, path, body, state, created_at, updated_at)
+             SELECT $1, $2, 'POST', $3, $4, 'pending', NOW(), NOW()
+              WHERE (SELECT COUNT(*) FROM gateway_commands
+                      WHERE gateway_id = $2 AND state IN ('pending', 'leased')) < $5
+             RETURNING command_id",
+        )
+        .bind(&command_id)
+        .bind(gateway_id)
+        .bind(RELOAD_PATH)
+        .bind(&body)
+        .bind(MAX_PENDING_PER_GATEWAY)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|err| EnqueueError::Store(format!("enqueue reload: {err}")))?;
+        tx.commit()
+            .await
+            .map_err(|err| EnqueueError::Store(format!("commit reload enqueue: {err}")))?;
+        match inserted {
+            Some(id) => Ok(ReloadEnqueued {
+                command_id: id,
+                reused: false,
+            }),
+            None => Err(EnqueueError::QueueFull),
+        }
     }
 
     async fn wait_for(&self, command_id: &str, wait: Duration) -> Option<CommandResult> {
@@ -720,40 +794,54 @@ async fn handle_reload(
         Err((status, code, message)) => return proxy_error(status, code, message),
     };
     // 只把允许的字段转发给 gwlinkd；`wait` 固定 true、超时与代理等待上限对齐。
-    let body = json!({
-        "wait": true,
-        "update": true,
-        "version": version,
-        "group": group,
-        "timeout_ms": input.timeout_ms.unwrap_or(15_000).min(15_000),
-        "reason": input.reason.as_deref().unwrap_or("warpstation publish"),
-    })
-    .to_string();
-
-    let command_id = match proxy.reusable_reload(&gateway_id, &body).await {
-        Ok(Some(existing)) => existing,
-        Ok(None) => match proxy
-            .enqueue(&gateway_id, "POST", RELOAD_PATH, Some(&body))
-            .await
-        {
-            Ok(id) => id,
-            Err(err) => return enqueue_error(err),
-        },
-        Err(err) => return proxy_error(StatusCode::INTERNAL_SERVER_ERROR, "queue_error", &err),
+    let enqueued = match proxy
+        .publish_reload(
+            &gateway_id,
+            group,
+            &version,
+            input.reason.as_deref().unwrap_or("warpstation publish"),
+            input.timeout_ms.unwrap_or(15_000),
+        )
+        .await
+    {
+        Ok(enqueued) => enqueued,
+        Err(err) => return enqueue_error(err),
     };
 
-    match proxy.wait_for(&command_id, RELOAD_WAIT).await {
+    match proxy.wait_for(&enqueued.command_id, RELOAD_WAIT).await {
         Some(result) => upstream_response(result),
         None => (
             StatusCode::ACCEPTED,
             Json(json!({
                 "accepted": true,
-                "request_id": command_id,
+                "request_id": enqueued.command_id,
                 "message": "queued",
             })),
         )
             .into_response(),
     }
+}
+
+/// 发布 tag / version 的合法形状（listener 与管理面入口同一口径）。
+pub(crate) fn valid_release_tag(tag: &str) -> bool {
+    !tag.is_empty()
+        && tag.len() <= 64
+        && tag
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// reload 命令的 body：listener 与管理面发布入口共用同一份形状。
+fn reload_body(group: &str, version: &str, reason: &str, timeout_ms: u64) -> String {
+    json!({
+        "wait": true,
+        "update": true,
+        "version": version,
+        "group": group,
+        "timeout_ms": timeout_ms.min(15_000),
+        "reason": reason,
+    })
+    .to_string()
 }
 
 /// 严格校验 WarpStation 发来的 reload body（字段 / 版本 / group / update）。
@@ -779,12 +867,7 @@ fn validate_reload(
         ));
     }
     let version = input.version.as_deref().unwrap_or_default();
-    if version.is_empty()
-        || version.len() > 64
-        || !version
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-    {
+    if !valid_release_tag(version) {
         return Err((
             StatusCode::BAD_REQUEST,
             "invalid_version",
@@ -1179,31 +1262,32 @@ mod tests {
         let gateway_id = test_gateway("wpx-dedupe");
         cleanup(&proxy, &gateway_id).await;
 
-        let body = r#"{"group":"models","version":"1.0.1"}"#;
-        let command_id = proxy
-            .enqueue(&gateway_id, "POST", RELOAD_PATH, Some(body))
+        let first = proxy
+            .publish_reload(&gateway_id, "models", "1.0.1", "test", 15_000)
             .await
-            .expect("enqueue");
-        assert_eq!(
-            proxy
-                .reusable_reload(&gateway_id, body)
-                .await
-                .expect("lookup")
-                .as_deref(),
-            Some(command_id.as_str())
-        );
+            .expect("publish");
+        assert!(!first.reused);
+
+        // pending → 复用同一条。
+        let second = proxy
+            .publish_reload(&gateway_id, "models", "1.0.1", "test", 15_000)
+            .await
+            .expect("publish again");
+        assert!(second.reused);
+        assert_eq!(first.command_id, second.command_id);
+
+        // leased → 仍复用。
         proxy.lease_command(&gateway_id).await.expect("lease");
-        assert!(
-            proxy
-                .reusable_reload(&gateway_id, body)
-                .await
-                .expect("lookup leased")
-                .is_some()
-        );
+        let third = proxy
+            .publish_reload(&gateway_id, "models", "1.0.1", "test", 15_000)
+            .await
+            .expect("publish while leased");
+        assert!(third.reused);
+        assert_eq!(first.command_id, third.command_id);
 
         proxy
             .complete_command(
-                &command_id,
+                &first.command_id,
                 CommandResult {
                     status_code: 200,
                     body: "{}".to_string(),
@@ -1215,13 +1299,14 @@ mod tests {
             )
             .await
             .expect("complete");
-        assert!(
-            proxy
-                .reusable_reload(&gateway_id, body)
-                .await
-                .expect("lookup done")
-                .is_none()
-        );
+
+        // 终态后不再复用：新发布应拿到新命令。
+        let fourth = proxy
+            .publish_reload(&gateway_id, "models", "1.0.1", "test", 15_000)
+            .await
+            .expect("publish after done");
+        assert!(!fourth.reused);
+        assert_ne!(first.command_id, fourth.command_id);
 
         cleanup(&proxy, &gateway_id).await;
     }

@@ -167,6 +167,50 @@ cos_region = "ap-hongkong"              # optional; when set the virtual-host UR
 `GET /api/v1/admin/package-sources` returns these locations (never credentials). GitHub and COS can
 be configured together; if neither is configured the page falls back to pasting a full URL.
 
+### Rule / config publish entries (`wparse-rules` / `wparse-infra`)
+
+Two admin entries read a repo's tag list and publish a selected tag through the **same**
+`gateway_commands` queue used by the wparse-proxy. gwlinkd's `wparse_relay` executes it with no
+gateway change: the command is still `kind=proxy` + `POST /admin/v1/reloads/model`.
+
+```http
+GET  /api/v1/admin/wparse/repos
+GET  /api/v1/admin/wparse/repos/{name}/tags?limit=100&refresh=false
+POST /api/v1/admin/wparse/repos/{name}/publish
+```
+
+```toml
+[wparse_release]
+enabled = true
+# 0 is rejected; the page uses this TTL before asking the provider again.
+tag_cache_seconds = 60
+# false = the page may only pick a tag from the list.
+allow_manual_tag = false
+max_targets = 20
+
+[[wparse_release.repos]]
+name = "wparse-rules"          # fixed route segment used by the UI
+group = "models"               # models | infra
+provider = "cnb"              # cnb | github | manual
+repo = "dy-sec/jingang-cust/wist/wp-rules"
+token = "${SEC_WP_GIT_PUB_TOKEN}"   # CNB access token needs repo-release:r
+tags_limit = 100
+
+[[wparse_release.repos]]
+name = "wparse-infra"
+group = "infra"
+provider = "cnb"
+repo = "dy-sec/jingang-cust/wist/wp-infra"
+token = "${SEC_WP_GIT_PUB_TOKEN}"
+tags_limit = 100
+```
+
+The tag list is read-only and works even when `[wparse_proxy].enabled = false`; publishing requires
+both `[wparse_release].enabled` and an active wparse-proxy (PostgreSQL). Tokens are never returned by
+the API and are expanded from `${SEC_...}`, so the same `.wist` read token used by the Git Proxy can
+be reused. A successful publish returns `202` with one `command_id` per gateway; poll the existing
+`GET /api/v1/admin/gateways/{gateway_id}/commands/{command_id}` for the terminal state.
+
 ### Environment variables
 
 | Variable | Default | Purpose |

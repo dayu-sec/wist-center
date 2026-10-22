@@ -69,6 +69,7 @@ mod tests {
                     enabled: false,
                     listen_addr: "0.0.0.0:3101".to_string(),
                 },
+                wparse_release: Default::default(),
                 log: Default::default(),
             },
             store: Arc::new(FileStore::new(&store_path)),

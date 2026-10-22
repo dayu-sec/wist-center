@@ -126,6 +126,15 @@ codes! {
     WPARSE_PROXY_TOKEN_ISSUE_FAILED => "wparse_proxy_token_issue_failed",
     WPARSE_PROXY_TOKEN_NOT_FOUND => "wparse_proxy_token_not_found",
     WPARSE_PROXY_UNAVAILABLE => "wparse_proxy_unavailable",
+    WPARSE_RELEASE_DISABLED => "wparse_release_disabled",
+    WPARSE_RELEASE_TARGETS_INVALID => "wparse_release_targets_invalid",
+    WPARSE_REPO_NOT_FOUND => "wparse_repo_not_found",
+    WPARSE_TAG_INVALID => "wparse_tag_invalid",
+    WPARSE_TAG_NOT_FOUND => "wparse_tag_not_found",
+    WPARSE_TAG_SOURCE_RATE_LIMITED => "wparse_tag_source_rate_limited",
+    WPARSE_TAG_SOURCE_UNAUTHORIZED => "wparse_tag_source_unauthorized",
+    WPARSE_TAG_SOURCE_UNAVAILABLE => "wparse_tag_source_unavailable",
+    WPARSE_TAG_VERIFICATION_REQUIRED => "wparse_tag_verification_required",
 }
 
 #[cfg(test)]

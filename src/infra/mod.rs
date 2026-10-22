@@ -16,5 +16,7 @@ pub mod store;
 pub use store::*;
 pub mod tls;
 pub use tls::*;
+pub mod vcs_tags;
+pub use vcs_tags::*;
 pub mod vm;
 pub use vm::*;

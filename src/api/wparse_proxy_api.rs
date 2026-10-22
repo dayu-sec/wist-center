@@ -62,7 +62,7 @@ fn proxy_unavailable() -> Response {
 ///
 /// 返回 `Some(response)` = 直接回给调用方（404/500）；`None` = 前置通过。
 /// 用 `Option` 而不是 `Result<(), Response>`：后者会让 clippy 报 `result_large_err`。
-async fn ensure_gateway_exists(state: &ApiState, gateway_id: &str) -> Option<Response> {
+pub(super) async fn ensure_gateway_exists(state: &ApiState, gateway_id: &str) -> Option<Response> {
     match state.store.get_gateway(gateway_id).await {
         Ok(Some(_)) => None,
         Ok(None) => {

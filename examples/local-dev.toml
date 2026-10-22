@@ -94,6 +94,22 @@ object_storage_secret_key = ""
 # cos_prefix = "wist-agentd"               # 缺省取 github_repo 的末段
 # cos_region = "ap-hongkong"              # 可留空：解析器按候选区逐个探测
 
+# 规则 / 配置发布入口（`wparse-rules` / `wparse-infra`）。
+# 开发态默认关闭；要试 tag 候选 / 发布时打开并按下面示例补 repo。
+[wparse_release]
+enabled = false
+tag_cache_seconds = 60
+allow_manual_tag = false
+max_targets = 20
+#
+# [[wparse_release.repos]]
+# name = "wparse-rules"
+# group = "models"
+# provider = "cnb"
+# repo = "dy-sec/jingang-cust/wist/wp-rules"
+# token = "${SEC_WP_GIT_PUB_TOKEN}"
+# tags_limit = 100
+
 [enrollment]
 # 启动时写进 store（只在缺失时写）的网关种子凭据，每项 `gateway_id:token`。
 # 开发时想省掉"先注册一次"的步骤可以填，例如：

@@ -29,6 +29,7 @@ mod rate_limit;
 mod rollout;
 mod version;
 mod wparse_proxy_api;
+mod wparse_release_api;
 
 /// 网关上报的日志摘要上限（字节）。
 ///
@@ -74,6 +75,9 @@ use gateway_ops::{
 use wparse_proxy_api::{
     admin_command_status, admin_latest_diagnose, admin_restart_gateway, admin_run_diagnose,
     issue_proxy_token, poll_command, report_command_result, revoke_proxy_token,
+};
+use wparse_release_api::{
+    admin_list_wparse_repos, admin_list_wparse_tags, admin_publish_wparse_release,
 };
 
 /// 提取 peer 连接信息（限流按 IP 分桶用；忽略可伪造的 `x-real-ip` / `x-forwarded-for`）。
@@ -389,6 +393,17 @@ pub fn router_for(state: ApiState) -> Router {
         .route(
             "/api/v1/gateway/commands/{command_id}/result",
             post(report_command_result),
+        )
+        // 管理面：规则 / 配置发布入口（wparse-rules / wparse-infra）。
+        // 发布复用 wparse-proxy 的命令队列；gwlinkd relay 原样执行。
+        .route("/api/v1/admin/wparse/repos", get(admin_list_wparse_repos))
+        .route(
+            "/api/v1/admin/wparse/repos/{name}/tags",
+            get(admin_list_wparse_tags),
+        )
+        .route(
+            "/api/v1/admin/wparse/repos/{name}/publish",
+            post(admin_publish_wparse_release),
         )
         // 管理面：触发一次体检 / 取最近一次报告（kind=diagnose 走同一条命令队列）。
         .route(

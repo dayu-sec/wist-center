@@ -88,6 +88,13 @@ const DEV_HMAC_SECRET: &str = "dev-center-hmac-secret-change-me";
 const DEFAULT_CREDENTIAL_TTL_SECONDS: i64 = 30 * 24 * 3600;
 /// 一次性接入券（link）的**短 TTL** 默认值：15 分钟（带外交付 + 现场执行的短窗口）。
 const DEFAULT_LINK_TTL_SECONDS: i64 = 15 * 60;
+/// 规则发布 tag 列表缓存默认值（秒）。
+const DEFAULT_TAG_CACHE_SECONDS: u64 = 60;
+/// 规则发布单次扇出网关数上限。
+const DEFAULT_MAX_TARGETS: usize = 20;
+/// 单次列 tag 的默认上限 / 硬上限。
+const DEFAULT_TAGS_LIMIT: usize = 100;
+const MAX_TAGS_LIMIT: usize = 200;
 
 #[derive(Debug, Clone)]
 pub struct CenterConfig {
@@ -150,8 +157,97 @@ pub struct CenterConfig {
     /// 规则发布兼容入口（WarpStation 设备面）：独立 HTTPS listener + 命令队列。
     /// 见设计文档 §6；需要 `database_url`（FileStore 模式下自动禁用）。
     pub wparse_proxy: WparseProxyConfig,
+    /// 规则 / 配置发布入口（`[wparse_release]`）：两个可配置 repo 的 tag 候选与发布。
+    pub wparse_release: WparseReleaseConfig,
     /// `[log]` 段：本进程运行日志（级别 / 格式 / 落点 / 轮转）。
     pub log: wist_log::LogSection,
+}
+
+/// 规则 / 配置发布入口配置（`[wparse_release]`）。
+///
+/// 与 [`WparseProxyConfig`] 分开：tag 列表是只读能力，proxy 关闭时仍可展示候选；
+/// 真正发布才要求 `[wparse_proxy].enabled = true` 且 `[store].database_url` 可用。
+#[derive(Debug, Clone)]
+pub struct WparseReleaseConfig {
+    pub enabled: bool,
+    /// tag 列表缓存秒数（`0` 视为非法，配置解析时拒绝）。
+    pub tag_cache_seconds: u64,
+    /// 是否允许绕过 tag 列表手填（默认关闭：优先从候选里选）。
+    pub allow_manual_tag: bool,
+    /// 单次发布最多扇出多少台网关。
+    pub max_targets: usize,
+    pub repos: Vec<WparseRepoConfig>,
+}
+
+impl Default for WparseReleaseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tag_cache_seconds: DEFAULT_TAG_CACHE_SECONDS,
+            allow_manual_tag: false,
+            max_targets: DEFAULT_MAX_TARGETS,
+            repos: Vec::new(),
+        }
+    }
+}
+
+/// tag 来源类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagProviderKind {
+    /// CNB OpenAPI（`https://api.cnb.cool/{repo}/-/git/tags`）。
+    Cnb,
+    /// GitHub REST API（`https://api.github.com/repos/{owner}/{repo}/tags`）。
+    Github,
+    /// 不联网：页面只提供手填（需要 `allow_manual_tag = true`）。
+    Manual,
+}
+
+impl TagProviderKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cnb => "cnb",
+            Self::Github => "github",
+            Self::Manual => "manual",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "cnb" => Some(Self::Cnb),
+            "github" => Some(Self::Github),
+            "manual" => Some(Self::Manual),
+            _ => None,
+        }
+    }
+}
+
+/// 一个可发布 repo 的配置。
+#[derive(Clone)]
+pub struct WparseRepoConfig {
+    /// 入口名（路由段 / 前端标识）；固定用 `wparse-rules` / `wparse-infra`。
+    pub name: String,
+    /// reload 的 group：`models` / `infra`。
+    pub group: String,
+    pub provider: TagProviderKind,
+    /// provider 原生标识：CNB 是 `group/.../repo`，GitHub 是 `owner/repo`。
+    pub repo: String,
+    /// 只读 token（CNB 需要 `repo-release:r`）；不返回给前端、不写日志。
+    pub token: Option<String>,
+    /// 单次列 tag 的上限（1..=200）。
+    pub tags_limit: usize,
+}
+
+impl std::fmt::Debug for WparseRepoConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WparseRepoConfig")
+            .field("name", &self.name)
+            .field("group", &self.group)
+            .field("provider", &self.provider)
+            .field("repo", &self.repo)
+            .field("token", &self.token.as_ref().map(|_| "***"))
+            .field("tags_limit", &self.tags_limit)
+            .finish()
+    }
 }
 
 /// 规则发布兼容入口配置（`[wparse_proxy]`）。
@@ -219,6 +315,7 @@ struct RawCenterConfig {
     packages: RawPackagesConfig,
     enrollment: RawEnrollmentConfig,
     wparse_proxy: RawWparseProxyConfig,
+    wparse_release: RawWparseReleaseConfig,
     log: wist_log::LogSection,
 }
 
@@ -287,6 +384,26 @@ struct RawEnrollmentConfig {
 struct RawWparseProxyConfig {
     enabled: Option<bool>,
     listen_addr: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawWparseReleaseConfig {
+    enabled: Option<bool>,
+    tag_cache_seconds: Option<u64>,
+    allow_manual_tag: Option<bool>,
+    max_targets: Option<usize>,
+    #[serde(default)]
+    repos: Vec<RawWparseRepo>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawWparseRepo {
+    name: String,
+    group: String,
+    provider: String,
+    repo: String,
+    token: Option<String>,
+    tags_limit: Option<usize>,
 }
 
 /// 默认配置文件路径：**当前工作目录**下的 `wist-center.toml`（与 gateway 同口径）。
@@ -399,6 +516,7 @@ impl CenterConfig {
         let security = raw.security;
         let artifacts = raw.artifacts;
         let package_sources = normalize_package_sources(raw.packages.sources)?;
+        let wparse_release = normalize_wparse_release(raw.wparse_release)?;
         let admin_token = normalize_optional(serve.admin_token);
         // 对象存储：endpoint/bucket/凭据四项齐全才启用（否则用本地文件）。
         let object_storage = match (
@@ -492,6 +610,7 @@ impl CenterConfig {
                     .listen_addr
                     .unwrap_or_else(|| "0.0.0.0:3101".to_string()),
             },
+            wparse_release,
             log,
         })
     }
@@ -599,6 +718,13 @@ fn expand_raw_env(raw: &mut RawCenterConfig, env: &EnvDict) -> Result<(), Config
     ] {
         if let Some(text) = value.as_ref() {
             *value = Some(expand(env, text)?);
+        }
+    }
+    // 规则发布入口：repo 与 token 都可能写成 `${VAR}`（token 通常是 `${SEC_...}`）。
+    for repo in &mut raw.wparse_release.repos {
+        repo.repo = expand(env, &repo.repo)?;
+        if let Some(token) = repo.token.as_ref() {
+            repo.token = Some(expand(env, token)?);
         }
     }
     Ok(())
@@ -845,6 +971,174 @@ fn trim_trailing_slash(value: String) -> String {
     value.trim_end_matches('/').to_string()
 }
 
+/// 归一化 `[wparse_release]`：入口名唯一、group 只允许 `models|infra`、repo 按 provider 归一。
+///
+/// 这里只做**配置期**校验（不联网、不碰 token）：repo 是否可读、token 是否有
+/// `repo-release:r` 由运行期 tag 接口现测并给出明确错误。
+fn normalize_wparse_release(
+    raw: RawWparseReleaseConfig,
+) -> Result<WparseReleaseConfig, ConfigError> {
+    let enabled = raw.enabled.unwrap_or(false);
+    let tag_cache_seconds = raw.tag_cache_seconds.unwrap_or(DEFAULT_TAG_CACHE_SECONDS);
+    if tag_cache_seconds == 0 {
+        return Err(config_validation(
+            "wparse_release.tag_cache_seconds must be greater than 0",
+        ));
+    }
+    let max_targets = raw.max_targets.unwrap_or(DEFAULT_MAX_TARGETS);
+    if max_targets == 0 {
+        return Err(config_validation(
+            "wparse_release.max_targets must be greater than 0",
+        ));
+    }
+    let allow_manual_tag = raw.allow_manual_tag.unwrap_or(false);
+    let mut repos = Vec::with_capacity(raw.repos.len());
+    let mut seen = HashSet::new();
+    let mut groups = HashSet::new();
+    for item in raw.repos {
+        let name = item.name.trim().to_string();
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        {
+            return Err(config_validation(format!(
+                "wparse_release.repos[].name must match ^[A-Za-z0-9._-]+$: {name:?}"
+            )));
+        }
+        if !seen.insert(name.clone()) {
+            return Err(config_validation(format!(
+                "wparse_release.repos[].name duplicated: {name}"
+            )));
+        }
+        let group = item.group.trim().to_ascii_lowercase();
+        if group != "models" && group != "infra" {
+            return Err(config_validation(format!(
+                "wparse_release.repos[{name}].group must be `models` or `infra`, got {:?}",
+                item.group
+            )));
+        }
+        if !groups.insert(group.clone()) {
+            return Err(config_validation(format!(
+                "wparse_release.repos[].group duplicated: {group} (each reload group can only have one repo)"
+            )));
+        }
+        let provider = TagProviderKind::parse(&item.provider).ok_or_else(|| {
+            config_validation(format!(
+                "wparse_release.repos[{name}].provider must be `cnb`, `github`, or `manual`, got {:?}",
+                item.provider
+            ))
+        })?;
+        if provider == TagProviderKind::Manual && !allow_manual_tag {
+            return Err(config_validation(format!(
+                "wparse_release.repos[{name}].provider = `manual` requires allow_manual_tag = true"
+            )));
+        }
+        let repo = normalize_repo_identifier(provider, &item.repo)?;
+        let tags_limit = item
+            .tags_limit
+            .unwrap_or(DEFAULT_TAGS_LIMIT)
+            .clamp(1, MAX_TAGS_LIMIT);
+        repos.push(WparseRepoConfig {
+            name,
+            group,
+            provider,
+            repo,
+            token: normalize_optional(item.token),
+            tags_limit,
+        });
+    }
+    if enabled && repos.is_empty() {
+        return Err(config_validation(
+            "wparse_release.enabled requires at least one [[wparse_release.repos]]",
+        ));
+    }
+    Ok(WparseReleaseConfig {
+        enabled,
+        tag_cache_seconds,
+        allow_manual_tag,
+        max_targets,
+        repos,
+    })
+}
+
+/// repo 标识归一：接受完整 URL，落成 provider 需要的 slug。
+///
+/// **只剥离匹配 provider 的 host**：`provider=cnb` 配了 GitHub URL 不会被静默接受
+/// （否则后面只会得到“仓库不存在”的 404，很难查）。`manual` 不联网，只做展示用，
+/// 保留原文。
+fn normalize_repo_identifier(provider: TagProviderKind, raw: &str) -> Result<String, ConfigError> {
+    let raw = raw.trim();
+    if provider == TagProviderKind::Manual {
+        if raw.is_empty() {
+            return Err(config_validation(
+                "wparse_release.repos[].repo must not be empty",
+            ));
+        }
+        return Ok(raw.to_string());
+    }
+    let value = match provider {
+        TagProviderKind::Cnb => raw
+            .strip_prefix("https://cnb.cool/")
+            .or_else(|| raw.strip_prefix("http://cnb.cool/")),
+        TagProviderKind::Github => raw
+            .strip_prefix("https://github.com/")
+            .or_else(|| raw.strip_prefix("http://github.com/")),
+        TagProviderKind::Manual => None,
+    }
+    .unwrap_or(raw)
+    .trim_end_matches('/')
+    .trim_end_matches(".git")
+    .to_string();
+    if value.is_empty()
+        || value.contains(char::is_whitespace)
+        || value.contains(['?', '#'])
+        || value.split('/').any(|part| part == "." || part == "..")
+    {
+        return Err(config_validation(format!(
+            "wparse_release.repos[].repo must not be empty / contain whitespace, `?`, `#`, `.` or `..`: {raw:?}"
+        )));
+    }
+    let parts: Vec<&str> = value.split('/').collect();
+    if parts.iter().any(|part| part.is_empty()) {
+        return Err(config_validation(format!(
+            "wparse_release.repos[].repo must not contain empty path segments: {raw:?}"
+        )));
+    }
+    // 带错了宿主（如 provider=cnb 但写 github.com/...）时明确拒绝；否则只会得到 404。
+    let foreign_host = match provider {
+        TagProviderKind::Cnb => {
+            value.starts_with("github.com/") || value.starts_with("gitlab.com/")
+        }
+        TagProviderKind::Github => value.starts_with("cnb.cool/"),
+        TagProviderKind::Manual => false,
+    };
+    if foreign_host {
+        return Err(config_validation(format!(
+            "wparse_release.repos[].repo host does not match provider {}: {raw:?}",
+            provider.as_str()
+        )));
+    }
+    match provider {
+        TagProviderKind::Cnb => {
+            if parts.len() < 2 {
+                return Err(config_validation(format!(
+                    "wparse_release.repos[].repo must be a CNB slug `group/.../repo`: {raw:?}"
+                )));
+            }
+        }
+        TagProviderKind::Github => {
+            if parts.len() != 2 {
+                return Err(config_validation(format!(
+                    "wparse_release.repos[].repo must be `owner/repo` for github: {raw:?}"
+                )));
+            }
+        }
+        TagProviderKind::Manual => unreachable!("manual is handled before URL normalization"),
+    }
+    Ok(value)
+}
+
 /// 归一可选值：去空白后为空 → None。
 fn normalize_optional(raw: Option<String>) -> Option<String> {
     raw.map(|value| value.trim().to_string())
@@ -1006,6 +1300,220 @@ cos_bucket = "github-1347593047"
         assert_eq!(
             config.package_sources[0].cos_prefix.as_deref(),
             Some("wist-agentd")
+        );
+    }
+
+    #[test]
+    fn parses_wparse_release_repos_and_normalizes_urls() {
+        let config = normalize_wparse_release(RawWparseReleaseConfig {
+            enabled: Some(true),
+            tag_cache_seconds: None,
+            allow_manual_tag: Some(true),
+            max_targets: None,
+            repos: vec![
+                RawWparseRepo {
+                    name: "wparse-rules".into(),
+                    group: "MODELS".into(),
+                    provider: "CNB".into(),
+                    repo: "https://cnb.cool/dy-sec/jingang-cust/wist/wp-rules.git".into(),
+                    token: Some("${SEC_TEST_TOKEN}".into()),
+                    tags_limit: None,
+                },
+                RawWparseRepo {
+                    name: "wparse-infra".into(),
+                    group: "infra".into(),
+                    provider: "cnb".into(),
+                    repo: "dy-sec/jingang-cust/wist/wp-infra".into(),
+                    token: None,
+                    tags_limit: Some(9999),
+                },
+            ],
+        })
+        .expect("wparse release");
+        assert!(config.enabled);
+        assert!(config.allow_manual_tag);
+        assert_eq!(config.repos.len(), 2);
+        assert_eq!(config.repos[0].name, "wparse-rules");
+        assert_eq!(config.repos[0].group, "models");
+        assert_eq!(config.repos[0].provider, TagProviderKind::Cnb);
+        // 完整 URL / `.git` 后缀都被归一成 API slug。
+        assert_eq!(config.repos[0].repo, "dy-sec/jingang-cust/wist/wp-rules");
+        // tags_limit 夹到硬上限。
+        assert_eq!(config.repos[1].tags_limit, MAX_TAGS_LIMIT);
+    }
+
+    #[test]
+    fn rejects_duplicate_wparse_release_repo_names() {
+        let repo = || RawWparseRepo {
+            name: "wparse-rules".into(),
+            group: "models".into(),
+            provider: "cnb".into(),
+            repo: "a/b".into(),
+            token: None,
+            tags_limit: None,
+        };
+        assert!(
+            normalize_wparse_release(RawWparseReleaseConfig {
+                repos: vec![repo(), repo()],
+                ..Default::default()
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_wparse_release_groups() {
+        let repo = |name: &str| RawWparseRepo {
+            name: name.into(),
+            group: "models".into(),
+            provider: "cnb".into(),
+            repo: "a/b".into(),
+            token: None,
+            tags_limit: None,
+        };
+        assert!(
+            normalize_wparse_release(RawWparseReleaseConfig {
+                repos: vec![repo("wparse-rules"), repo("wparse-rules-2")],
+                ..Default::default()
+            })
+            .is_err(),
+            "two repos must not share a reload group"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_group_or_provider() {
+        let repo = |group: &str, provider: &str| RawWparseRepo {
+            name: "wparse-rules".into(),
+            group: group.into(),
+            provider: provider.into(),
+            repo: "a/b".into(),
+            token: None,
+            tags_limit: None,
+        };
+        for (group, provider) in [("rules", "cnb"), ("models", "svn")] {
+            assert!(
+                normalize_wparse_release(RawWparseReleaseConfig {
+                    repos: vec![repo(group, provider)],
+                    ..Default::default()
+                })
+                .is_err(),
+                "group={group} provider={provider} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_repo_host_that_does_not_match_provider() {
+        let repo = |provider: &str, repo: &str| RawWparseRepo {
+            name: "wparse-rules".into(),
+            group: "models".into(),
+            provider: provider.into(),
+            repo: repo.into(),
+            token: None,
+            tags_limit: None,
+        };
+        for (provider, repo_url) in [
+            ("cnb", "github.com/dayu-sec/wp-rules"),
+            ("github", "cnb.cool/dy-sec/jingang-cust/wist/wp-rules"),
+        ] {
+            assert!(
+                normalize_wparse_release(RawWparseReleaseConfig {
+                    repos: vec![repo(provider, repo_url)],
+                    ..Default::default()
+                })
+                .is_err(),
+                "provider={provider} repo={repo_url} should be rejected"
+            );
+        }
+        // manual 只做展示：保留原文，只要求非空。
+        assert!(
+            normalize_wparse_release(RawWparseReleaseConfig {
+                allow_manual_tag: Some(true),
+                repos: vec![repo(
+                    "manual",
+                    "https://cnb.cool/dy-sec/jingang-cust/wist/wp-rules"
+                )],
+                ..Default::default()
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn manual_provider_requires_allow_manual_tag() {
+        let raw = || RawWparseReleaseConfig {
+            allow_manual_tag: Some(false),
+            repos: vec![RawWparseRepo {
+                name: "wparse-rules".into(),
+                group: "models".into(),
+                provider: "manual".into(),
+                repo: "dy-sec/jingang-cust/wist/wp-rules".into(),
+                token: None,
+                tags_limit: None,
+            }],
+            ..Default::default()
+        };
+        assert!(normalize_wparse_release(raw()).is_err());
+        let mut allowed = raw();
+        allowed.allow_manual_tag = Some(true);
+        assert!(normalize_wparse_release(allowed).is_ok());
+    }
+
+    #[test]
+    fn wparse_release_enabled_requires_repos() {
+        assert!(
+            normalize_wparse_release(RawWparseReleaseConfig {
+                enabled: Some(true),
+                ..Default::default()
+            })
+            .is_err()
+        );
+        assert!(
+            normalize_wparse_release(RawWparseReleaseConfig {
+                enabled: Some(false),
+                ..Default::default()
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn wparse_repo_debug_redacts_token() {
+        let repo = WparseRepoConfig {
+            name: "wparse-rules".into(),
+            group: "models".into(),
+            provider: TagProviderKind::Cnb,
+            repo: "a/b".into(),
+            token: Some("super-secret".into()),
+            tags_limit: 100,
+        };
+        let rendered = format!("{repo:?}");
+        assert!(!rendered.contains("super-secret"), "{rendered}");
+        assert!(rendered.contains("***"), "{rendered}");
+    }
+
+    #[test]
+    fn loads_wparse_release_from_file() {
+        let path = write_temp_config(
+            r#"
+[wparse_release]
+enabled = true
+allow_manual_tag = true
+
+[[wparse_release.repos]]
+name = "wparse-rules"
+group = "models"
+provider = "manual"
+repo = "dy-sec/jingang-cust/wist/wp-rules"
+"#,
+        );
+        let config = CenterConfig::load_from_path(&path).expect("config loads");
+        assert!(config.wparse_release.enabled);
+        assert_eq!(config.wparse_release.repos.len(), 1);
+        assert_eq!(
+            config.wparse_release.repos[0].provider,
+            TagProviderKind::Manual
         );
     }
 

@@ -72,6 +72,35 @@ object_storage_secret_key = ""
 # cos_prefix = "wist-agentd"               # 缺省取 github_repo 的末段
 # cos_region = "ap-hongkong"              # 可留空：解析器按候选区逐个探测
 
+# 规则 / 配置发布入口（`wparse-rules` / `wparse-infra`）。
+# tag 列表是只读能力；真正发布要求 [wparse_proxy].enabled = true 且 [store].database_url 可用。
+#
+# provider：`cnb`（CNB OpenAPI）/ `github`（GitHub REST）/ `manual`（断网现场只手填）。
+# token 只从 `${SEC_...}` 解析（推荐复用 .wist 的 wp_git_pub_token；CNB 需 repo-release:r）；
+# 不返回给前端、不写日志。
+[wparse_release]
+enabled = false
+# tag 列表缓存秒数；allow_manual_tag = false 时页面只能从候选里选。
+tag_cache_seconds = 60
+allow_manual_tag = false
+max_targets = 20
+#
+# [[wparse_release.repos]]
+# name = "wparse-rules"
+# group = "models"
+# provider = "cnb"
+# repo = "dy-sec/jingang-cust/wist/wp-rules"
+# token = "${SEC_WP_GIT_PUB_TOKEN}"
+# tags_limit = 100
+#
+# [[wparse_release.repos]]
+# name = "wparse-infra"
+# group = "infra"
+# provider = "cnb"
+# repo = "dy-sec/jingang-cust/wist/wp-infra"
+# token = "${SEC_WP_GIT_PUB_TOKEN}"
+# tags_limit = 100
+
 [enrollment]
 # 启动时写入 store（仅缺失时写入）的网关种子凭据，每项 `gateway_id:token`。
 # 例：gateway_credentials = ["gw-demo:change-me"]
