@@ -617,6 +617,10 @@ impl WparseProxy {
         reason: &str,
         timeout_ms: u64,
     ) -> Result<ReloadEnqueued, EnqueueError> {
+        // wparse 的 `version` 字段是**版本号**（不带 `v`），它会自己解析 `refs/tags/vX.Y.Z`。
+        // WarpStation 调用前已经 strip；Center 直接发 tag 时必须在这里归一，否则 wparse 会报
+        // `requested version 'vX.Y.Z' was not found`。
+        let version = normalize_reload_version(version);
         let body = reload_body(group, version, reason, timeout_ms);
         // 同一 gateway + 同一 body 的「查重 + 插入」必须原子：两个并发发布（双击、两个管理员）
         // 不能各插一条相同 reload。锁随事务结束自动释放，不需要额外表。
@@ -820,6 +824,16 @@ async fn handle_reload(
         )
             .into_response(),
     }
+}
+
+/// wparse 期望的 reload `version`：去掉单个前导 `v`/`V`，其余原样。
+///
+/// `v` 单独一个字符时保留（不能归一成空串）；非 `v` 开头的 tag（如 `release_2026.10`）原样。
+pub(crate) fn normalize_reload_version(version: &str) -> &str {
+    version
+        .strip_prefix(['v', 'V'])
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(version)
 }
 
 /// 发布 tag / version 的合法形状（listener 与管理面入口同一口径）。
@@ -1063,6 +1077,19 @@ mod tests {
             timeout_ms: None,
             reason: None,
         }
+    }
+
+    #[test]
+    fn reload_version_strips_a_single_v_prefix() {
+        assert_eq!(normalize_reload_version("v1.0.7"), "1.0.7");
+        assert_eq!(normalize_reload_version("V1.0.7"), "1.0.7");
+        assert_eq!(normalize_reload_version("1.0.7"), "1.0.7");
+        // 非 v 开头的 tag 原样；单独一个 `v` 也不能归一成空串。
+        assert_eq!(
+            normalize_reload_version("release_2026.10"),
+            "release_2026.10"
+        );
+        assert_eq!(normalize_reload_version("v"), "v");
     }
 
     #[test]
