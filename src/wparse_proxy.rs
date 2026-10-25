@@ -63,6 +63,8 @@ pub const KIND_DIAGNOSE: &str = "diagnose";
 pub const KIND_RESTART_GATEWAY: &str = "restart-gateway";
 /// 命令类型：重启 gwlinkd 自己（服务管理器拉起，先回执后重启）。
 pub const KIND_RESTART_GWLINKD: &str = "restart-gwlinkd";
+/// 命令类型：绑定业务身份（gwlinkd 落盘 `tenant_id` / `revision`）。
+pub const KIND_BIND_TENANT: &str = "bind-tenant";
 
 /// 入队失败：队列满（429）与存储错误（500）必须区分。
 #[derive(Debug)]
@@ -382,6 +384,19 @@ impl WparseProxy {
         .map_err(|err| format!("load command owner: {err}"))
     }
 
+    /// 命令的 kind 与 body：回执侧据此把 `bind-tenant` 的失败写回绑定记录。
+    pub async fn command_meta(
+        &self,
+        command_id: &str,
+    ) -> ProxyResult<Option<(String, Option<String>)>> {
+        let row = sqlx::query("SELECT kind, body FROM gateway_commands WHERE command_id = $1")
+            .bind(command_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|err| format!("load command meta: {err}"))?;
+        Ok(row.map(|row| (row.get("kind"), row.get("body"))))
+    }
+
     /// 写回结果并唤醒所有等待该命令的 HTTP 请求。
     pub async fn complete_command(
         &self,
@@ -474,14 +489,25 @@ impl WparseProxy {
         }
     }
 
-    /// 入队一条**控制类**命令（体检）。
+    /// 入队一条**控制类**命令（体检 / 重启 / 绑定身份）。
     ///
-    /// 幂等：同 gateway + 同 kind 已有 pending/leased 的命令时直接复用（连点两次不会跑两次）。
-    /// 控制类命令不带 `method` / `path` / `body` —— 执行细则在 gwlinkd 侧（配置驱动）。
+    /// 幂等：同 gateway + 同 kind + 同 body 已有 pending/leased 的命令时直接复用
+    /// （连点两次不会跑两次；换绑因 body 里的 revision 变化而不会误复用）。
+    /// 控制类命令不带 `method` / `path`；执行细则在 gwlinkd 侧（配置驱动）。
     pub async fn enqueue_control(
         &self,
         gateway_id: &str,
         kind: &str,
+    ) -> Result<(String, bool), EnqueueError> {
+        self.enqueue_control_with_body(gateway_id, kind, None).await
+    }
+
+    /// 同 [`Self::enqueue_control`]，但可带 JSON body（`bind-tenant` 用）。
+    pub async fn enqueue_control_with_body(
+        &self,
+        gateway_id: &str,
+        kind: &str,
+        body: Option<&str>,
     ) -> Result<(String, bool), EnqueueError> {
         // 同一 (gateway, kind) 的“查重 + 插入”必须原子：两个并发点击不能各插一条。
         // 用事务级 advisory lock（锁随事务结束自动释放，不需要维护额外表）。
@@ -501,11 +527,13 @@ impl WparseProxy {
             "SELECT command_id
                FROM gateway_commands
               WHERE gateway_id = $1 AND kind = $2 AND state IN ('pending', 'leased')
+                AND (body IS NOT DISTINCT FROM $3)
               ORDER BY created_at
               LIMIT 1",
         )
         .bind(gateway_id)
         .bind(kind)
+        .bind(body)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|err| EnqueueError::Store(format!("find pending control command: {err}")))?;
@@ -521,14 +549,15 @@ impl WparseProxy {
         let inserted: Option<String> = sqlx::query_scalar(
             "INSERT INTO gateway_commands
                  (command_id, gateway_id, kind, method, path, body, state, created_at, updated_at)
-             SELECT $1, $2, $3, '', '', NULL, 'pending', NOW(), NOW()
+             SELECT $1, $2, $3, '', '', $4, 'pending', NOW(), NOW()
               WHERE (SELECT COUNT(*) FROM gateway_commands
-                      WHERE gateway_id = $2 AND state IN ('pending', 'leased')) < $4
+                      WHERE gateway_id = $2 AND state IN ('pending', 'leased')) < $5
              RETURNING command_id",
         )
         .bind(&command_id)
         .bind(gateway_id)
         .bind(kind)
+        .bind(body)
         .bind(MAX_PENDING_PER_GATEWAY)
         .fetch_optional(&mut *tx)
         .await
@@ -1659,6 +1688,60 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(body_text(response).await.contains("queue_full"));
+
+        cleanup(&proxy, &gateway_id).await;
+    }
+
+    /// 控制命令去重键必须包含 body：换绑（同 kind、不同 tenant/revision）不能被“同 kind 复用”吃掉。
+    /// 需本地 PostgreSQL。
+    ///
+    /// 运行：`cargo test -p wist-center -- --ignored enqueue_control_with_body_dedupes_by_body`
+    #[tokio::test]
+    #[ignore = "需要本地 PostgreSQL（docker compose up -d postgres）"]
+    async fn enqueue_control_with_body_dedupes_by_body() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let database_url = std::env::var("WARP_INSIGHT_CENTER_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://demo:demo@127.0.0.1:55432/insight_demo".to_string());
+        let proxy = WparseProxy::connect(&database_url).await.expect("connect");
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let gateway_id = format!("pg-cmd-{nanos}");
+
+        let body_a = r#"{"tenant_id":"tenant-a","revision":1}"#;
+        let (first, reused) = proxy
+            .enqueue_control_with_body(&gateway_id, KIND_BIND_TENANT, Some(body_a))
+            .await
+            .expect("enqueue first");
+        assert!(!reused);
+
+        // 同 body → 复用（幂等），不出第二条。
+        let (same, reused) = proxy
+            .enqueue_control_with_body(&gateway_id, KIND_BIND_TENANT, Some(body_a))
+            .await
+            .expect("enqueue same");
+        assert!(reused);
+        assert_eq!(same, first);
+
+        // 换绑（不同 body）→ **新命令**，不能复用上一条。
+        let body_b = r#"{"tenant_id":"tenant-b","revision":2}"#;
+        let (second, reused) = proxy
+            .enqueue_control_with_body(&gateway_id, KIND_BIND_TENANT, Some(body_b))
+            .await
+            .expect("enqueue rebind");
+        assert!(!reused);
+        assert_ne!(second, first);
+
+        // 命令元信息可读（回执侧据此把 bind-tenant 失败写回绑定）。
+        let (kind, body) = proxy
+            .command_meta(&second)
+            .await
+            .expect("meta")
+            .expect("command exists");
+        assert_eq!(kind, KIND_BIND_TENANT);
+        assert_eq!(body.as_deref(), Some(body_b));
 
         cleanup(&proxy, &gateway_id).await;
     }

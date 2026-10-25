@@ -10,12 +10,12 @@ use axum::{
 
 use wist_control::{
     ACTION_PUSH_AGENT_PACKAGE, ACTION_PUSH_KNOWLEDGE_PACKAGE, AgentStatusAcceptedReturned,
-    DateTime, GatewayCredentialBundle, GatewayCredentialVerificationResult,
-    GatewayEnrollmentResult, GatewayInitialConfig, GatewayInitializationStatus,
-    GatewayInstanceLifecycleState, GatewayStatusAccepted, GatewayUpgradePlan,
-    GatewayUpgradeResultAccepted, QueryGatewayInitializationStatus, RegisterGateway,
-    RenewGatewayCredential, ReportAgentStatus, ReportGatewayStatus, ReportGatewayUpgradeResult,
-    VerifyGatewayCredential,
+    DateTime, DesiredBusinessIdentity, GatewayCredentialBundle,
+    GatewayCredentialVerificationResult, GatewayEnrollmentResult, GatewayInitialConfig,
+    GatewayInitializationStatus, GatewayInstanceLifecycleState, GatewayStatusAccepted,
+    GatewayUpgradePlan, GatewayUpgradeResultAccepted, QueryGatewayInitializationStatus,
+    RegisterGateway, RenewGatewayCredential, ReportAgentStatus, ReportGatewayStatus,
+    ReportGatewayUpgradeResult, VerifyGatewayCredential,
 };
 
 use crate::infra::{
@@ -733,8 +733,20 @@ pub async fn get_gateway_initial_config(
                 .flatten()
                 .map(|token| token.token_id)
                 .unwrap_or_default();
-            let config =
-                build_initial_config_json(&state, &gateway, gateway_id, &enrollment_token_id);
+            let binding = match state.store.get_customer_binding(gateway_id).await {
+                Ok(binding) => binding,
+                Err(err) => {
+                    log::warn!("load customer binding failed: {}", err.display_chain());
+                    None
+                }
+            };
+            let config = build_initial_config_json(
+                &state,
+                &gateway,
+                gateway_id,
+                &enrollment_token_id,
+                binding.as_ref(),
+            );
             // 配置类响应 → `no-store`（本路径无一次性明文凭据，仍不缓存）。
             super::error::json_no_store(InitialConfigReturned {
                 config,
@@ -832,7 +844,20 @@ async fn provision_gateway_initial_config(
         log::warn!("mark gateway initializing failed: {}", err.display_chain());
     }
     rate_limit::clear_auth_failures(state, client_key, GATEWAY_AUTH_SCOPE);
-    let config = build_initial_config_json(state, gateway, gateway_id, &enrollment.token_id);
+    let binding = match state.store.get_customer_binding(gateway_id).await {
+        Ok(binding) => binding,
+        Err(err) => {
+            log::warn!("load customer binding failed: {}", err.display_chain());
+            None
+        }
+    };
+    let config = build_initial_config_json(
+        state,
+        gateway,
+        gateway_id,
+        &enrollment.token_id,
+        binding.as_ref(),
+    );
     // 含一次性 RegistToken 明文 → `no-store`。
     super::error::json_no_store(InitialConfigReturned {
         config,
@@ -855,7 +880,22 @@ fn build_initial_config_json(
     gateway: &StoredGateway,
     gateway_id: &str,
     enrollment_token_id: &str,
+    binding: Option<&crate::infra::GatewayCustomerBindingRecord>,
 ) -> GatewayInitialConfig {
+    // 历史脏值（早于 tag-safe 校验写入的绑定）**不下发**：gwlinkd 会拒绝，且中心无从得知。
+    let (tenant_id, binding_revision) = match binding {
+        Some(binding) if super::is_tag_safe(&binding.customer_id) => {
+            (Some(binding.customer_id.clone()), Some(binding.revision))
+        }
+        Some(binding) => {
+            log::warn!(
+                "event=GatewayInitialConfigIdentitySkipped gateway_id={} reason=unsafe_tenant_id",
+                binding.gateway_id
+            );
+            (None, None)
+        }
+        None => (None, None),
+    };
     GatewayInitialConfig {
         gateway_id: gateway.gateway_id.clone(),
         control_center_endpoint: state.config.public_url.trim_end_matches('/').to_string(),
@@ -863,6 +903,8 @@ fn build_initial_config_json(
         server_tls_required: control_center_tls_required(&state.config),
         protocol_version: state.config.protocol_version.clone(),
         enrollment_token_id: enrollment_token_id.to_string(),
+        tenant_id,
+        binding_revision,
     }
 }
 
@@ -922,6 +964,59 @@ pub async fn submit_gateway_status(
                     err.display_chain(),
                 );
             }
+            // 业务身份回执：网关自报的 tenant_id / revision 只作“已生效/漂移”证据，
+            // 权威值仍是中心绑定表的 customer_id。非法/超长值不落库（只告警），
+            // 写失败也只告警，不影响状态上报。
+            if let (Some(tenant_id), Some(revision)) =
+                (input.tenant_id.as_deref(), input.binding_revision)
+            {
+                if super::is_tag_safe(tenant_id) {
+                    if let Err(err) = state
+                        .store
+                        .record_customer_binding_report(&input.gateway_id, tenant_id, revision)
+                        .await
+                    {
+                        log::warn!(
+                            "record customer binding report failed: {}",
+                            err.display_chain()
+                        );
+                    }
+                } else {
+                    log::warn!(
+                        "event=GatewayBindingReportRejected gateway_id={} reason=unsafe_tenant_id",
+                        input.gateway_id
+                    );
+                }
+            }
+            // 期望值补偿：回执带出**中心权威**的业务身份（无绑定 → None）。
+            // 网关据此在命令丢失 / 离线 / 重启后发现本地落后并自行应用（设计 §11.1）；
+            // 历史脏值（未做过 tag-safe 校验前写入的绑定）不下发 —— 否则 gwlinkd 会拒绝且永不自愈。
+            let desired_business_identity = match state
+                .store
+                .get_customer_binding(&input.gateway_id)
+                .await
+            {
+                Ok(binding) => binding.and_then(|binding| {
+                    if !super::is_tag_safe(&binding.customer_id) {
+                        log::warn!(
+                            "event=GatewayBindingDesiredSkipped gateway_id={} reason=unsafe_tenant_id",
+                            binding.gateway_id
+                        );
+                        return None;
+                    }
+                    Some(DesiredBusinessIdentity {
+                        tenant_id: binding.customer_id,
+                        revision: binding.revision,
+                    })
+                }),
+                Err(err) => {
+                    log::warn!(
+                        "load customer binding for status receipt failed: {}",
+                        err.display_chain()
+                    );
+                    None
+                }
+            };
             // 时序历史：配置了 VictoriaMetrics 则推送指标（失败仅告警，不影响上报成功）。
             if let Some(vm_url) = &state.config.victoriametrics_url
                 && let Err(err) =
@@ -935,6 +1030,7 @@ pub async fn submit_gateway_status(
                     gateway_id: input.gateway_id,
                     instance_id: input.instance_id,
                     accepted_at,
+                    desired_business_identity,
                 }),
             )
                 .into_response()
@@ -1476,6 +1572,45 @@ mod tests {
         let returned: GatewayStatusAccepted = serde_json::from_slice(&body).expect("json");
         assert_eq!(returned.gateway_id, "gw-001");
         assert_eq!(returned.instance_id, "inst-1");
+        // 未绑定 → 回执不带期望值（旧中心行为）。
+        assert!(returned.desired_business_identity.is_none());
+    }
+
+    /// 状态回执带**中心权威**期望身份：命令丢失 / 离线时网关据此自补（设计 §11.1）。
+    #[tokio::test]
+    async fn status_receipt_carries_the_desired_business_identity() {
+        let state = test_state();
+        let binding = state
+            .store
+            .bind_gateway_customer("gw-001", "tenant-acme", "test")
+            .await
+            .expect("bind");
+        let response = super::super::router_for(state)
+            .oneshot(with_identity(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/gateway/status")
+                    .header("content-type", "application/json")
+                    .body(Body::from(status_payload("gw-001")))
+                    .expect("request"),
+                client_identity("gw-001", TEST_FINGERPRINT),
+            ))
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let returned: GatewayStatusAccepted = serde_json::from_slice(&body).expect("json");
+        let desired = returned
+            .desired_business_identity
+            .expect("回执应带期望业务身份");
+        assert_eq!(desired.tenant_id, "tenant-acme");
+        assert_eq!(desired.revision, binding.revision);
     }
 
     #[tokio::test]

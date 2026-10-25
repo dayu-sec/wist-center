@@ -4196,7 +4196,7 @@ dependencies = [
 
 [[package]]
 name = "wist-center"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "async-trait",
  "aws-sdk-s3",
@@ -4248,9 +4248,9 @@ dependencies = [
 
 [[package]]
 name = "wist-control"
-version = "0.17.0"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5514bfe61f1307b892a4c40efb2fa96438941d841cb96bf2c25e3fd57c115333"
+checksum = "72f427367498cf68596c78841d34b3e0306f05ca1b769214c81b883e102b7290"
 dependencies = [
  "chrono",
  "jumo-derive",

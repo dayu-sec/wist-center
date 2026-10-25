@@ -211,6 +211,28 @@ pub async fn report_command_result(
                 // 回填失败不该把「命令已经完成」这件事退回去：网关侧确实做完了。
                 log::warn!("event=WparsePlanReconcileFailed command_id={command_id} err={err}");
             }
+            // `bind-tenant` 失败（写 `.env` / 重启 wparse）→ 把原因写回绑定记录。
+            // 网关只在**已生效**时上报 `binding_revision`，不在这里回写的话，「失败」在管理面不可见。
+            if let Some(error) = snapshot.error.as_deref()
+                && let Ok(Some((kind, body))) = proxy.command_meta(&command_id).await
+                && kind == crate::wparse_proxy::KIND_BIND_TENANT
+            {
+                let revision = body
+                    .as_deref()
+                    .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+                    .and_then(|body| body.get("revision").and_then(|value| value.as_i64()));
+                if let Some(revision) = revision
+                    && let Err(err) = state
+                        .store
+                        .mark_binding_failed(&owner, revision, error)
+                        .await
+                {
+                    log::warn!(
+                        "event=GatewayBindingFailedMarkFailed gateway_id={owner} err={}",
+                        err.display_chain()
+                    );
+                }
+            }
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(false) => ApiError::conflict(

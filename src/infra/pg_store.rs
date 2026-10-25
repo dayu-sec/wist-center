@@ -11,9 +11,10 @@ use wist_error::{StoreError, StoreReason};
 use crate::config::GatewayCredentialSeed;
 
 use super::{
-    EnrollmentTokenIssue, GatewayCustomerBindingRecord, GatewayStatusUpdate, LifecycleEvent,
-    ReleaseRecord, Store, StoredAgent, StoredEnrollmentToken, StoredGateway,
-    StoredGatewayCredentialStatus, UpgradePlanRecord, normalize_upgrade_plan, sha256_hex,
+    EnrollmentTokenIssue, GatewayBindingAuditEvent, GatewayCustomerBindingRecord,
+    GatewayStatusUpdate, LifecycleEvent, ReleaseRecord, Store, StoredAgent, StoredEnrollmentToken,
+    StoredGateway, StoredGatewayCredentialStatus, UpgradePlanRecord, normalize_upgrade_plan,
+    sha256_hex,
 };
 
 #[derive(Debug, Clone)]
@@ -109,6 +110,30 @@ fn lifecycle_name(state: GatewayInstanceLifecycleState) -> &'static str {
         GatewayInstanceLifecycleState::Initializing => "Initializing",
         GatewayInstanceLifecycleState::Running => "Running",
         GatewayInstanceLifecycleState::Failed => "Failed",
+    }
+}
+
+/// gateway_binding_audit 表行。
+#[derive(Debug, FromRow)]
+struct BindingAuditRow {
+    gateway_id: String,
+    customer_id: String,
+    previous_customer_id: Option<String>,
+    revision: i64,
+    requested_by: String,
+    at: chrono::DateTime<chrono::Utc>,
+}
+
+impl BindingAuditRow {
+    fn into_event(self) -> GatewayBindingAuditEvent {
+        GatewayBindingAuditEvent {
+            gateway_id: self.gateway_id,
+            customer_id: self.customer_id,
+            previous_customer_id: self.previous_customer_id,
+            revision: self.revision,
+            requested_by: self.requested_by,
+            at: DateTime::from_rfc3339(&self.at.to_rfc3339()).unwrap_or_else(DateTime::now),
+        }
     }
 }
 
@@ -926,48 +951,195 @@ impl Store for PgStore {
         &self,
         gateway_id: &str,
         customer_id: &str,
+        requested_by: &str,
     ) -> Result<GatewayCustomerBindingRecord, StoreError> {
         let bound_at = chrono::Utc::now();
-        sqlx::query(
-            "INSERT INTO gateway_customer_bindings (gateway_id, customer_id, status, bound_at) \
-             VALUES ($1, $2, 'bound', $3) \
-             ON CONFLICT (gateway_id) DO UPDATE SET customer_id = $2, status = 'bound', bound_at = $3",
+        // 事务 +行锁：读旧值、改绑定、写审计必须原子，否则并发两次换绑会写出错的 previous。
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .source_raw_err(StoreReason::Sql, "begin bind transaction")?;
+        let previous: Option<String> = sqlx::query_scalar(
+            "SELECT customer_id FROM gateway_customer_bindings WHERE gateway_id = $1 FOR UPDATE",
+        )
+        .bind(gateway_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .source_raw_err(StoreReason::Sql, "lock customer binding")?;
+        // 同客户重绑：revision 不递增、保留 applied 证据，但回到「待生效」（重新下发语义）。
+        let row = sqlx::query(
+            "INSERT INTO gateway_customer_bindings \
+                 (gateway_id, customer_id, status, bound_at, revision) \
+             VALUES ($1, $2, 'bound', $3, 1) \
+             ON CONFLICT (gateway_id) DO UPDATE SET \
+                 customer_id = EXCLUDED.customer_id, \
+                 status = 'bound', \
+                 bound_at = EXCLUDED.bound_at, \
+                 revision = CASE WHEN gateway_customer_bindings.customer_id = EXCLUDED.customer_id \
+                                 THEN gateway_customer_bindings.revision \
+                                 ELSE gateway_customer_bindings.revision + 1 END, \
+                 applied_revision = CASE WHEN gateway_customer_bindings.customer_id = EXCLUDED.customer_id \
+                                         THEN gateway_customer_bindings.applied_revision ELSE NULL END, \
+                 applied_at = CASE WHEN gateway_customer_bindings.customer_id = EXCLUDED.customer_id \
+                                   THEN gateway_customer_bindings.applied_at ELSE NULL END, \
+                 reported_tenant_id = CASE WHEN gateway_customer_bindings.customer_id = EXCLUDED.customer_id \
+                                           THEN gateway_customer_bindings.reported_tenant_id ELSE NULL END, \
+                 last_error = NULL \
+             RETURNING gateway_id, customer_id, status, bound_at, revision, \
+                       applied_revision, applied_at, reported_tenant_id, last_error",
         )
         .bind(gateway_id)
         .bind(customer_id)
         .bind(bound_at)
-        .execute(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .source_raw_err(StoreReason::Sql, "bind gateway customer")?;
-        Ok(GatewayCustomerBindingRecord {
-            gateway_id: gateway_id.to_string(),
-            customer_id: customer_id.to_string(),
-            status: "bound".to_string(),
-            bound_at: DateTime::from_rfc3339(&bound_at.to_rfc3339()).unwrap_or_else(DateTime::now),
-        })
+        let binding = binding_from_row(&row);
+        // 只有**归属变化**才记审计（同客户重绑不改归属，不刷屏）。
+        if previous.as_deref() != Some(binding.customer_id.as_str()) {
+            sqlx::query(
+                "INSERT INTO gateway_binding_audit \
+                     (gateway_id, customer_id, previous_customer_id, revision, requested_by, at) \
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+            )
+            .bind(&binding.gateway_id)
+            .bind(&binding.customer_id)
+            .bind(previous.as_deref())
+            .bind(binding.revision)
+            .bind(requested_by.trim())
+            .bind(bound_at)
+            .execute(&mut *tx)
+            .await
+            .source_raw_err(StoreReason::Sql, "insert binding audit")?;
+        }
+        tx.commit()
+            .await
+            .source_raw_err(StoreReason::Sql, "commit bind transaction")?;
+        Ok(binding)
     }
 
     async fn list_customer_bindings(
         &self,
     ) -> Result<Vec<GatewayCustomerBindingRecord>, StoreError> {
-        let rows: Vec<(String, String, String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
-            "SELECT gateway_id, customer_id, status, bound_at FROM gateway_customer_bindings",
+        let rows = sqlx::query(
+            "SELECT gateway_id, customer_id, status, bound_at, revision, \
+                    applied_revision, applied_at, reported_tenant_id, last_error \
+               FROM gateway_customer_bindings",
         )
         .fetch_all(&self.pool)
         .await
         .source_raw_err(StoreReason::Sql, "list customer bindings")?;
-        Ok(rows
-            .into_iter()
-            .map(
-                |(gateway_id, customer_id, status, bound_at)| GatewayCustomerBindingRecord {
-                    gateway_id,
-                    customer_id,
-                    status,
-                    bound_at: DateTime::from_rfc3339(&bound_at.to_rfc3339())
-                        .unwrap_or_else(DateTime::now),
-                },
-            )
-            .collect())
+        Ok(rows.iter().map(binding_from_row).collect())
+    }
+
+    async fn get_customer_binding(
+        &self,
+        gateway_id: &str,
+    ) -> Result<Option<GatewayCustomerBindingRecord>, StoreError> {
+        let row = sqlx::query(
+            "SELECT gateway_id, customer_id, status, bound_at, revision, \
+                    applied_revision, applied_at, reported_tenant_id, last_error \
+               FROM gateway_customer_bindings WHERE gateway_id = $1",
+        )
+        .bind(gateway_id)
+        .fetch_optional(&self.pool)
+        .await
+        .source_raw_err(StoreReason::Sql, "get customer binding")?;
+        Ok(row.as_ref().map(binding_from_row))
+    }
+
+    async fn record_customer_binding_report(
+        &self,
+        gateway_id: &str,
+        reported_tenant_id: &str,
+        reported_revision: i64,
+    ) -> Result<Option<GatewayCustomerBindingRecord>, StoreError> {
+        // 状态机与 FileStore 逐条对齐（`applied_at` 只在**变为**已生效时刷新）。
+        let row = sqlx::query(
+            "UPDATE gateway_customer_bindings \
+                SET reported_tenant_id = $2, \
+                    applied_revision = CASE WHEN customer_id = $2 AND $3 = revision \
+                                            THEN $3 ELSE applied_revision END, \
+                    applied_at = CASE WHEN customer_id = $2 AND $3 = revision \
+                                       AND applied_revision IS DISTINCT FROM $3 \
+                                      THEN NOW() ELSE applied_at END, \
+                    status = CASE WHEN customer_id <> $2 THEN 'drift' \
+                                  WHEN $3 = revision THEN 'applied' \
+                                  ELSE 'bound' END, \
+                    last_error = CASE WHEN customer_id <> $2 THEN 'reported tenant_id mismatch' \
+                                      WHEN $3 < revision THEN 'gateway reported older revision' \
+                                      WHEN $3 > revision THEN 'gateway reported newer revision' \
+                                      ELSE NULL END \
+              WHERE gateway_id = $1 \
+             RETURNING gateway_id, customer_id, status, bound_at, revision, \
+                       applied_revision, applied_at, reported_tenant_id, last_error",
+        )
+        .bind(gateway_id)
+        .bind(reported_tenant_id)
+        .bind(reported_revision)
+        .fetch_optional(&self.pool)
+        .await
+        .source_raw_err(StoreReason::Sql, "record customer binding report")?;
+        Ok(row.as_ref().map(binding_from_row))
+    }
+
+    async fn mark_binding_failed(
+        &self,
+        gateway_id: &str,
+        revision: i64,
+        error: &str,
+    ) -> Result<bool, StoreError> {
+        let affected = sqlx::query(
+            "UPDATE gateway_customer_bindings \
+                SET status = 'failed', last_error = $3 \
+              WHERE gateway_id = $1 AND revision = $2",
+        )
+        .bind(gateway_id)
+        .bind(revision)
+        // 与 FileStore 同口径：截断到 300 字符（不多字段，CHAR_LENGTH 简单截断由应用层做）。
+        .bind(error.trim().chars().take(300).collect::<String>())
+        .execute(&self.pool)
+        .await
+        .source_raw_err(StoreReason::Sql, "mark binding failed")?
+        .rows_affected();
+        Ok(affected > 0)
+    }
+
+    async fn list_binding_audit(
+        &self,
+        gateway_id: &str,
+    ) -> Result<Vec<GatewayBindingAuditEvent>, StoreError> {
+        let rows: Vec<BindingAuditRow> = sqlx::query_as(
+            "SELECT gateway_id, customer_id, previous_customer_id, revision, requested_by, at \
+               FROM gateway_binding_audit WHERE gateway_id = $1 ORDER BY at DESC, id DESC LIMIT 100",
+        )
+        .bind(gateway_id)
+        .fetch_all(&self.pool)
+        .await
+        .source_raw_err(StoreReason::Sql, "list binding audit")?;
+        let mut events: Vec<GatewayBindingAuditEvent> =
+            rows.into_iter().map(BindingAuditRow::into_event).collect();
+        // 与 FileStore 一致：**升序**返回（新→旧取自 SQL），前端自己决定怎么展示。
+        events.reverse();
+        Ok(events)
+    }
+}
+
+/// `gateway_customer_bindings` 行 → 记录（时间列直接读 chrono）。
+fn binding_from_row(row: &sqlx::postgres::PgRow) -> GatewayCustomerBindingRecord {
+    let bound_at: chrono::DateTime<chrono::Utc> = row.get("bound_at");
+    let applied_at: Option<chrono::DateTime<chrono::Utc>> = row.get("applied_at");
+    GatewayCustomerBindingRecord {
+        gateway_id: row.get("gateway_id"),
+        customer_id: row.get("customer_id"),
+        status: row.get("status"),
+        bound_at: DateTime::from_rfc3339(&bound_at.to_rfc3339()).unwrap_or_else(DateTime::now),
+        revision: row.get("revision"),
+        applied_revision: row.get("applied_revision"),
+        applied_at: applied_at.and_then(|at| DateTime::from_rfc3339(&at.to_rfc3339())),
+        reported_tenant_id: row.get("reported_tenant_id"),
+        last_error: row.get("last_error"),
     }
 }
 
@@ -1181,5 +1353,145 @@ mod tests {
             .execute(&store.pool)
             .await
             .expect("cleanup");
+    }
+
+    /// 集成测试：业务身份绑定状态机 + 审计（与 FileStore 同一口径）。需本地 PostgreSQL。
+    ///
+    /// 运行：`cargo test -p wist-center -- --ignored pg_store_binding_state_machine_and_audit`
+    #[tokio::test]
+    #[ignore = "需要本地 PostgreSQL（docker compose up -d postgres）"]
+    async fn pg_store_binding_state_machine_and_audit() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let database_url = std::env::var("WARP_INSIGHT_CENTER_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://demo:demo@127.0.0.1:55432/insight_demo".to_string());
+        let store = PgStore::connect(&database_url).await.expect("connect pg");
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let gateway_id = format!("pg-bind-{nanos}");
+
+        let first = store
+            .bind_gateway_customer(&gateway_id, "tenant-a", "alice")
+            .await
+            .expect("bind");
+        assert_eq!(first.revision, 1);
+        assert_eq!(first.status, "bound");
+
+        let applied = store
+            .record_customer_binding_report(&gateway_id, "tenant-a", 1)
+            .await
+            .expect("report")
+            .expect("binding");
+        assert_eq!(applied.status, "applied");
+        let applied_at = applied.applied_at.clone();
+        assert!(applied_at.is_some());
+
+        // 心跳不刷 `applied_at`（那是「最近一次**变为**已生效」）。
+        let again = store
+            .record_customer_binding_report(&gateway_id, "tenant-a", 1)
+            .await
+            .expect("report")
+            .expect("binding");
+        assert_eq!(again.applied_at, applied_at);
+
+        // 同客户重绑：不递增 revision，但回到「待生效」。
+        let same = store
+            .bind_gateway_customer(&gateway_id, "tenant-a", "bob")
+            .await
+            .expect("repeat");
+        assert_eq!(same.revision, 1);
+        assert_eq!(same.status, "bound");
+
+        // 换绑：递增并清 applied。
+        let changed = store
+            .bind_gateway_customer(&gateway_id, "tenant-b", "bob")
+            .await
+            .expect("rebind");
+        assert_eq!(changed.revision, 2);
+        assert_eq!(changed.applied_revision, None);
+
+        // 旧 / 超前 revision：不冒充已生效。
+        let older = store
+            .record_customer_binding_report(&gateway_id, "tenant-b", 1)
+            .await
+            .expect("report")
+            .expect("binding");
+        assert_eq!(older.status, "bound");
+        assert_eq!(older.applied_revision, None);
+        assert_eq!(
+            older.last_error.as_deref(),
+            Some("gateway reported older revision")
+        );
+        let newer = store
+            .record_customer_binding_report(&gateway_id, "tenant-b", 9)
+            .await
+            .expect("report")
+            .expect("binding");
+        assert_eq!(newer.status, "bound");
+        assert_eq!(
+            newer.last_error.as_deref(),
+            Some("gateway reported newer revision")
+        );
+
+        // 版本相同 → applied；错误 tenant → drift。
+        let applied = store
+            .record_customer_binding_report(&gateway_id, "tenant-b", 2)
+            .await
+            .expect("report")
+            .expect("binding");
+        assert_eq!(applied.status, "applied");
+        assert!(applied.last_error.is_none());
+        let drift = store
+            .record_customer_binding_report(&gateway_id, "tenant-x", 2)
+            .await
+            .expect("report")
+            .expect("binding");
+        assert_eq!(drift.status, "drift");
+        assert_eq!(drift.reported_tenant_id.as_deref(), Some("tenant-x"));
+
+        // 命令回执失败：只命中当前版本。
+        assert!(
+            !store
+                .mark_binding_failed(&gateway_id, 1, "stale failure")
+                .await
+                .expect("stale")
+        );
+        assert!(
+            store
+                .mark_binding_failed(&gateway_id, 2, "restart failed")
+                .await
+                .expect("failed")
+        );
+        let failed = store
+            .get_customer_binding(&gateway_id)
+            .await
+            .expect("get")
+            .expect("binding");
+        assert_eq!(failed.status, "failed");
+        assert_eq!(failed.last_error.as_deref(), Some("restart failed"));
+
+        // 审计：首绑 + 换绑两条（同客户重绑不记），升序。
+        let events = store.list_binding_audit(&gateway_id).await.expect("audit");
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0].customer_id, "tenant-a");
+        assert!(events[0].previous_customer_id.is_none());
+        assert_eq!(events[0].requested_by, "alice");
+        assert_eq!(events[1].customer_id, "tenant-b");
+        assert_eq!(events[1].previous_customer_id.as_deref(), Some("tenant-a"));
+        assert_eq!(events[1].requested_by, "bob");
+
+        // 清理测试数据。
+        sqlx::query("DELETE FROM gateway_customer_bindings WHERE gateway_id = $1")
+            .bind(&gateway_id)
+            .execute(&store.pool)
+            .await
+            .expect("cleanup bindings");
+        sqlx::query("DELETE FROM gateway_binding_audit WHERE gateway_id = $1")
+            .bind(&gateway_id)
+            .execute(&store.pool)
+            .await
+            .expect("cleanup audit");
     }
 }

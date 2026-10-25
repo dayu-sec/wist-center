@@ -45,6 +45,9 @@ pub struct CenterStoreSnapshot {
     pub upgrade_plans: Vec<UpgradePlanRecord>,
     /// 网关-客户绑定记录。
     pub customer_bindings: Vec<GatewayCustomerBindingRecord>,
+    /// 换绑审计（append-only，key = gateway_id，有界保留最近 ~100 条）。
+    #[serde(default)]
+    pub binding_audit: HashMap<String, Vec<GatewayBindingAuditEvent>>,
     /// 网关注册 Token（key = token_id；映射模型 GatewayEnrollmentToken）。
     #[serde(default)]
     pub enrollment_tokens: HashMap<String, StoredEnrollmentToken>,
@@ -99,6 +102,57 @@ pub struct GatewayCustomerBindingRecord {
     pub customer_id: String,
     pub status: String,
     pub bound_at: DateTime,
+    /// 绑定版本：同一客户重复绑定不递增；换绑递增。
+    #[serde(default = "default_binding_revision")]
+    pub revision: i64,
+    /// 网关已上报生效的 revision。
+    #[serde(default)]
+    pub applied_revision: Option<i64>,
+    #[serde(default)]
+    pub applied_at: Option<DateTime>,
+    /// 网关自报的 tenant_id（用于漂移检测；权威值仍是 `customer_id`）。
+    #[serde(default)]
+    pub reported_tenant_id: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+fn default_binding_revision() -> i64 {
+    1
+}
+
+/// 换绑审计事件（映射模型 `Control.InsightCenterApp.AdminFacingInterface.GatewayBindingAuditEvent`）：
+/// **谁**（`requested_by`）在**什么时候**把哪台网关绑到**哪个客户**（换绑时带旧值）。
+/// 绑定表只保留最新值，历史在这里。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayBindingAuditEvent {
+    pub gateway_id: String,
+    pub customer_id: String,
+    /// 换绑前的客户；首次绑定为 `None`。
+    #[serde(default)]
+    pub previous_customer_id: Option<String>,
+    pub revision: i64,
+    pub requested_by: String,
+    pub at: DateTime,
+}
+
+/// 字符串截断（审计 / `last_error` 不该被超长输入撑大）。
+fn bounded(value: &str, max_chars: usize) -> String {
+    value.trim().chars().take(max_chars).collect()
+}
+
+/// 追加一条换绑审计（每网关有界保留最近 100 条）。
+fn push_binding_audit(snapshot: &mut CenterStoreSnapshot, event: GatewayBindingAuditEvent) {
+    let events = snapshot
+        .binding_audit
+        .entry(event.gateway_id.clone())
+        .or_default();
+    events.push(event);
+    const MAX_EVENTS: usize = 100;
+    if events.len() > MAX_EVENTS {
+        let excess = events.len() - MAX_EVENTS;
+        events.drain(..excess);
+    }
 }
 
 /// 升级计划里的一个阶段（映射模型 `Control.Rollout.RolloutPhase`）。
@@ -699,15 +753,41 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     ) -> Result<Option<UpgradePlanRecord>, StoreError>;
     /// 覆盖保存一份升级计划（批准 / 推进 / 结果回填都走它）。
     async fn save_upgrade_plan(&self, plan: &UpgradePlanRecord) -> Result<(), StoreError>;
-    /// 绑定网关到客户（幂等：同网关重复绑定更新客户）。
+    /// 绑定网关到客户（幂等：同网关重复绑定同一客户不递增 revision；换绑递增）。
+    /// `requested_by` 在同一临界区内写进审计（归属变化时）。
     async fn bind_gateway_customer(
         &self,
         gateway_id: &str,
         customer_id: &str,
+        requested_by: &str,
     ) -> Result<GatewayCustomerBindingRecord, StoreError>;
     /// 查询全部网关-客户绑定。
     async fn list_customer_bindings(&self)
     -> Result<Vec<GatewayCustomerBindingRecord>, StoreError>;
+    /// 查询某网关的客户绑定；无则 `None`。
+    async fn get_customer_binding(
+        &self,
+        gateway_id: &str,
+    ) -> Result<Option<GatewayCustomerBindingRecord>, StoreError>;
+    /// 记录网关上报的 tenant_id / revision：一致且版本相同 → applied；否则记漂移/落后。
+    async fn record_customer_binding_report(
+        &self,
+        gateway_id: &str,
+        reported_tenant_id: &str,
+        reported_revision: i64,
+    ) -> Result<Option<GatewayCustomerBindingRecord>, StoreError>;
+    /// 命令回执失败（`bind-tenant`）→ 当前版本绑定标 `failed` + 原因。返回是否命中当前版本。
+    async fn mark_binding_failed(
+        &self,
+        gateway_id: &str,
+        revision: i64,
+        error: &str,
+    ) -> Result<bool, StoreError>;
+    /// 查询某网关的换绑审计（按时间升序）。
+    async fn list_binding_audit(
+        &self,
+        gateway_id: &str,
+    ) -> Result<Vec<GatewayBindingAuditEvent>, StoreError>;
     /// 查询某 gateway 下的全部 Agent 状态（按 agent_id 排序）。
     async fn list_agents_by_gateway(
         &self,
@@ -1248,31 +1328,70 @@ impl FileStore {
         Ok(())
     }
 
-    /// 绑定网关到客户（同步，供测试与 trait 委托）：同网关重复绑定更新客户。
+    /// 绑定网关到客户（同步，供测试与 trait 委托）：同网关重复绑定同一客户不递增 revision；换绑递增。
+    ///
+    /// **归属变化时在同一把锁里**追加一条审计（`requested_by` 一并落库）：读旧值、改绑定、写审计
+    /// 必须在同一个临界区，否则并发两次换绑会写出错的 `previous_customer_id`。
+    /// 同客户重绑不记事件（不改变归属），只重置下发状态 —— 它意味着「重新下发一次」。
     pub fn bind_gateway_customer(
         &self,
         gateway_id: &str,
         customer_id: &str,
+        requested_by: &str,
     ) -> Result<GatewayCustomerBindingRecord, StoreError> {
         let binding =
             self.update::<Result<GatewayCustomerBindingRecord, StoreError>>(|snapshot| {
-                if let Some(existing) = snapshot
+                let now = DateTime::now();
+                let (binding, previous) = match snapshot
                     .customer_bindings
                     .iter_mut()
                     .find(|binding| binding.gateway_id == gateway_id)
                 {
-                    existing.customer_id = customer_id.to_string();
-                    existing.status = "bound".to_string();
-                    existing.bound_at = DateTime::now();
-                    return Ok(existing.clone());
-                }
-                let binding = GatewayCustomerBindingRecord {
-                    gateway_id: gateway_id.to_string(),
-                    customer_id: customer_id.to_string(),
-                    status: "bound".to_string(),
-                    bound_at: DateTime::now(),
+                    Some(existing) => {
+                        let previous = existing.customer_id.clone();
+                        if previous != customer_id {
+                            existing.customer_id = customer_id.to_string();
+                            existing.revision = existing.revision.max(1) + 1;
+                            existing.applied_revision = None;
+                            existing.applied_at = None;
+                            existing.reported_tenant_id = None;
+                        }
+                        // 无论首绑/重绑/换绑，下发侧都回到「待生效」，等网关下一次心跳确认。
+                        existing.status = "bound".to_string();
+                        existing.last_error = None;
+                        existing.bound_at = now.clone();
+                        (existing.clone(), Some(previous))
+                    }
+                    None => {
+                        let binding = GatewayCustomerBindingRecord {
+                            gateway_id: gateway_id.to_string(),
+                            customer_id: customer_id.to_string(),
+                            status: "bound".to_string(),
+                            bound_at: now.clone(),
+                            revision: 1,
+                            applied_revision: None,
+                            applied_at: None,
+                            reported_tenant_id: None,
+                            last_error: None,
+                        };
+                        snapshot.customer_bindings.push(binding.clone());
+                        (binding, None)
+                    }
                 };
-                snapshot.customer_bindings.push(binding.clone());
+                let changed = previous.as_deref() != Some(customer_id);
+                if changed {
+                    push_binding_audit(
+                        snapshot,
+                        GatewayBindingAuditEvent {
+                            gateway_id: gateway_id.to_string(),
+                            customer_id: binding.customer_id.clone(),
+                            previous_customer_id: previous,
+                            revision: binding.revision,
+                            requested_by: bounded(requested_by, 128),
+                            at: now,
+                        },
+                    );
+                }
                 Ok(binding)
             })??;
         Ok(binding)
@@ -1281,6 +1400,110 @@ impl FileStore {
     pub fn list_customer_bindings(&self) -> Result<Vec<GatewayCustomerBindingRecord>, StoreError> {
         let snapshot = self.load()?;
         Ok(snapshot.customer_bindings)
+    }
+
+    pub fn get_customer_binding(
+        &self,
+        gateway_id: &str,
+    ) -> Result<Option<GatewayCustomerBindingRecord>, StoreError> {
+        let snapshot = self.load()?;
+        Ok(snapshot
+            .customer_bindings
+            .into_iter()
+            .find(|binding| binding.gateway_id == gateway_id))
+    }
+
+    /// 记录网关上报的 tenant_id / revision（状态机与 PgStore **逐条对齐**）：
+    ///
+    /// | 输入 | status | applied_* | last_error |
+    /// |---|---|---|---|
+    /// | tenant 不一致 | `drift` | 不动 | `reported tenant_id mismatch` |
+    /// | revision 落后 | `bound` | 不动 | `gateway reported older revision` |
+    /// | revision 超前 | `bound` | 不动 | `gateway reported newer revision` |
+    /// | revision 相等 | `applied` | 记该 revision（仅变化时刷新 `applied_at`） | 清空 |
+    ///
+    /// 无绑定时**不写盘**：FileStore 的 `update` 会重写整份 `store.json`，心跳 30s 一次，
+    /// 没绑定的网关不应产生写放大。
+    pub fn record_customer_binding_report(
+        &self,
+        gateway_id: &str,
+        reported_tenant_id: &str,
+        reported_revision: i64,
+    ) -> Result<Option<GatewayCustomerBindingRecord>, StoreError> {
+        if self.get_customer_binding(gateway_id)?.is_none() {
+            return Ok(None);
+        }
+        let binding =
+            self.update::<Result<Option<GatewayCustomerBindingRecord>, StoreError>>(|snapshot| {
+                let Some(existing) = snapshot
+                    .customer_bindings
+                    .iter_mut()
+                    .find(|binding| binding.gateway_id == gateway_id)
+                else {
+                    return Ok(None);
+                };
+                existing.reported_tenant_id = Some(reported_tenant_id.to_string());
+                if existing.customer_id != reported_tenant_id {
+                    existing.status = "drift".to_string();
+                    existing.last_error = Some("reported tenant_id mismatch".to_string());
+                } else if reported_revision < existing.revision {
+                    existing.status = "bound".to_string();
+                    existing.last_error = Some("gateway reported older revision".to_string());
+                } else if reported_revision > existing.revision {
+                    // 网关比中心新（中心库回滚 / 重建）：不冒充已生效，也不回写超前的版本。
+                    existing.status = "bound".to_string();
+                    existing.last_error = Some("gateway reported newer revision".to_string());
+                } else {
+                    // `applied_at` 是「最近一次**变为**已生效」，不是每次心跳都刷新。
+                    if existing.applied_revision != Some(reported_revision) {
+                        existing.applied_at = Some(DateTime::now());
+                    }
+                    existing.applied_revision = Some(reported_revision);
+                    existing.status = "applied".to_string();
+                    existing.last_error = None;
+                }
+                Ok(Some(existing.clone()))
+            })??;
+        Ok(binding)
+    }
+
+    /// 命令回执失败（`bind-tenant`）→ 绑定标 `failed` + 原因。
+    ///
+    /// 只对**当前绑定版本**生效：旧命令的失败不能盖掉换绑后的新状态。
+    pub fn mark_binding_failed(
+        &self,
+        gateway_id: &str,
+        revision: i64,
+        error: &str,
+    ) -> Result<bool, StoreError> {
+        let changed = self.update::<Result<bool, StoreError>>(|snapshot| {
+            let Some(existing) = snapshot
+                .customer_bindings
+                .iter_mut()
+                .find(|binding| binding.gateway_id == gateway_id)
+            else {
+                return Ok(false);
+            };
+            if existing.revision != revision {
+                return Ok(false);
+            }
+            existing.status = "failed".to_string();
+            existing.last_error = Some(bounded(error, 300));
+            Ok(true)
+        })??;
+        Ok(changed)
+    }
+
+    pub fn list_binding_audit(
+        &self,
+        gateway_id: &str,
+    ) -> Result<Vec<GatewayBindingAuditEvent>, StoreError> {
+        let snapshot = self.load()?;
+        Ok(snapshot
+            .binding_audit
+            .get(gateway_id)
+            .cloned()
+            .unwrap_or_default())
     }
 
     pub fn list_agents_by_gateway(&self, gateway_id: &str) -> Result<Vec<StoredAgent>, StoreError> {
@@ -1629,14 +1852,52 @@ impl Store for FileStore {
         &self,
         gateway_id: &str,
         customer_id: &str,
+        requested_by: &str,
     ) -> Result<GatewayCustomerBindingRecord, StoreError> {
-        FileStore::bind_gateway_customer(self, gateway_id, customer_id)
+        FileStore::bind_gateway_customer(self, gateway_id, customer_id, requested_by)
     }
 
     async fn list_customer_bindings(
         &self,
     ) -> Result<Vec<GatewayCustomerBindingRecord>, StoreError> {
         FileStore::list_customer_bindings(self)
+    }
+
+    async fn get_customer_binding(
+        &self,
+        gateway_id: &str,
+    ) -> Result<Option<GatewayCustomerBindingRecord>, StoreError> {
+        FileStore::get_customer_binding(self, gateway_id)
+    }
+
+    async fn record_customer_binding_report(
+        &self,
+        gateway_id: &str,
+        reported_tenant_id: &str,
+        reported_revision: i64,
+    ) -> Result<Option<GatewayCustomerBindingRecord>, StoreError> {
+        FileStore::record_customer_binding_report(
+            self,
+            gateway_id,
+            reported_tenant_id,
+            reported_revision,
+        )
+    }
+
+    async fn mark_binding_failed(
+        &self,
+        gateway_id: &str,
+        revision: i64,
+        error: &str,
+    ) -> Result<bool, StoreError> {
+        FileStore::mark_binding_failed(self, gateway_id, revision, error)
+    }
+
+    async fn list_binding_audit(
+        &self,
+        gateway_id: &str,
+    ) -> Result<Vec<GatewayBindingAuditEvent>, StoreError> {
+        FileStore::list_binding_audit(self, gateway_id)
     }
 }
 
@@ -2417,5 +2678,173 @@ mod tests {
             .as_nanos();
         let sequence = COUNTER.fetch_add(1, Ordering::SeqCst);
         std::env::temp_dir().join(format!("wist-center-store-test-{nanos}-{sequence}.json"))
+    }
+
+    #[test]
+    fn customer_binding_revision_and_applied_report() {
+        let path = test_store_path();
+        let store = FileStore::new(&path);
+
+        let first = store
+            .bind_gateway_customer("gw-1", "tenant-a", "alice")
+            .expect("bind");
+        assert_eq!(first.revision, 1);
+        assert_eq!(first.status, "bound");
+
+        // 同客户重复绑定：不递增 revision（幂等），但回到「待生效」（重新下发语义）。
+        let applied = store
+            .record_customer_binding_report("gw-1", "tenant-a", 1)
+            .expect("report")
+            .expect("binding");
+        assert_eq!(applied.status, "applied");
+        let same = store
+            .bind_gateway_customer("gw-1", "tenant-a", "bob")
+            .expect("rebind");
+        assert_eq!(same.revision, 1);
+        assert_eq!(same.status, "bound");
+
+        // 换绑：递增 revision，并清掉上一轮的生效状态。
+        let changed = store
+            .bind_gateway_customer("gw-1", "tenant-b", "bob")
+            .expect("rebind");
+        assert_eq!(changed.revision, 2);
+        assert_eq!(changed.applied_revision, None);
+        assert_eq!(changed.applied_at, None);
+
+        // 网关上报一致且同版本 → applied。
+        let applied = store
+            .record_customer_binding_report("gw-1", "tenant-b", 2)
+            .expect("report")
+            .expect("binding");
+        assert_eq!(applied.status, "applied");
+        assert_eq!(applied.applied_revision, Some(2));
+        let first_applied_at = applied.applied_at.clone();
+        assert!(first_applied_at.is_some());
+        assert!(applied.last_error.is_none());
+
+        // 下一次心跳：状态不变，`applied_at` **不**被刷新（那是「最近一次变为已生效」）。
+        let again = store
+            .record_customer_binding_report("gw-1", "tenant-b", 2)
+            .expect("report")
+            .expect("binding");
+        assert_eq!(again.status, "applied");
+        assert_eq!(again.applied_at, first_applied_at);
+
+        // 旧 revision：不覆盖已生效版本；状态回到待生效（与 PgStore 同口径）。
+        let older = store
+            .record_customer_binding_report("gw-1", "tenant-b", 1)
+            .expect("report")
+            .expect("binding");
+        assert_eq!(older.status, "bound");
+        assert_eq!(older.applied_revision, Some(2));
+        assert_eq!(
+            older.last_error.as_deref(),
+            Some("gateway reported older revision")
+        );
+
+        // 超前 revision：中心不冒充已生效，也不回写超前的版本。
+        let newer = store
+            .record_customer_binding_report("gw-1", "tenant-b", 9)
+            .expect("report")
+            .expect("binding");
+        assert_eq!(newer.status, "bound");
+        assert_eq!(newer.applied_revision, Some(2));
+        assert_eq!(
+            newer.last_error.as_deref(),
+            Some("gateway reported newer revision")
+        );
+
+        // 自报 tenant 与权威值不一致 → drift。
+        let drift = store
+            .record_customer_binding_report("gw-1", "tenant-x", 2)
+            .expect("report")
+            .expect("binding");
+        assert_eq!(drift.status, "drift");
+        assert_eq!(
+            drift.last_error.as_deref(),
+            Some("reported tenant_id mismatch")
+        );
+
+        let got = store
+            .get_customer_binding("gw-1")
+            .expect("get")
+            .expect("binding");
+        assert_eq!(got.customer_id, "tenant-b");
+        let _ = fs::remove_file(path);
+    }
+
+    /// 换绑审计：只在**归属变化**时记（首绑 + 换绑），带 `requested_by` 与旧值。
+    #[test]
+    fn binding_audit_records_only_real_changes() {
+        let path = test_store_path();
+        let store = FileStore::new(&path);
+        assert!(store.list_binding_audit("gw-1").expect("empty").is_empty());
+
+        let first = store
+            .bind_gateway_customer("gw-1", "tenant-a", "alice")
+            .expect("bind");
+        assert_eq!(first.revision, 1);
+        store
+            .bind_gateway_customer("gw-1", "tenant-a", "bob")
+            .expect("repeat");
+        let changed = store
+            .bind_gateway_customer("gw-1", "tenant-b", "bob")
+            .expect("rebind");
+        assert_eq!(changed.revision, 2);
+
+        let events = store.list_binding_audit("gw-1").expect("audit");
+        // 同客户重复绑定不产生事件（不改变归属），只剩首绑 + 换绑两条。
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0].customer_id, "tenant-a");
+        assert!(events[0].previous_customer_id.is_none());
+        assert_eq!(events[0].requested_by, "alice");
+        assert_eq!(events[1].customer_id, "tenant-b");
+        assert_eq!(events[1].previous_customer_id.as_deref(), Some("tenant-a"));
+        assert_eq!(events[1].requested_by, "bob");
+        assert_eq!(events[1].revision, 2);
+        // 别的网关看不到这条历史。
+        assert!(store.list_binding_audit("gw-2").expect("empty").is_empty());
+        let _ = fs::remove_file(path);
+    }
+
+    /// 命令回执失败：只对**当前版本**生效（旧命令的失败不能盖掉新绑定）。
+    #[test]
+    fn mark_binding_failed_only_hits_the_current_revision() {
+        let path = test_store_path();
+        let store = FileStore::new(&path);
+        store
+            .bind_gateway_customer("gw-1", "tenant-a", "alice")
+            .expect("bind");
+        store
+            .bind_gateway_customer("gw-1", "tenant-b", "alice")
+            .expect("rebind");
+
+        assert!(
+            !store
+                .mark_binding_failed("gw-1", 1, "restart failed")
+                .expect("stale failure"),
+            "旧版本失败不应命中"
+        );
+        assert!(
+            store
+                .mark_binding_failed("gw-1", 2, "restart failed")
+                .expect("failure"),
+            "当前版本应该命中"
+        );
+        let binding = store
+            .get_customer_binding("gw-1")
+            .expect("get")
+            .expect("binding");
+        assert_eq!(binding.status, "failed");
+        assert_eq!(binding.last_error.as_deref(), Some("restart failed"));
+
+        // 下一次心跳（恢复后再生效）会把 failed 拉回 applied。
+        let applied = store
+            .record_customer_binding_report("gw-1", "tenant-b", 2)
+            .expect("report")
+            .expect("binding");
+        assert_eq!(applied.status, "applied");
+        assert!(applied.last_error.is_none());
+        let _ = fs::remove_file(path);
     }
 }

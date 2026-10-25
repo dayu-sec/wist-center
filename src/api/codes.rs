@@ -39,6 +39,7 @@ codes! {
     COS_PATH_REQUIRED => "cos_path_required",
     COS_RESOLVE_FAILED => "cos_resolve_failed",
     CREDENTIAL_ID_GENERATION_FAILED => "credential_id_generation_failed",
+    CUSTOMER_ID_NOT_TAG_SAFE => "customer_id_not_tag_safe",
     ENROLLMENT_TOKEN_CONSUME_FAILED => "enrollment_token_consume_failed",
     ENROLLMENT_TOKEN_REJECTED => "enrollment_token_rejected",
     ENROLLMENT_TOKEN_UNKNOWN_GATEWAY => "enrollment_token_unknown_gateway",
@@ -46,6 +47,7 @@ codes! {
     GATEWAY_ALREADY_EXISTS => "gateway_already_exists",
     GATEWAY_ARCHIVE_FAILED => "gateway_archive_failed",
     GATEWAY_BIND_FAILED => "gateway_bind_failed",
+    GATEWAY_BINDING_HISTORY_LOAD_FAILED => "gateway_binding_history_load_failed",
     GATEWAY_CREATE_FAILED => "gateway_create_failed",
     GATEWAY_CREDENTIAL_STORE_UNAVAILABLE => "gateway_credential_store_unavailable",
     GATEWAY_ID_AND_REQUESTED_BY_REQUIRED => "gateway_id_and_requested_by_required",
@@ -151,6 +153,13 @@ mod tests {
         assert_eq!(INVALID_LINK_TOKEN, "invalid_link_token");
         assert_eq!(GATEWAY_STORE_UNAVAILABLE, "gateway_store_unavailable");
         assert_eq!(INSTALL_ALL_UNAVAILABLE, "install_all_unavailable");
+        // 业务身份绑定（前端/脚本按它分支）。
+        assert_eq!(CUSTOMER_ID_NOT_TAG_SAFE, "customer_id_not_tag_safe");
+        assert_eq!(GATEWAY_BIND_FAILED, "gateway_bind_failed");
+        assert_eq!(
+            GATEWAY_BINDING_HISTORY_LOAD_FAILED,
+            "gateway_binding_history_load_failed"
+        );
     }
 
     /// 词表自身：全是非空 `snake_case` 且取值互不重复。

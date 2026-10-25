@@ -16,7 +16,7 @@ use wist_control::{
     GatewayInstanceLifecycleState, GatewayListView, GatewayRuntimeStatus, GlobalPolicyDispatch,
 };
 
-use crate::infra::{StoreReason, StoredGateway};
+use crate::infra::{GatewayCustomerBindingRecord, StoreReason, StoredGateway};
 
 use super::{
     ApiState, PeerConnectInfo,
@@ -81,10 +81,31 @@ pub struct AdminGatewayInstanceView {
     /// 页面据此显示「已归档」与「取消归档」。
     #[serde(default)]
     pub archived_at: Option<DateTime>,
+    /// 业务身份绑定（与 Center 管理面字段 `customer_id` 同名；数据面称 `tenant_id`）。
+    #[serde(default)]
+    pub customer_id: Option<String>,
+    #[serde(default)]
+    pub binding_status: Option<String>,
+    #[serde(default)]
+    pub binding_revision: Option<i64>,
+    #[serde(default)]
+    pub applied_revision: Option<i64>,
+    #[serde(default)]
+    pub applied_at: Option<DateTime>,
+    #[serde(default)]
+    pub binding_last_error: Option<String>,
+    /// 网关**自报**的 tenant_id（只作漂移证据；`customer_id` 才是权威值）。
+    /// 页面用它告诉操作员「网关实际报了什么」，免得只能上机查。
+    #[serde(default)]
+    pub reported_tenant_id: Option<String>,
 }
 
 /// 实例视图（列表与归档回执共用一份）：`init_url` 由中心对外地址派生。
-fn gateway_instance_view(state: &ApiState, gateway: StoredGateway) -> AdminGatewayInstanceView {
+fn gateway_instance_view(
+    state: &ApiState,
+    gateway: StoredGateway,
+    binding: Option<&GatewayCustomerBindingRecord>,
+) -> AdminGatewayInstanceView {
     let init_url = format!(
         "{}/api/v1/gateway/link-upstream?gateway_id={}",
         state.config.public_url.trim_end_matches('/'),
@@ -100,6 +121,13 @@ fn gateway_instance_view(state: &ApiState, gateway: StoredGateway) -> AdminGatew
         initialized_at: gateway.initialized_at,
         init_url,
         archived_at: gateway.archived_at,
+        customer_id: binding.map(|binding| binding.customer_id.clone()),
+        binding_status: binding.map(|binding| binding.status.clone()),
+        binding_revision: binding.map(|binding| binding.revision),
+        applied_revision: binding.and_then(|binding| binding.applied_revision),
+        applied_at: binding.and_then(|binding| binding.applied_at.clone()),
+        binding_last_error: binding.and_then(|binding| binding.last_error.clone()),
+        reported_tenant_id: binding.and_then(|binding| binding.reported_tenant_id.clone()),
     }
 }
 
@@ -548,11 +576,26 @@ pub async fn admin_list_gateway_instances(
             );
         }
     };
-    let instances: Vec<AdminGatewayInstanceView> = gateways
-        .into_iter()
-        .filter(|gateway| query.include_archived || gateway.archived_at.is_none())
-        .map(|gateway| gateway_instance_view(&state, gateway))
-        .collect();
+    let instances: Vec<AdminGatewayInstanceView> = {
+        let bindings = match state.store.list_customer_bindings().await {
+            Ok(bindings) => bindings
+                .into_iter()
+                .map(|binding| (binding.gateway_id.clone(), binding))
+                .collect::<std::collections::HashMap<_, _>>(),
+            Err(err) => {
+                log::warn!("load customer bindings failed: {}", err.display_chain());
+                std::collections::HashMap::new()
+            }
+        };
+        gateways
+            .into_iter()
+            .filter(|gateway| query.include_archived || gateway.archived_at.is_none())
+            .map(|gateway| {
+                let binding = bindings.get(&gateway.gateway_id);
+                gateway_instance_view(&state, gateway, binding)
+            })
+            .collect()
+    };
     Json(instances).into_response()
 }
 
@@ -628,7 +671,16 @@ pub async fn admin_set_gateway_archived(
     }
     // 回执带上这台实例的最新视图（页面据此就地显示「已归档 / 取消归档」）。
     match state.store.get_gateway(&gateway_id).await {
-        Ok(Some(stored)) => Json(gateway_instance_view(&state, stored)).into_response(),
+        Ok(Some(stored)) => {
+            let binding = match state.store.get_customer_binding(&stored.gateway_id).await {
+                Ok(binding) => binding,
+                Err(err) => {
+                    log::warn!("load customer binding failed: {}", err.display_chain());
+                    None
+                }
+            };
+            Json(gateway_instance_view(&state, stored, binding.as_ref())).into_response()
+        }
         _ => Json(serde_json::json!({
             "gateway_id": gateway_id,
             "archived_at": archived_at,
@@ -1649,6 +1701,10 @@ pub struct BindGatewayCustomerRequest {
 }
 
 /// 绑定网关到客户：POST /api/v1/admin/gateways/bind。
+///
+/// 绑定成功后：已初始化网关入队 `bind-tenant`（gwlinkd 落盘并上报生效）；
+/// 未初始化网关不入队，由 `link-upstream` 的初始配置携带。
+/// 审计（`requested_by`）在 store 的同一次原子写里完成，读旧值不再有竞态。
 pub async fn admin_bind_gateway_customer(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -1659,19 +1715,44 @@ pub async fn admin_bind_gateway_customer(
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
         return response;
     }
-    if request.gateway_id.trim().is_empty()
-        || request.customer_id.trim().is_empty()
-        || request.requested_by.trim().is_empty()
-    {
+    let gateway_id = request.gateway_id.trim();
+    let customer_id = request.customer_id.trim();
+    if gateway_id.is_empty() || customer_id.is_empty() || request.requested_by.trim().is_empty() {
         return super::error::ApiError::bad_request(
             super::codes::GATEWAY_ID_CUSTOMER_ID_REQUESTED_BY_REQUIRED,
             "gateway_id, customer_id and requested_by must not be empty",
         )
         .into_response();
     }
+    if !super::is_tag_safe(customer_id) {
+        return super::error::ApiError::bad_request(
+            super::codes::CUSTOMER_ID_NOT_TAG_SAFE,
+            "customer_id must be 1..=64 chars of [A-Za-z0-9_.:/=@+,-] (it becomes a wparse tag value)",
+        )
+        .into_response();
+    }
+    // 不存在的网关不允许绑定（先创建实例）。
+    let gateway = match state.store.get_gateway(gateway_id).await {
+        Ok(Some(gateway)) => gateway,
+        Ok(None) => {
+            return super::error::ApiError::not_found(
+                super::codes::GATEWAY_NOT_FOUND,
+                format!("unknown gateway {gateway_id}"),
+            )
+            .into_response();
+        }
+        Err(err) => {
+            return super::error::internal_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                super::codes::GATEWAY_LOAD_FAILED,
+                "failed to load gateway",
+                err.display_chain(),
+            );
+        }
+    };
     let binding = match state
         .store
-        .bind_gateway_customer(&request.gateway_id, &request.customer_id)
+        .bind_gateway_customer(gateway_id, customer_id, request.requested_by.trim())
         .await
     {
         Ok(binding) => binding,
@@ -1684,11 +1765,63 @@ pub async fn admin_bind_gateway_customer(
             );
         }
     };
+    // 已初始化才下发；未初始化由 link-upstream 的初始配置携带。下发失败不回滚绑定
+    // （绑定是权威事实；网关可在下次绑定/重试时补偿）。
+    if !gateway.credential_token_hash.is_empty() {
+        match state.proxy.as_ref() {
+            Some(proxy) => {
+                let payload = serde_json::json!({
+                    "tenant_id": binding.customer_id,
+                    "revision": binding.revision,
+                })
+                .to_string();
+                match proxy
+                    .enqueue_control_with_body(
+                        gateway_id,
+                        crate::wparse_proxy::KIND_BIND_TENANT,
+                        Some(&payload),
+                    )
+                    .await
+                {
+                    Ok((command_id, reused)) => log::info!(
+                        "event=GatewayTenantBindEnqueued gateway_id={} customer_id={} revision={} command_id={} reused={}",
+                        gateway_id,
+                        binding.customer_id,
+                        binding.revision,
+                        command_id,
+                        reused
+                    ),
+                    Err(err) => log::warn!(
+                        "event=GatewayTenantBindEnqueueFailed gateway_id={} customer_id={} revision={} error={}",
+                        gateway_id,
+                        binding.customer_id,
+                        binding.revision,
+                        err
+                    ),
+                }
+            }
+            None => log::warn!(
+                "event=GatewayTenantBindNotDispatched gateway_id={} reason=proxy_unavailable",
+                gateway_id
+            ),
+        }
+    }
+    log::info!(
+        "event=GatewayCustomerBound gateway_id={} customer_id={} requested_by={} revision={}",
+        gateway_id,
+        binding.customer_id,
+        request.requested_by.trim(),
+        binding.revision
+    );
     Json(GatewayCustomerBinding {
         gateway_id: binding.gateway_id,
         customer_id: binding.customer_id,
         status: binding.status,
         bound_at: binding.bound_at,
+        revision: binding.revision,
+        applied_revision: binding.applied_revision,
+        applied_at: binding.applied_at,
+        last_error: binding.last_error,
     })
     .into_response()
 }
@@ -1724,6 +1857,13 @@ pub async fn admin_get_gateway_initial_config(
         .into_response();
     }
     // 配置类响应（信任包 / 端点）→ `no-store`。
+    let binding = match state.store.get_customer_binding(&gateway_id).await {
+        Ok(binding) => binding,
+        Err(err) => {
+            log::warn!("load customer binding failed: {}", err.display_chain());
+            None
+        }
+    };
     super::error::json_no_store(GatewayInitialConfig {
         gateway_id: gateway_id.clone(),
         control_center_endpoint: state.config.public_url.clone(),
@@ -1731,6 +1871,8 @@ pub async fn admin_get_gateway_initial_config(
         server_tls_required,
         protocol_version: state.config.protocol_version.clone(),
         enrollment_token_id,
+        tenant_id: binding.as_ref().map(|binding| binding.customer_id.clone()),
+        binding_revision: binding.as_ref().map(|binding| binding.revision),
     })
 }
 
@@ -2111,6 +2253,35 @@ pub async fn admin_list_gateway_lifecycle(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 super::codes::GATEWAY_LIFECYCLE_LOAD_FAILED,
                 "failed to load gateway lifecycle",
+                err.display_chain(),
+            );
+        }
+    };
+    Json(events).into_response()
+}
+
+/// 查询某 gateway 的换绑审计（bind / 换绑历史，升序）：
+/// `GET /api/v1/admin/gateways/:gateway_id/bindings`。
+///
+/// 与同组子资源（`lifecycle` / `agents`）同口径：网关不存在时返回 `200 []`（不泄露存在性，
+/// 也不把「没有历史」和「网关不存在」分成两个错误码）；绑定入口 `POST /bind` 才做 404。
+pub async fn admin_list_gateway_binding_history(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    client: PeerConnectInfo,
+    Path(gateway_id): Path<String>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    let events = match state.store.list_binding_audit(&gateway_id).await {
+        Ok(events) => events,
+        Err(err) => {
+            return super::error::internal_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                super::codes::GATEWAY_BINDING_HISTORY_LOAD_FAILED,
+                "failed to load gateway binding history",
                 err.display_chain(),
             );
         }
@@ -2611,6 +2782,116 @@ mod tests {
             status,
             serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
         )
+    }
+
+    /// 绑定业务身份：校验 tag-safe、存在性、revision 幂等/递增。
+    #[tokio::test]
+    async fn bind_customer_validates_and_returns_revision() {
+        let state = state_with_store(gateway_store(1));
+        let app = super::super::router_for(state.clone());
+
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/admin/gateways/bind",
+            serde_json::json!({
+                "gateway_id": "gw-001",
+                "customer_id": "tenant-acme",
+                "requested_by": "admin",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["customer_id"], "tenant-acme");
+        assert_eq!(body["revision"], 1);
+        assert_eq!(body["status"], "bound");
+
+        // 同客户重复绑定：revision 不递增。
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/admin/gateways/bind",
+            serde_json::json!({
+                "gateway_id": "gw-001",
+                "customer_id": "tenant-acme",
+                "requested_by": "admin",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["revision"], 1);
+
+        // 换绑：revision 递增。
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/admin/gateways/bind",
+            serde_json::json!({
+                "gateway_id": "gw-001",
+                "customer_id": "tenant-b",
+                "requested_by": "admin",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["revision"], 2);
+
+        // tag-safe 校验：空格直接 400。
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/admin/gateways/bind",
+            serde_json::json!({
+                "gateway_id": "gw-001",
+                "customer_id": "tenant acme",
+                "requested_by": "admin",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            body["error"]["code"],
+            super::super::codes::CUSTOMER_ID_NOT_TAG_SAFE
+        );
+
+        // 不存在的网关：404。
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/admin/gateways/bind",
+            serde_json::json!({
+                "gateway_id": "gw-999",
+                "customer_id": "tenant-acme",
+                "requested_by": "admin",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(
+            body["error"]["code"],
+            super::super::codes::GATEWAY_NOT_FOUND
+        );
+
+        // 换绑审计：只记**归属变化**（首绑 + 换绑），同客户重复绑定不入库。
+        let events = state
+            .store
+            .list_binding_audit("gw-001")
+            .await
+            .expect("audit");
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0].customer_id, "tenant-acme");
+        assert!(events[0].previous_customer_id.is_none());
+        assert_eq!(events[0].requested_by, "admin");
+        assert_eq!(events[1].customer_id, "tenant-b");
+        assert_eq!(
+            events[1].previous_customer_id.as_deref(),
+            Some("tenant-acme")
+        );
+        assert_eq!(events[1].revision, 2);
+        assert_eq!(events[1].requested_by, "admin");
+
+        // 管理面可查：GET .../bindings（升序）。
+        let (status, history) = get_json(&app, "/api/v1/admin/gateways/gw-001/bindings").await;
+        assert_eq!(status, StatusCode::OK, "{history}");
+        let history = history.as_array().expect("array");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1]["customer_id"], "tenant-b");
+        assert_eq!(history[1]["previous_customer_id"], "tenant-acme");
     }
 
     /// 建一份计划（目标都已在册），返回 (state, app, plan_id)。
