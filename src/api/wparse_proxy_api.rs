@@ -233,6 +233,30 @@ pub async fn report_command_result(
                     );
                 }
             }
+            // 回执**报成功但数据面没生效**（`wparse_applied:false`）→ 同样回写原因。
+            // 只有一种来源：gwlinkd 没配 `wparse_apply_command`（`.env` 写了、wparse 没重启），
+            // 现场表现就是“绑了但数据一直带 unbound”，而页面停在「已下发」什么也不说。
+            if snapshot.error.is_none()
+                && let Some(reason) = bind_not_applied_reason(&snapshot.body)
+                && let Ok(Some((kind, body))) = proxy.command_meta(&command_id).await
+                && kind == crate::wparse_proxy::KIND_BIND_TENANT
+            {
+                let revision = body
+                    .as_deref()
+                    .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+                    .and_then(|body| body.get("revision").and_then(|value| value.as_i64()));
+                if let Some(revision) = revision
+                    && let Err(err) = state
+                        .store
+                        .mark_binding_failed(&owner, revision, &reason)
+                        .await
+                {
+                    log::warn!(
+                        "event=GatewayBindingNotAppliedMarkFailed gateway_id={owner} err={}",
+                        err.display_chain()
+                    );
+                }
+            }
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(false) => ApiError::conflict(
@@ -365,6 +389,22 @@ fn restart_kind_for(target: &str) -> Option<&'static str> {
         "gwlinkd" => Some(crate::wparse_proxy::KIND_RESTART_GWLINKD),
         _ => None,
     }
+}
+
+/// `bind-tenant` 回执里「命令成功、但数据面没生效」的原因（纯函数，便于单测）。
+///
+/// 判定只看 `wparse_applied == false`：字段缺失（旧 gwlinkd 的其它 kind 回执）一律当「没说」。
+fn bind_not_applied_reason(result_body: &str) -> Option<String> {
+    let body: serde_json::Value = serde_json::from_str(result_body).ok()?;
+    if body.get("wparse_applied").and_then(|value| value.as_bool()) != Some(false) {
+        return None;
+    }
+    Some(
+        body.get("reason")
+            .and_then(|value| value.as_str())
+            .unwrap_or("数据面未生效（wparse_applied=false）")
+            .to_string(),
+    )
 }
 
 pub async fn admin_restart_gateway(
@@ -540,6 +580,27 @@ mod tests {
         assert_eq!(restart_kind_for(" GWLinkd "), Some("restart-gwlinkd"));
         assert_eq!(restart_kind_for("all"), None, "不支持批量重启");
         assert_eq!(restart_kind_for(""), None);
+    }
+
+    #[test]
+    fn bind_not_applied_reason_only_fires_on_an_explicit_false() {
+        // 没生效 + gwlinkd 给了原因 → 用它的原因。
+        assert_eq!(
+            bind_not_applied_reason(
+                r#"{"tenant_id":"t","revision":1,"wparse_applied":false,"apply":"not_configured","reason":"gwlinkd 未配置 wparse_apply_command"}"#
+            )
+            .as_deref(),
+            Some("gwlinkd 未配置 wparse_apply_command")
+        );
+        // 没生效但旧 gwlinkd 没给原因 → 仍然要说“未生效”，不能当成功。
+        assert_eq!(
+            bind_not_applied_reason(r#"{"wparse_applied":false}"#).as_deref(),
+            Some("数据面未生效（wparse_applied=false）")
+        );
+        // 已生效 / 字段缺失（其它 kind 的 body）/ 不是 JSON → 不处理。
+        assert_eq!(bind_not_applied_reason(r#"{"wparse_applied":true}"#), None);
+        assert_eq!(bind_not_applied_reason(r#"{"restart":"gwlinkd"}"#), None);
+        assert_eq!(bind_not_applied_reason("not json"), None);
     }
 
     #[test]
