@@ -1826,6 +1826,48 @@ pub async fn admin_bind_gateway_customer(
     .into_response()
 }
 
+/// 查询某网关最近一次 `bind-tenant` 命令：GET /api/v1/admin/gateways/:gateway_id/bind-command。
+///
+/// 绑定是**异步远程命令**：POST /bind 只返回绑定事实与“已下发/已生效”，命令本身的状态
+/// （有没有被取走、回执是什么、数据面是否真生效）以前无处可看。
+/// 页面用这个接口展示“下发记录”；`command` 为 `null` = 从未下发过。
+pub async fn admin_latest_bind_command(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    client: PeerConnectInfo,
+    Path(gateway_id): Path<String>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    if let Some(response) =
+        super::wparse_proxy_api::ensure_gateway_exists(&state, &gateway_id).await
+    {
+        return response;
+    }
+    let Some(proxy) = state.proxy.as_ref() else {
+        return super::wparse_proxy_api::proxy_unavailable();
+    };
+    match proxy.latest_bind_command(&gateway_id).await {
+        Ok(command) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "gateway_id": gateway_id,
+                "command": command,
+            })),
+        )
+            .into_response(),
+        Err(err) => super::error::ApiError::internal_with(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            super::codes::COMMAND_STORE_UNAVAILABLE,
+            "failed to load bind command",
+            err,
+        )
+        .into_response(),
+    }
+}
+
 /// 查询网关初始配置（admin 侧）：GET /api/v1/admin/gateways/:gateway_id/config。
 pub async fn admin_get_gateway_initial_config(
     State(state): State<ApiState>,

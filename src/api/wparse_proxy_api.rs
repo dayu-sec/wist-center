@@ -50,7 +50,7 @@ pub struct CommandResultBody {
     pub log_excerpt: Option<String>,
 }
 
-fn proxy_unavailable() -> Response {
+pub(super) fn proxy_unavailable() -> Response {
     ApiError::unavailable(
         codes::WPARSE_PROXY_UNAVAILABLE,
         "wparse proxy is not enabled on this center",

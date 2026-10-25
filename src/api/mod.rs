@@ -69,14 +69,14 @@ use admin_ops::{
     admin_advance_upgrade_plan, admin_approve_upgrade_plan, admin_bind_gateway_customer,
     admin_create_gateway_instance, admin_create_upgrade_plan, admin_dispatch_agent_fleet_command,
     admin_dispatch_global_policy, admin_get_agent_history, admin_get_gateway_history,
-    admin_get_gateway_initial_config, admin_get_gateway_uptime, admin_list_gateway_agents,
-    admin_list_gateway_binding_history, admin_list_gateway_instances, admin_list_gateway_lifecycle,
-    admin_list_gateway_status, admin_list_package_sources, admin_list_releases,
-    admin_list_upgrade_plans, admin_package_source_latest, admin_publish_release,
-    admin_publish_release_batch, admin_resolve_cos, admin_resolve_github_release,
-    admin_retry_upgrade_plan, admin_rotate_gateway_link_token, admin_set_gateway_archived,
-    admin_set_release_status, admin_show_gateway_status, admin_view_gateway_list,
-    admin_view_upgrade_plan,
+    admin_get_gateway_initial_config, admin_get_gateway_uptime, admin_latest_bind_command,
+    admin_list_gateway_agents, admin_list_gateway_binding_history, admin_list_gateway_instances,
+    admin_list_gateway_lifecycle, admin_list_gateway_status, admin_list_package_sources,
+    admin_list_releases, admin_list_upgrade_plans, admin_package_source_latest,
+    admin_publish_release, admin_publish_release_batch, admin_resolve_cos,
+    admin_resolve_github_release, admin_retry_upgrade_plan, admin_rotate_gateway_link_token,
+    admin_set_gateway_archived, admin_set_release_status, admin_show_gateway_status,
+    admin_view_gateway_list, admin_view_upgrade_plan,
 };
 use gateway_ops::{
     download_release_artifact, get_gateway_initial_config, get_gateway_upgrade_plan,
@@ -472,6 +472,11 @@ pub fn router_for(state: ApiState) -> Router {
         .route(
             "/api/v1/admin/gateways/{gateway_id}/bindings",
             get(admin_list_gateway_binding_history),
+        )
+        // 管理面：最近一次 `bind-tenant` 命令的下发记录（命令 ID / 状态 / 回执 / 是否真生效）
+        .route(
+            "/api/v1/admin/gateways/{gateway_id}/bind-command",
+            get(admin_latest_bind_command),
         )
         // 管理面：归档 / 取消归档一台网关（标记，不删除；只允许归档离线网关）
         .route(

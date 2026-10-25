@@ -110,6 +110,53 @@ pub struct CommandResult {
     pub log_excerpt: Option<String>,
 }
 
+/// 最近一次绑定命令（`kind=bind-tenant`）的可见记录。
+///
+/// 绑定客户是**远程命令**：页面必须能看到“发了没 / 被取走没 / 执行结果 / 数据面到底生效没”，
+/// 否则“已下发”这种派生状态一旦与现场不一致就无从排查。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BindCommandRecord {
+    pub command_id: String,
+    /// 队列状态（pending / leased / done / failed / expired）。
+    pub state: String,
+    pub response_status: Option<i32>,
+    /// 网关回执的 `wparse_applied`（数据面是否真的重启/生效）。
+    pub wparse_applied: Option<bool>,
+    /// 网关回执的 `apply`（`not_configured` / `unchanged` …）。
+    pub apply: Option<String>,
+    /// 未生效的原因（网关回执的 `reason`）。
+    pub reason: Option<String>,
+    pub error: Option<String>,
+    pub requested_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// 从 `bind-tenant` 回执 body 里抽出的三个标志（纯函数，便于单测）。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct BindCommandFlags {
+    pub wparse_applied: Option<bool>,
+    pub apply: Option<String>,
+    pub reason: Option<String>,
+}
+
+pub fn bind_command_flags(body: Option<&str>) -> BindCommandFlags {
+    let Some(value) = body.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+    else {
+        return BindCommandFlags::default();
+    };
+    let string_field = |key: &str| {
+        value
+            .get(key)
+            .and_then(|item| item.as_str())
+            .map(str::to_string)
+    };
+    BindCommandFlags {
+        wparse_applied: value.get("wparse_applied").and_then(|item| item.as_bool()),
+        apply: string_field("apply"),
+        reason: string_field("reason"),
+    }
+}
+
 /// 最近一次体检（`kind=diagnose`）的状态与报告。
 ///
 /// `report` 就是 gwlinkd 回传的 `gops run diagnose --json` 原文（已解析）；
@@ -569,6 +616,46 @@ impl WparseProxy {
             Some(id) => Ok((id, false)),
             None => Err(EnqueueError::QueueFull),
         }
+    }
+
+    /// 最近一次 `bind-tenant` 的下发记录（页面「下发记录」用）。
+    ///
+    /// 绑定客户走的是**远程命令**（center → 队列 → gwlinkd 执行 → 回执），
+    /// 以前页面上只有“绑定回执”（POST 的同步返回）与绑定状态，看不到命令本身
+    /// 到底有没有被取走、执行结果是什么、数据面究竟生效没 —— 本次补上。
+    pub async fn latest_bind_command(
+        &self,
+        gateway_id: &str,
+    ) -> ProxyResult<Option<BindCommandRecord>> {
+        let row = sqlx::query(
+            "SELECT command_id, state, response_status, response_body, error,
+                    created_at, updated_at
+               FROM gateway_commands
+              WHERE gateway_id = $1 AND kind = $2
+              ORDER BY created_at DESC, command_id DESC
+              LIMIT 1",
+        )
+        .bind(gateway_id)
+        .bind(KIND_BIND_TENANT)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| format!("load latest bind command: {err}"))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let body: Option<String> = row.get("response_body");
+        let flags = bind_command_flags(body.as_deref());
+        Ok(Some(BindCommandRecord {
+            command_id: row.get("command_id"),
+            state: row.get("state"),
+            response_status: row.get("response_status"),
+            wparse_applied: flags.wparse_applied,
+            apply: flags.apply,
+            reason: flags.reason,
+            error: row.get("error"),
+            requested_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
+        }))
     }
 
     /// 最近一次体检记录（页面展示用）：不管成功/失败/在飞，取最新一条。
@@ -1163,6 +1250,33 @@ mod tests {
         // `None` 与空串同罪。
         let (_, code, _) = validate_reload(&reload(Some("models"), Some(true), None)).unwrap_err();
         assert_eq!(code, "invalid_version");
+    }
+
+    #[test]
+    fn bind_command_flags_reads_the_gateway_receipt() {
+        // gwlinkd 0.17.1+：没生效时带 apply/reason。
+        let flags = bind_command_flags(Some(
+            r#"{"tenant_id":"t","revision":2,"wparse_applied":false,"apply":"not_configured","reason":"gwlinkd 未配置 wparse_apply_command"}"#,
+        ));
+        assert_eq!(flags.wparse_applied, Some(false));
+        assert_eq!(flags.apply.as_deref(), Some("not_configured"));
+        assert_eq!(
+            flags.reason.as_deref(),
+            Some("gwlinkd 未配置 wparse_apply_command")
+        );
+
+        // 生效："apply":"unchanged" 等值原样带出。
+        let flags = bind_command_flags(Some(r#"{"wparse_applied":true,"apply":"unchanged"}"#));
+        assert_eq!(flags.wparse_applied, Some(true));
+        assert_eq!(flags.apply.as_deref(), Some("unchanged"));
+        assert_eq!(flags.reason, None);
+
+        // 命令还在队列里（没回执）/ 回执不是 JSON → 三个字段都 "unspecified"，不能当成成功。
+        assert_eq!(bind_command_flags(None), BindCommandFlags::default());
+        assert_eq!(
+            bind_command_flags(Some("not json")),
+            BindCommandFlags::default()
+        );
     }
 
     #[test]
