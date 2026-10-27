@@ -75,6 +75,22 @@ pub struct RetryRolloutPlanRequest {
     pub target_ids: Vec<String>,
 }
 
+/// 归档 / 取消归档一份执行记录：`POST /api/v1/admin/rollout-plans/{plan_id}/archive`。
+///
+/// 归档是**标记**（`archived_at`），计划与逐目标条目全留；默认列表不再展示，
+/// `{"archived": false}` 随时恢复。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ArchiveRolloutPlanRequest {
+    /// `true` = 归档；`false` = 取消归档。
+    pub archived: bool,
+}
+
+/// 只有**终结态**的计划能被归档 / 删除：`draft` / `rolling` 还在推进，藏起来或删掉会让人
+/// 找不到「批准 / 推进」入口、丢在飞的工作（停用请先推进到了结）。
+pub(super) fn is_terminal(status: &str) -> bool {
+    matches!(status, "completed" | "failed" | "canceled")
+}
+
 // ── 读投影（模型里只到「计划」/「计划 + 条目」的形状；与网关视图同形） ──
 
 #[derive(Debug, Clone, Serialize)]
@@ -100,6 +116,8 @@ pub struct RolloutPlanView {
     pub created_at: DateTime,
     pub approved_by: Option<String>,
     pub approved_at: Option<DateTime>,
+    /// 归档时刻（`None` = 未归档）。前端据此分「执行记录 / 已归档」。
+    pub archived_at: Option<DateTime>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -180,6 +198,7 @@ pub(super) fn plan_view(plan: &UpgradePlanRecord) -> RolloutPlanView {
         created_at: plan.created_at.clone(),
         approved_by: plan.approved_by.clone(),
         approved_at: plan.approved_at.clone(),
+        archived_at: plan.archived_at.clone(),
     }
 }
 
@@ -401,6 +420,7 @@ pub(super) fn build_plan(input: &CreateRolloutPlanRequest) -> Result<UpgradePlan
         created_at: now,
         approved_by: None,
         approved_at: None,
+        archived_at: None,
         entries,
         legacy_steps: Vec::new(),
         legacy_targets: Vec::new(),
@@ -476,6 +496,7 @@ pub(super) fn build_retry_plan(
         created_at: now,
         approved_by: None,
         approved_at: None,
+        archived_at: None,
         entries,
         legacy_steps: Vec::new(),
         legacy_targets: Vec::new(),
@@ -1064,6 +1085,7 @@ mod tests {
             created_at: DateTime::now(),
             approved_by: None,
             approved_at: None,
+            archived_at: None,
             entries,
             legacy_steps: Vec::new(),
             legacy_targets: Vec::new(),

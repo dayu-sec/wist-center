@@ -159,6 +159,41 @@ CREATE TABLE IF NOT EXISTS upgrade_plans (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- 通用后台任务（中心本地作业：入队 → 串行 worker 执行 → 查询）。
+-- payload 存整条 JobRecord（含业务载荷 / 结果 / 进度 / 失败原因）；
+-- kind / queue / state / priority 单独成列，供认领、过滤与索引。
+CREATE TABLE IF NOT EXISTS jobs (
+  job_id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  queue TEXT NOT NULL,
+  -- 业务主体（如 release 的 component），供通用读面按主体过滤。
+  subject TEXT,
+  state TEXT NOT NULL,
+  priority INT NOT NULL DEFAULT 0,
+  payload JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  finished_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_claim
+  ON jobs (queue, state, priority DESC, created_at);
+CREATE INDEX IF NOT EXISTS idx_jobs_recent
+  ON jobs (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_jobs_subject
+  ON jobs (queue, subject, created_at DESC);
+-- 保留期清理：终态任务按 finished_at 删除。
+CREATE INDEX IF NOT EXISTS idx_jobs_cleanup
+  ON jobs (queue, state, finished_at);
+-- 老库补列（终态时间 / 业务主体）。
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS subject TEXT;
+-- 补列后回填历史终态任务的结束时间。
+UPDATE jobs SET finished_at = (payload->>'finished_at')::timestamptz
+  WHERE finished_at IS NULL AND payload->>'finished_at' IS NOT NULL;
+-- 回填 release 任务的主体（老行没有 subject 列）。
+UPDATE jobs SET subject = payload->'payload'->>'component'
+  WHERE subject IS NULL AND queue = 'release-download'
+    AND payload->'payload'->>'component' IS NOT NULL;
+
 -- 规则发布命令队列（WarpStation → Center wparse-proxy → gwlinkd → 本机 wparse）。
 CREATE TABLE IF NOT EXISTS gateway_commands (
   command_id TEXT PRIMARY KEY,

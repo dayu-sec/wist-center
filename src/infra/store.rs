@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use wist_control::GatewayInstanceLifecycleState;
 use wist_control::types::DateTime;
 
+use super::jobs::{CancelOutcome, JobProgress, JobRecord};
 use super::{ReleaseArtifact, ReleasePackage, sha256_hex};
 use crate::config::GatewayCredentialSeed;
 
@@ -43,6 +44,9 @@ pub struct CenterStoreSnapshot {
     pub releases: HashMap<String, Vec<ReleaseRecord>>,
     /// 升级计划（按创建顺序，新→旧）。
     pub upgrade_plans: Vec<UpgradePlanRecord>,
+    /// 远程包下载任务（按创建顺序，新→旧；worker 串行执行）。
+    #[serde(default)]
+    pub jobs: Vec<JobRecord>,
     /// 网关-客户绑定记录。
     pub customer_bindings: Vec<GatewayCustomerBindingRecord>,
     /// 换绑审计（append-only，key = gateway_id，有界保留最近 ~100 条）。
@@ -224,6 +228,10 @@ pub struct UpgradePlanRecord {
     pub approved_by: Option<String>,
     #[serde(default)]
     pub approved_at: Option<DateTime>,
+    /// 归档时刻（`None` = 未归档）。归档是**标记**：计划与逐目标条目全留，
+    /// 默认列表不再展示，`{"archived": false}` 随时恢复。
+    #[serde(default)]
+    pub archived_at: Option<DateTime>,
     /// 逐目标条目（存储上与计划同放，见类型注释）。
     #[serde(default)]
     pub entries: Vec<UpgradePlanEntryRecord>,
@@ -753,6 +761,46 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     ) -> Result<Option<UpgradePlanRecord>, StoreError>;
     /// 覆盖保存一份升级计划（批准 / 推进 / 结果回填都走它）。
     async fn save_upgrade_plan(&self, plan: &UpgradePlanRecord) -> Result<(), StoreError>;
+    /// **物理删除**一份升级计划（计划与逐目标条目同存于一条记录，随计划一并删除）。
+    /// 返回是否命中（`false` = 计划不存在）。调用方负责「只删终结态」那条业务约束
+    /// （执行中的计划还有在飞的工作，存储层不判定状态）。
+    async fn delete_upgrade_plan(&self, plan_id: &str) -> Result<bool, StoreError>;
+    /// 新建一条后台任务（`state=queued`）。
+    async fn create_job(&self, job: &JobRecord) -> Result<(), StoreError>;
+    /// 取一条任务；无则 `None`。
+    async fn get_job(&self, job_id: &str) -> Result<Option<JobRecord>, StoreError>;
+    /// 某队列最近的 `limit` 条任务（新→旧）。
+    async fn list_jobs(&self, queue: &str, limit: usize) -> Result<Vec<JobRecord>, StoreError>;
+    /// 按可选条件列出任务（`queue` / `kind` / `state` / `subject` 都为 `None` 时等于全量最近 N 条）。
+    async fn list_jobs_filtered(
+        &self,
+        queue: Option<&str>,
+        kind: Option<&str>,
+        state: Option<&str>,
+        subject: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<JobRecord>, StoreError>;
+    /// 原子认领某队列最早的一条 `queued` 任务（置 `running` 并写 `started_at`）；无则 `None`。
+    async fn claim_next_job(&self, queue: &str) -> Result<Option<JobRecord>, StoreError>;
+    /// 覆盖保存一条任务（状态流转 / 结果回填）。
+    async fn save_job(&self, job: &JobRecord) -> Result<(), StoreError>;
+    /// 只更新任务的进度（执行中高频回写，不覆盖整条记录）。
+    async fn update_job_progress(
+        &self,
+        job_id: &str,
+        progress: &JobProgress,
+    ) -> Result<(), StoreError>;
+    /// 把某队列上次退出时残留的 `running` 任务排回 `queued`（业务执行需幂等）。
+    /// 返回被重新排队的条数。
+    async fn requeue_running_jobs(&self, queue: &str) -> Result<u64, StoreError>;
+    /// 取消一条**排队中**的任务（原子：与认领竞争时只有一个能成功）。
+    async fn cancel_queued_job(&self, job_id: &str) -> Result<CancelOutcome, StoreError>;
+    /// 删除某队列在 `before` 之前已终结（成功 / 失败 / 已取消）的任务；返回删除条数。
+    async fn delete_terminal_jobs_before(
+        &self,
+        queue: &str,
+        before: &DateTime,
+    ) -> Result<u64, StoreError>;
     /// 绑定网关到客户（幂等：同网关重复绑定同一客户不递增 revision；换绑递增）。
     /// `requested_by` 在同一临界区内写进审计（归属变化时）。
     async fn bind_gateway_customer(
@@ -1328,6 +1376,176 @@ impl FileStore {
         Ok(())
     }
 
+    /// 删除一份升级计划（同步，供测试与 trait 委托）：返回是否命中。
+    pub fn delete_upgrade_plan(&self, plan_id: &str) -> Result<bool, StoreError> {
+        self.update(|snapshot| {
+            let before = snapshot.upgrade_plans.len();
+            snapshot
+                .upgrade_plans
+                .retain(|plan| plan.plan_id != plan_id);
+            snapshot.upgrade_plans.len() != before
+        })
+    }
+
+    /// 新建一条后台任务（同步，供测试与 trait 委托）：插最前（新→旧）。
+    pub fn create_job(&self, job: &JobRecord) -> Result<(), StoreError> {
+        self.update(|snapshot| {
+            snapshot.jobs.insert(0, job.clone());
+        })
+    }
+
+    pub fn get_job(&self, job_id: &str) -> Result<Option<JobRecord>, StoreError> {
+        Ok(self
+            .load()?
+            .jobs
+            .into_iter()
+            .find(|job| job.job_id == job_id))
+    }
+
+    /// 某队列最近的 `limit` 条任务（新→旧）。
+    pub fn list_jobs(&self, queue: &str, limit: usize) -> Result<Vec<JobRecord>, StoreError> {
+        Ok(self
+            .load()?
+            .jobs
+            .into_iter()
+            .filter(|job| job.queue == queue)
+            .take(limit)
+            .collect())
+    }
+
+    /// 按可选条件列出任务（新→旧）。
+    pub fn list_jobs_filtered(
+        &self,
+        queue: Option<&str>,
+        kind: Option<&str>,
+        state: Option<&str>,
+        subject: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<JobRecord>, StoreError> {
+        Ok(self
+            .load()?
+            .jobs
+            .into_iter()
+            .filter(|job| queue.is_none_or(|wanted| job.queue == wanted))
+            .filter(|job| kind.is_none_or(|wanted| job.kind == wanted))
+            .filter(|job| state.is_none_or(|wanted| job.state == wanted))
+            .filter(|job| subject.is_none_or(|wanted| job.subject.as_deref() == Some(wanted)))
+            .take(limit)
+            .collect())
+    }
+
+    /// 原子认领某队列最早的一条 `queued` 任务（整个 `update` 在同一把锁里）。
+    ///
+    /// 顺序：`priority` 大者优先，同优先级按 `created_at` 从早到晚。
+    pub fn claim_next_job(&self, queue: &str) -> Result<Option<JobRecord>, StoreError> {
+        self.update(|snapshot| {
+            let index = snapshot
+                .jobs
+                .iter()
+                .enumerate()
+                .filter(|(_, job)| job.queue == queue && job.state == super::jobs::JOB_QUEUED)
+                .min_by(|(_, left), (_, right)| {
+                    right.priority.cmp(&left.priority).then_with(|| {
+                        left.created_at
+                            .to_chrono()
+                            .cmp(&right.created_at.to_chrono())
+                    })
+                })
+                .map(|(index, _)| index)?;
+            let job = &mut snapshot.jobs[index];
+            job.state = super::jobs::JOB_RUNNING.to_string();
+            job.started_at = Some(DateTime::now());
+            Some(job.clone())
+        })
+    }
+
+    pub fn save_job(&self, job: &JobRecord) -> Result<(), StoreError> {
+        self.update(|snapshot| {
+            let Some(slot) = snapshot
+                .jobs
+                .iter_mut()
+                .find(|existing| existing.job_id == job.job_id)
+            else {
+                return Err(StoreReason::Conflict
+                    .to_err()
+                    .with_detail(job.job_id.clone()));
+            };
+            *slot = job.clone();
+            Ok(())
+        })??;
+        Ok(())
+    }
+
+    /// 只更新任务的进度（找不到任务不报错：进度是 best-effort）。
+    pub fn update_job_progress(
+        &self,
+        job_id: &str,
+        progress: &JobProgress,
+    ) -> Result<(), StoreError> {
+        self.update(|snapshot| {
+            if let Some(job) = snapshot.jobs.iter_mut().find(|job| job.job_id == job_id) {
+                job.progress = progress.clone();
+            }
+        })
+    }
+
+    /// 把某队列残留的 `running` 任务排回 `queued`（返回重排条数）。
+    pub fn requeue_running_jobs(&self, queue: &str) -> Result<u64, StoreError> {
+        self.update(|snapshot| {
+            let mut count = 0_u64;
+            for job in snapshot.jobs.iter_mut() {
+                if job.queue == queue && job.state == super::jobs::JOB_RUNNING {
+                    job.state = super::jobs::JOB_QUEUED.to_string();
+                    job.started_at = None;
+                    // 重启后重新开始：旧的进度不能留在「排队中」的任务上。
+                    job.progress = JobProgress {
+                        message: Some("重新排队中".to_string()),
+                        ..JobProgress::default()
+                    };
+                    count += 1;
+                }
+            }
+            count
+        })
+    }
+
+    /// 取消排队中的任务（同一把锁里判定，和认领互斥）。
+    pub fn cancel_queued_job(&self, job_id: &str) -> Result<CancelOutcome, StoreError> {
+        self.update(|snapshot| {
+            let Some(job) = snapshot.jobs.iter_mut().find(|job| job.job_id == job_id) else {
+                return CancelOutcome::NotFound;
+            };
+            if job.state != super::jobs::JOB_QUEUED {
+                return CancelOutcome::NotCancelable(job.clone());
+            }
+            job.state = super::jobs::JOB_CANCELED.to_string();
+            job.finished_at = Some(DateTime::now());
+            job.progress.message = Some("已取消".to_string());
+            CancelOutcome::Canceled(job.clone())
+        })
+    }
+
+    /// 删除某队列在 `before` 之前已终结的任务（返回删除条数）。
+    pub fn delete_terminal_jobs_before(
+        &self,
+        queue: &str,
+        before: &DateTime,
+    ) -> Result<u64, StoreError> {
+        self.update(|snapshot| {
+            let total = snapshot.jobs.len();
+            snapshot.jobs.retain(|job| {
+                let expired = job.queue == queue
+                    && job.is_terminal()
+                    && job
+                        .finished_at
+                        .as_ref()
+                        .is_some_and(|finished| finished.to_chrono() < before.to_chrono());
+                !expired
+            });
+            (total - snapshot.jobs.len()) as u64
+        })
+    }
+
     /// 绑定网关到客户（同步，供测试与 trait 委托）：同网关重复绑定同一客户不递增 revision；换绑递增。
     ///
     /// **归属变化时在同一把锁里**追加一条审计（`requested_by` 一并落库）：读旧值、改绑定、写审计
@@ -1846,6 +2064,65 @@ impl Store for FileStore {
 
     async fn save_upgrade_plan(&self, plan: &UpgradePlanRecord) -> Result<(), StoreError> {
         FileStore::save_upgrade_plan(self, plan)
+    }
+
+    async fn delete_upgrade_plan(&self, plan_id: &str) -> Result<bool, StoreError> {
+        FileStore::delete_upgrade_plan(self, plan_id)
+    }
+
+    async fn create_job(&self, job: &JobRecord) -> Result<(), StoreError> {
+        FileStore::create_job(self, job)
+    }
+
+    async fn get_job(&self, job_id: &str) -> Result<Option<JobRecord>, StoreError> {
+        FileStore::get_job(self, job_id)
+    }
+
+    async fn list_jobs(&self, queue: &str, limit: usize) -> Result<Vec<JobRecord>, StoreError> {
+        FileStore::list_jobs(self, queue, limit)
+    }
+
+    async fn list_jobs_filtered(
+        &self,
+        queue: Option<&str>,
+        kind: Option<&str>,
+        state: Option<&str>,
+        subject: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<JobRecord>, StoreError> {
+        FileStore::list_jobs_filtered(self, queue, kind, state, subject, limit)
+    }
+
+    async fn claim_next_job(&self, queue: &str) -> Result<Option<JobRecord>, StoreError> {
+        FileStore::claim_next_job(self, queue)
+    }
+
+    async fn save_job(&self, job: &JobRecord) -> Result<(), StoreError> {
+        FileStore::save_job(self, job)
+    }
+
+    async fn update_job_progress(
+        &self,
+        job_id: &str,
+        progress: &JobProgress,
+    ) -> Result<(), StoreError> {
+        FileStore::update_job_progress(self, job_id, progress)
+    }
+
+    async fn requeue_running_jobs(&self, queue: &str) -> Result<u64, StoreError> {
+        FileStore::requeue_running_jobs(self, queue)
+    }
+
+    async fn cancel_queued_job(&self, job_id: &str) -> Result<CancelOutcome, StoreError> {
+        FileStore::cancel_queued_job(self, job_id)
+    }
+
+    async fn delete_terminal_jobs_before(
+        &self,
+        queue: &str,
+        before: &DateTime,
+    ) -> Result<u64, StoreError> {
+        FileStore::delete_terminal_jobs_before(self, queue, before)
     }
 
     async fn bind_gateway_customer(
@@ -2845,6 +3122,204 @@ mod tests {
             .expect("binding");
         assert_eq!(applied.status, "applied");
         assert!(applied.last_error.is_none());
+        let _ = fs::remove_file(path);
+    }
+
+    /// 通用任务：认领按「优先级高者优先，其次最早入队」、`running` 残留可重排回
+    /// `queued`，进度可单独更新，终态写回后 `get` / `list` 都能看到。
+    #[test]
+    fn jobs_claim_fifo_and_requeue_running() {
+        let path = test_store_path();
+        let store = FileStore::new(&path);
+        let payload = serde_json::json!({ "component": "wist-agentd" });
+        let mut first =
+            JobRecord::queued("release-download", "release-download", payload.clone(), 0);
+        first.job_id = "job-first".to_string();
+        let mut second = JobRecord::queued("release-download", "release-download", payload, 0);
+        second.job_id = "job-second".to_string();
+        store.create_job(&first).expect("create first");
+        store.create_job(&second).expect("create second");
+
+        let claimed = store
+            .claim_next_job("release-download")
+            .expect("claim")
+            .expect("job");
+        assert_eq!(claimed.job_id, "job-first", "最早入队的先跑");
+        assert_eq!(claimed.state, super::super::jobs::JOB_RUNNING);
+        assert!(claimed.started_at.is_some());
+        assert!(
+            store
+                .claim_next_job("release-download")
+                .expect("claim")
+                .is_some(),
+            "第二条也能被认领"
+        );
+
+        // 进度单独回写，不覆盖整条记录。
+        store
+            .update_job_progress(
+                "job-first",
+                &JobProgress {
+                    completed: 1,
+                    total: 3,
+                    message: Some("取包中（2/3）".to_string()),
+                },
+            )
+            .expect("progress");
+        let progress = store
+            .get_job("job-first")
+            .expect("get")
+            .expect("job")
+            .progress;
+        assert_eq!(progress.completed, 1);
+        assert_eq!(progress.total, 3);
+
+        // 模拟进程重启：两条 running 都排回 queued。
+        assert_eq!(
+            store
+                .requeue_running_jobs("release-download")
+                .expect("requeue"),
+            2
+        );
+        let queued = store.list_jobs("release-download", 10).expect("list");
+        assert_eq!(queued.len(), 2);
+        assert!(
+            queued
+                .iter()
+                .all(|job| job.state == super::super::jobs::JOB_QUEUED),
+            "{queued:?}"
+        );
+        // 重新排队后旧进度要清掉（否则 UI 会在「排队中」显示上一次的 1/3）。
+        let requeued = store.get_job("job-first").expect("get").expect("job");
+        assert_eq!(requeued.progress.completed, 0);
+        assert_eq!(requeued.progress.total, 0);
+
+        // 回填终态后可按 id 取回。
+        let mut done = store.get_job("job-first").expect("get").expect("job");
+        done.state = super::super::jobs::JOB_SUCCEEDED.to_string();
+        done.finished_at = Some(DateTime::now());
+        store.save_job(&done).expect("save");
+        let loaded = store.get_job("job-first").expect("get").expect("job");
+        assert_eq!(loaded.state, super::super::jobs::JOB_SUCCEEDED);
+        let _ = fs::remove_file(path);
+    }
+
+    /// 取消只受理排队中（运行中 / 已终结回 NotCancelable）；保留期清理只删
+    /// 已终结且 `finished_at` 超期的任务。
+    #[test]
+    fn jobs_cancel_and_retention() {
+        let path = test_store_path();
+        let store = FileStore::new(&path);
+        let payload = serde_json::json!({ "component": "wist-agentd" });
+        let mk = |id: &str| {
+            let mut job =
+                JobRecord::queued("release-download", "release-download", payload.clone(), 0);
+            job.job_id = id.to_string();
+            job
+        };
+
+        store.create_job(&mk("job-a")).expect("create a");
+        store.create_job(&mk("job-b")).expect("create b");
+        // A 已被 worker 认领 → 不能取消。
+        let claimed = store
+            .claim_next_job("release-download")
+            .expect("claim")
+            .expect("job");
+        assert_eq!(claimed.job_id, "job-a");
+        match store.cancel_queued_job("job-a").expect("cancel a") {
+            CancelOutcome::NotCancelable(job) => {
+                assert_eq!(job.state, super::super::jobs::JOB_RUNNING)
+            }
+            other => panic!("running job must not be cancelable: {other:?}"),
+        }
+
+        // B 仍在排队 → 取消成功。
+        match store.cancel_queued_job("job-b").expect("cancel b") {
+            CancelOutcome::Canceled(job) => {
+                assert_eq!(job.state, super::super::jobs::JOB_CANCELED);
+                assert!(job.finished_at.is_some());
+            }
+            other => panic!("queued job should cancel: {other:?}"),
+        }
+        assert!(matches!(
+            store
+                .cancel_queued_job("job-missing")
+                .expect("cancel missing"),
+            CancelOutcome::NotFound
+        ));
+
+        // 造一条 8 天前完成的终态任务 → 保留期 7 天清理把它删掉。
+        store.create_job(&mk("job-old")).expect("create old");
+        let old = store
+            .claim_next_job("release-download")
+            .expect("claim old")
+            .expect("old job");
+        let mut old = old;
+        old.state = super::super::jobs::JOB_SUCCEEDED.to_string();
+        old.finished_at = Some(DateTime::in_days(-8));
+        store.save_job(&old).expect("finish old");
+        assert_eq!(
+            store
+                .delete_terminal_jobs_before("release-download", &DateTime::in_days(-7))
+                .expect("cleanup"),
+            1
+        );
+        assert!(store.get_job("job-old").expect("get old").is_none());
+        assert!(
+            store.get_job("job-a").expect("get a").is_some(),
+            "运行中不清理"
+        );
+        assert!(
+            store.get_job("job-b").expect("get b").is_some(),
+            "刚取消的任务未超期"
+        );
+
+        // 通用读面的状态过滤。
+        let canceled = store
+            .list_jobs_filtered(
+                Some("release-download"),
+                None,
+                Some(super::super::jobs::JOB_CANCELED),
+                None,
+                10,
+            )
+            .expect("filtered");
+        assert_eq!(canceled.len(), 1);
+        assert_eq!(canceled[0].job_id, "job-b");
+        let _ = fs::remove_file(path);
+    }
+
+    /// 主体过滤必须在 **limit 之前**生效：目标主体的任务不能被更新的其它主体挤掉。
+    #[test]
+    fn jobs_filter_by_subject_before_limit() {
+        let path = test_store_path();
+        let store = FileStore::new(&path);
+        let mut target = JobRecord::queued(
+            "release-download",
+            "release-download",
+            serde_json::json!({}),
+            0,
+        )
+        .with_subject("component-a");
+        target.job_id = "job-target".to_string();
+        store.create_job(&target).expect("create target");
+        for index in 0..5 {
+            let mut other = JobRecord::queued(
+                "release-download",
+                "release-download",
+                serde_json::json!({}),
+                0,
+            )
+            .with_subject("component-b");
+            other.job_id = format!("job-other-{index}");
+            store.create_job(&other).expect("create other");
+        }
+
+        let found = store
+            .list_jobs_filtered(Some("release-download"), None, None, Some("component-a"), 1)
+            .expect("filtered");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].job_id, "job-target");
         let _ = fs::remove_file(path);
     }
 }

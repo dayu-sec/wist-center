@@ -67,15 +67,17 @@ pub(crate) fn is_tag_safe(value: &str) -> bool {
 
 use admin_ops::{
     admin_advance_upgrade_plan, admin_approve_upgrade_plan, admin_bind_gateway_customer,
-    admin_create_gateway_instance, admin_create_upgrade_plan, admin_dispatch_agent_fleet_command,
-    admin_dispatch_global_policy, admin_get_agent_history, admin_get_gateway_history,
-    admin_get_gateway_initial_config, admin_get_gateway_uptime, admin_latest_bind_command,
+    admin_cancel_job, admin_create_gateway_instance, admin_create_upgrade_plan,
+    admin_delete_upgrade_plan, admin_dispatch_agent_fleet_command, admin_dispatch_global_policy,
+    admin_get_agent_history, admin_get_gateway_history, admin_get_gateway_initial_config,
+    admin_get_gateway_uptime, admin_get_job, admin_get_release_job, admin_latest_bind_command,
     admin_list_gateway_agents, admin_list_gateway_binding_history, admin_list_gateway_instances,
-    admin_list_gateway_lifecycle, admin_list_gateway_status, admin_list_package_sources,
-    admin_list_releases, admin_list_upgrade_plans, admin_package_source_latest,
-    admin_publish_release, admin_publish_release_batch, admin_resolve_cos,
-    admin_resolve_github_release, admin_retry_upgrade_plan, admin_rotate_gateway_link_token,
-    admin_set_gateway_archived, admin_set_release_status, admin_show_gateway_status,
+    admin_list_gateway_lifecycle, admin_list_gateway_status, admin_list_jobs,
+    admin_list_package_sources, admin_list_release_jobs, admin_list_releases,
+    admin_list_upgrade_plans, admin_package_source_latest, admin_publish_release,
+    admin_publish_release_batch, admin_resolve_cos, admin_resolve_github_release,
+    admin_retry_upgrade_plan, admin_rotate_gateway_link_token, admin_set_gateway_archived,
+    admin_set_release_status, admin_set_upgrade_plan_archived, admin_show_gateway_status,
     admin_view_gateway_list, admin_view_upgrade_plan,
 };
 use gateway_ops::{
@@ -110,6 +112,8 @@ pub struct ApiState {
     pub gateway_ca: Arc<crate::infra::gateway_ca::GatewayCa>,
     /// 规则发布兼容入口（命令队列 + proxy token）；未启用时为 `None`。
     pub proxy: Option<Arc<crate::wparse_proxy::WparseProxy>>,
+    /// 远程包下载任务的串行队列（发布端点只入队，worker 后台取包 / 校验 / 镜像 / 落库）。
+    pub jobs: Arc<crate::infra::JobQueue>,
 }
 
 /// 控制中心是否要求 TLS：按 `public_url` scheme 推导（https → true，http → false）。
@@ -186,17 +190,28 @@ pub fn router(
     gateway_ca: Arc<crate::infra::gateway_ca::GatewayCa>,
     proxy: Option<Arc<crate::wparse_proxy::WparseProxy>>,
 ) -> Router {
-    router_for(state_of(config, store, gateway_ca, proxy))
+    router_for(state_of(config, store, gateway_ca, proxy, true))
 }
 
 /// 构造共享状态（两个监听面各用一份，字段都是 `Arc` / `Clone`）。
+///
+/// `start_release_worker`：只在**管理面**（或单 listener 模式）起下载 worker —— 网关面虽然也
+/// 共享同一个 store，但不接发布请求，没必要再起一个空转的 worker。
 fn state_of(
     config: CenterConfig,
     store: Arc<dyn Store>,
     gateway_ca: Arc<crate::infra::gateway_ca::GatewayCa>,
     proxy: Option<Arc<crate::wparse_proxy::WparseProxy>>,
+    start_release_worker: bool,
 ) -> ApiState {
     let artifact_store = crate::infra::build_artifact_store(&config);
+    let jobs = crate::infra::release_job_queue(store.clone(), artifact_store.clone());
+    // 管理面起 worker；网关面虽然共享同一个 store，但不接发布请求，没必要再起一个空转的 worker。
+    // 测试想检查「排队中」的形状就直接 `store.create_job`，不要走 HTTP 发布端点 ——
+    // `JobQueue::enqueue` 里的懒启动会把 worker 拉起来把任务跑掉。
+    if start_release_worker {
+        jobs.start();
+    }
     ApiState {
         config,
         store,
@@ -204,6 +219,7 @@ fn state_of(
         rate_limits: Arc::new(Mutex::new(rate_limit::RateLimitState::default())),
         gateway_ca,
         proxy,
+        jobs,
     }
 }
 
@@ -255,7 +271,7 @@ pub fn gateway_router(
     proxy: Option<Arc<crate::wparse_proxy::WparseProxy>>,
 ) -> Router {
     scoped_router(
-        state_of(config, store, gateway_ca, proxy),
+        state_of(config, store, gateway_ca, proxy, false),
         ListenerScope::Gateway,
     )
 }
@@ -268,7 +284,7 @@ pub fn admin_router(
     proxy: Option<Arc<crate::wparse_proxy::WparseProxy>>,
 ) -> Router {
     scoped_router(
-        state_of(config, store, gateway_ca, proxy),
+        state_of(config, store, gateway_ca, proxy, true),
         ListenerScope::Admin,
     )
 }
@@ -498,6 +514,16 @@ pub fn router_for(state: ApiState) -> Router {
             "/api/v1/admin/releases/{component}/batch",
             post(admin_publish_release_batch),
         )
+        // 管理面：远程包下载任务（发布端点只入队；这里查进度 / 列最近任务）
+        .route("/api/v1/admin/release-jobs", get(admin_list_release_jobs))
+        .route(
+            "/api/v1/admin/release-jobs/{job_id}",
+            get(admin_get_release_job),
+        )
+        // 通用任务面：列 / 查 / 取消（只取消排队中的任务）。
+        .route("/api/v1/admin/jobs", get(admin_list_jobs))
+        .route("/api/v1/admin/jobs/{job_id}", get(admin_get_job))
+        .route("/api/v1/admin/jobs/{job_id}/cancel", post(admin_cancel_job))
         // 管理面：安装包来源（录入页按版本号拼 URL 做探活）
         .route(
             "/api/v1/admin/package-sources",
@@ -546,7 +572,12 @@ pub fn router_for(state: ApiState) -> Router {
         )
         .route(
             "/api/v1/admin/rollout-plans/{plan_id}",
-            get(admin_view_upgrade_plan),
+            get(admin_view_upgrade_plan).delete(admin_delete_upgrade_plan),
+        )
+        // 归档 / 取消归档执行记录：只受理终结态（completed / failed / canceled）。
+        .route(
+            "/api/v1/admin/rollout-plans/{plan_id}/archive",
+            post(admin_set_upgrade_plan_archived),
         )
         // 兜底：未命中的路径 / 方法也回统一错误信封（默认 axum 是空体）。
         .fallback(fallback_not_found)

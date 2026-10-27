@@ -1363,6 +1363,18 @@ mod tests {
         request
     }
 
+    /// 网关面测试不跑下载任务；给 ApiState 一个独立的空队列即可（不调用 `start`，无常驻任务）。
+    fn inert_jobs() -> std::sync::Arc<crate::infra::JobQueue> {
+        let path = temp_state_path("wic-jobs-test");
+        crate::infra::release_job_queue(
+            std::sync::Arc::new(FileStore::new(&path)),
+            std::sync::Arc::new(crate::infra::LocalArtifactStore::new(
+                std::env::temp_dir().join("wic-artifacts"),
+                "http://127.0.0.1:3100",
+            )),
+        )
+    }
+
     fn test_state() -> ApiState {
         let path = temp_state_path("wic-api-test");
         let store = FileStore::new(&path);
@@ -1419,6 +1431,7 @@ mod tests {
             rate_limits: std::sync::Arc::new(std::sync::Mutex::new(
                 super::super::rate_limit::RateLimitState::default(),
             )),
+            jobs: inert_jobs(),
         }
     }
 
@@ -1485,6 +1498,7 @@ mod tests {
             rate_limits: std::sync::Arc::new(std::sync::Mutex::new(
                 super::super::rate_limit::RateLimitState::default(),
             )),
+            jobs: inert_jobs(),
         }
     }
 
@@ -1538,6 +1552,7 @@ mod tests {
             rate_limits: std::sync::Arc::new(std::sync::Mutex::new(
                 super::super::rate_limit::RateLimitState::default(),
             )),
+            jobs: inert_jobs(),
         }
     }
 
@@ -3355,6 +3370,7 @@ mod tests {
             rate_limits: std::sync::Arc::new(std::sync::Mutex::new(
                 super::super::rate_limit::RateLimitState::default(),
             )),
+            jobs: inert_jobs(),
         };
         let app = super::super::router_for(state);
         let response = app

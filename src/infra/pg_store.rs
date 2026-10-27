@@ -11,10 +11,10 @@ use wist_error::{StoreError, StoreReason};
 use crate::config::GatewayCredentialSeed;
 
 use super::{
-    EnrollmentTokenIssue, GatewayBindingAuditEvent, GatewayCustomerBindingRecord,
-    GatewayStatusUpdate, LifecycleEvent, ReleaseRecord, Store, StoredAgent, StoredEnrollmentToken,
-    StoredGateway, StoredGatewayCredentialStatus, UpgradePlanRecord, normalize_upgrade_plan,
-    sha256_hex,
+    CancelOutcome, EnrollmentTokenIssue, GatewayBindingAuditEvent, GatewayCustomerBindingRecord,
+    GatewayStatusUpdate, JobProgress, JobRecord, LifecycleEvent, ReleaseRecord, Store, StoredAgent,
+    StoredEnrollmentToken, StoredGateway, StoredGatewayCredentialStatus, UpgradePlanRecord,
+    normalize_upgrade_plan, sha256_hex,
 };
 
 #[derive(Debug, Clone)]
@@ -947,6 +947,246 @@ impl Store for PgStore {
         Ok(())
     }
 
+    async fn delete_upgrade_plan(&self, plan_id: &str) -> Result<bool, StoreError> {
+        let affected = sqlx::query("DELETE FROM upgrade_plans WHERE plan_id = $1")
+            .bind(plan_id)
+            .execute(&self.pool)
+            .await
+            .source_raw_err(StoreReason::Sql, "delete upgrade plan")?;
+        Ok(affected.rows_affected() > 0)
+    }
+
+    async fn create_job(&self, job: &JobRecord) -> Result<(), StoreError> {
+        let payload = serde_json::to_value(job).source_err(StoreReason::Json, "serialize job")?;
+        sqlx::query(
+            "INSERT INTO jobs (job_id, kind, queue, subject, state, priority, payload, finished_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(&job.job_id)
+        .bind(&job.kind)
+        .bind(&job.queue)
+        .bind(&job.subject)
+        .bind(&job.state)
+        .bind(job.priority)
+        .bind(payload)
+        .bind(job.finished_at.as_ref().map(|value| value.to_chrono()))
+        .execute(&self.pool)
+        .await
+        .source_raw_err(StoreReason::Sql, "insert job")?;
+        Ok(())
+    }
+
+    async fn get_job(&self, job_id: &str) -> Result<Option<JobRecord>, StoreError> {
+        let row: Option<(serde_json::Value,)> =
+            sqlx::query_as("SELECT payload FROM jobs WHERE job_id = $1")
+                .bind(job_id)
+                .fetch_optional(&self.pool)
+                .await
+                .source_raw_err(StoreReason::Sql, "select job")?;
+        let Some((payload,)) = row else {
+            return Ok(None);
+        };
+        let job: JobRecord =
+            serde_json::from_value(payload).source_err(StoreReason::Json, "deserialize job")?;
+        Ok(Some(job))
+    }
+
+    async fn list_jobs(&self, queue: &str, limit: usize) -> Result<Vec<JobRecord>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT payload FROM jobs WHERE queue = $1 ORDER BY created_at DESC LIMIT $2",
+        )
+        .bind(queue)
+        .bind(limit.clamp(1, 200) as i64)
+        .fetch_all(&self.pool)
+        .await
+        .source_raw_err(StoreReason::Sql, "list jobs")?;
+        let mut jobs = Vec::with_capacity(rows.len());
+        for row in rows {
+            let payload: serde_json::Value = row
+                .try_get("payload")
+                .source_raw_err(StoreReason::Sql, "read job payload")?;
+            jobs.push(
+                serde_json::from_value(payload).source_err(StoreReason::Json, "deserialize job")?,
+            );
+        }
+        Ok(jobs)
+    }
+
+    async fn list_jobs_filtered(
+        &self,
+        queue: Option<&str>,
+        kind: Option<&str>,
+        state: Option<&str>,
+        subject: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<JobRecord>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT payload FROM jobs \
+             WHERE ($1::text IS NULL OR queue = $1) \
+               AND ($2::text IS NULL OR kind = $2) \
+               AND ($3::text IS NULL OR state = $3) \
+               AND ($4::text IS NULL OR subject = $4) \
+             ORDER BY created_at DESC LIMIT $5",
+        )
+        .bind(queue)
+        .bind(kind)
+        .bind(state)
+        .bind(subject)
+        .bind(limit.clamp(1, 200) as i64)
+        .fetch_all(&self.pool)
+        .await
+        .source_raw_err(StoreReason::Sql, "list jobs filtered")?;
+        let mut jobs = Vec::with_capacity(rows.len());
+        for row in rows {
+            let payload: serde_json::Value = row
+                .try_get("payload")
+                .source_raw_err(StoreReason::Sql, "read job payload")?;
+            jobs.push(
+                serde_json::from_value(payload).source_err(StoreReason::Json, "deserialize job")?,
+            );
+        }
+        Ok(jobs)
+    }
+
+    async fn claim_next_job(&self, queue: &str) -> Result<Option<JobRecord>, StoreError> {
+        // `FOR UPDATE SKIP LOCKED`：多实例部署时一条任务只会被一个 worker 认领。
+        let row: Option<(serde_json::Value,)> = sqlx::query_as(
+            "UPDATE jobs SET state = 'running', \
+             payload = jsonb_set(payload, '{state}', '\"running\"'::jsonb) \
+             WHERE job_id = (\
+               SELECT job_id FROM jobs \
+               WHERE queue = $1 AND state = 'queued' \
+               ORDER BY priority DESC, created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED\
+             ) RETURNING payload",
+        )
+        .bind(queue)
+        .fetch_optional(&self.pool)
+        .await
+        .source_raw_err(StoreReason::Sql, "claim job")?;
+        let Some((payload,)) = row else {
+            return Ok(None);
+        };
+        let mut job: JobRecord = serde_json::from_value(payload)
+            .source_err(StoreReason::Json, "deserialize claimed job")?;
+        job.state = super::jobs::JOB_RUNNING.to_string();
+        job.started_at = Some(DateTime::now());
+        // 把 `started_at` 一并落回 payload（claim 只改了 state）。
+        self.save_job(&job).await?;
+        Ok(Some(job))
+    }
+
+    async fn save_job(&self, job: &JobRecord) -> Result<(), StoreError> {
+        let payload = serde_json::to_value(job).source_err(StoreReason::Json, "serialize job")?;
+        sqlx::query(
+            "INSERT INTO jobs (job_id, kind, queue, subject, state, priority, payload, finished_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+             ON CONFLICT (job_id) DO UPDATE SET \
+               kind = EXCLUDED.kind, queue = EXCLUDED.queue, subject = EXCLUDED.subject, \
+               state = EXCLUDED.state, priority = EXCLUDED.priority, \
+               payload = EXCLUDED.payload, finished_at = EXCLUDED.finished_at",
+        )
+        .bind(&job.job_id)
+        .bind(&job.kind)
+        .bind(&job.queue)
+        .bind(&job.subject)
+        .bind(&job.state)
+        .bind(job.priority)
+        .bind(payload)
+        .bind(job.finished_at.as_ref().map(|value| value.to_chrono()))
+        .execute(&self.pool)
+        .await
+        .source_raw_err(StoreReason::Sql, "save job")?;
+        Ok(())
+    }
+
+    async fn update_job_progress(
+        &self,
+        job_id: &str,
+        progress: &JobProgress,
+    ) -> Result<(), StoreError> {
+        let value = serde_json::to_value(progress)
+            .source_err(StoreReason::Json, "serialize job progress")?;
+        sqlx::query(
+            "UPDATE jobs SET payload = jsonb_set(payload, '{progress}', $2) WHERE job_id = $1",
+        )
+        .bind(job_id)
+        .bind(value)
+        .execute(&self.pool)
+        .await
+        .source_raw_err(StoreReason::Sql, "update job progress")?;
+        Ok(())
+    }
+
+    async fn requeue_running_jobs(&self, queue: &str) -> Result<u64, StoreError> {
+        let rows = sqlx::query("SELECT payload FROM jobs WHERE queue = $1 AND state = 'running'")
+            .bind(queue)
+            .fetch_all(&self.pool)
+            .await
+            .source_raw_err(StoreReason::Sql, "list running jobs")?;
+        let mut count = 0_u64;
+        for row in rows {
+            let payload: serde_json::Value = row
+                .try_get("payload")
+                .source_raw_err(StoreReason::Sql, "read running job payload")?;
+            let mut job: JobRecord = serde_json::from_value(payload)
+                .source_err(StoreReason::Json, "deserialize running job")?;
+            job.state = super::jobs::JOB_QUEUED.to_string();
+            job.started_at = None;
+            // 重启后重新开始：旧的进度不能留在「排队中」的任务上。
+            job.progress = JobProgress {
+                message: Some("重新排队中".to_string()),
+                ..JobProgress::default()
+            };
+            self.save_job(&job).await?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    async fn cancel_queued_job(&self, job_id: &str) -> Result<CancelOutcome, StoreError> {
+        // 条件更新：只有 `queued` 能被取消；与 worker 的认领互斥，只有一个能成功。
+        let row: Option<(serde_json::Value,)> = sqlx::query_as(
+            "UPDATE jobs SET state = 'canceled', \
+             payload = jsonb_set(payload, '{state}', '\"canceled\"'::jsonb) \
+             WHERE job_id = $1 AND state = 'queued' RETURNING payload",
+        )
+        .bind(job_id)
+        .fetch_optional(&self.pool)
+        .await
+        .source_raw_err(StoreReason::Sql, "cancel queued job")?;
+        if let Some((payload,)) = row {
+            let mut job: JobRecord = serde_json::from_value(payload)
+                .source_err(StoreReason::Json, "deserialize canceled job")?;
+            job.state = super::jobs::JOB_CANCELED.to_string();
+            job.finished_at = Some(DateTime::now());
+            job.progress.message = Some("已取消".to_string());
+            self.save_job(&job).await?;
+            return Ok(CancelOutcome::Canceled(job));
+        }
+        Ok(match self.get_job(job_id).await? {
+            Some(job) => CancelOutcome::NotCancelable(job),
+            None => CancelOutcome::NotFound,
+        })
+    }
+
+    async fn delete_terminal_jobs_before(
+        &self,
+        queue: &str,
+        before: &DateTime,
+    ) -> Result<u64, StoreError> {
+        let affected = sqlx::query(
+            "DELETE FROM jobs WHERE queue = $1 \
+             AND state IN ('succeeded', 'failed', 'canceled') \
+             AND finished_at IS NOT NULL AND finished_at < $2",
+        )
+        .bind(queue)
+        .bind(before.to_chrono())
+        .execute(&self.pool)
+        .await
+        .source_raw_err(StoreReason::Sql, "delete terminal jobs")?;
+        Ok(affected.rows_affected())
+    }
+
     async fn bind_gateway_customer(
         &self,
         gateway_id: &str,
@@ -1333,7 +1573,14 @@ mod tests {
             .await
             .expect("create");
         assert_eq!(stored.gateway_id, gateway_id);
-        assert_eq!(stored.credential_token_hash, sha256_hex("it-token"));
+        // 一次性链接令牌的摘要落在 `link_token_hash`；网关凭据摘要是**注册时**才签发的，
+        // 这里不该有值（旧断言拿凭据摘要去比，已随「一次性链接令牌」改造失效）。
+        assert_eq!(stored.link_token_hash, sha256_hex("it-token"));
+        assert!(
+            stored.credential_token_hash.is_empty(),
+            "创建阶段不应签发凭据：{}",
+            stored.credential_token_hash
+        );
         assert_eq!(
             stored.credential_status,
             StoredGatewayCredentialStatus::Active
@@ -1493,5 +1740,188 @@ mod tests {
             .execute(&store.pool)
             .await
             .expect("cleanup audit");
+    }
+
+    /// 集成测试：通用任务队列在 PG 上的行为与 FileStore **同一口径**
+    /// （认领顺序 / 主体过滤 / 取消 / 保留期清理 / 重排）。需本地 PostgreSQL。
+    ///
+    /// 这条测试是必要的：FileStore 的用例再全，也盖不住 `FOR UPDATE SKIP LOCKED`、
+    /// `subject` 过滤条件和 `payload ->` 回填这些只存在于 SQL 里的逻辑。
+    ///
+    /// 运行：`cargo test -p wist-center -- --ignored pg_store_jobs_round_trip`
+    #[tokio::test]
+    #[ignore = "需要本地 PostgreSQL（docker compose up -d postgres）"]
+    async fn pg_store_jobs_round_trip() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        use crate::infra::jobs::{JOB_CANCELED, JOB_QUEUED, JOB_RUNNING, JOB_SUCCEEDED};
+
+        let database_url = std::env::var("WARP_INSIGHT_CENTER_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://demo:demo@127.0.0.1:55432/insight_demo".to_string());
+        let store = PgStore::connect(&database_url).await.expect("connect pg");
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        // 每条任务 / 队列都带本次运行的唯一后缀：重复跑、并行跑都不会互相干扰。
+        let queue = format!("pg-jobs-{nanos}");
+        let payload = serde_json::json!({ "component": "wist-agentd" });
+        let mk = |tag: &str, subject: &str, priority: i32| {
+            let mut job =
+                JobRecord::queued(queue.clone(), "release-download", payload.clone(), priority)
+                    .with_subject(subject);
+            job.job_id = format!("{queue}-{tag}");
+            job
+        };
+
+        // --- 认领顺序：优先级高者优先，同优先级按入队时间 ---
+        store
+            .create_job(&mk("low", "component-a", 0))
+            .await
+            .expect("create low");
+        store
+            .create_job(&mk("high", "component-a", 5))
+            .await
+            .expect("create high");
+        let claimed = store
+            .claim_next_job(&queue)
+            .await
+            .expect("claim")
+            .expect("job");
+        assert_eq!(claimed.job_id, format!("{queue}-high"), "优先级大的先跑");
+        assert_eq!(claimed.state, JOB_RUNNING);
+        assert!(claimed.started_at.is_some());
+        assert_eq!(claimed.subject.as_deref(), Some("component-a"));
+
+        // 认领是原子的：第二条不会拿到同一条。
+        let second = store
+            .claim_next_job(&queue)
+            .await
+            .expect("claim second")
+            .expect("job");
+        assert_eq!(second.job_id, format!("{queue}-low"));
+        assert!(
+            store
+                .claim_next_job(&queue)
+                .await
+                .expect("claim empty")
+                .is_none()
+        );
+
+        // --- 主体过滤必须在 limit 之前生效 ---
+        store
+            .create_job(&mk("other", "component-b", 0))
+            .await
+            .expect("create other");
+        let filtered = store
+            .list_jobs_filtered(Some(&queue), None, None, Some("component-a"), 1)
+            .await
+            .expect("filtered");
+        assert_eq!(filtered.len(), 1, "{filtered:?}");
+        assert_eq!(filtered[0].subject.as_deref(), Some("component-a"));
+
+        // --- 重排 running：清掉旧进度 ---
+        store
+            .update_job_progress(
+                &format!("{queue}-high"),
+                &JobProgress {
+                    completed: 1,
+                    total: 3,
+                    message: Some("取包中（2/3）".to_string()),
+                },
+            )
+            .await
+            .expect("progress");
+        assert_eq!(
+            store.requeue_running_jobs(&queue).await.expect("requeue"),
+            2
+        );
+        let requeued = store
+            .get_job(&format!("{queue}-high"))
+            .await
+            .expect("get")
+            .expect("job");
+        assert_eq!(requeued.state, JOB_QUEUED);
+        assert!(requeued.started_at.is_none());
+        assert_eq!(requeued.progress.completed, 0, "旧进度不能留在排队态");
+
+        // --- 取消：只受理 queued ---
+        store
+            .claim_next_job(&queue)
+            .await
+            .expect("claim")
+            .expect("job");
+        match store
+            .cancel_queued_job(&format!("{queue}-high"))
+            .await
+            .expect("cancel running")
+        {
+            CancelOutcome::NotCancelable(job) => assert_eq!(job.state, JOB_RUNNING),
+            other => panic!("running job must not be cancelable: {other:?}"),
+        }
+        match store
+            .cancel_queued_job(&format!("{queue}-low"))
+            .await
+            .expect("cancel queued")
+        {
+            CancelOutcome::Canceled(job) => {
+                assert_eq!(job.state, JOB_CANCELED);
+                assert!(job.finished_at.is_some());
+            }
+            other => panic!("queued job should cancel: {other:?}"),
+        }
+        assert!(matches!(
+            store
+                .cancel_queued_job(&format!("{queue}-absent"))
+                .await
+                .expect("cancel absent"),
+            CancelOutcome::NotFound
+        ));
+        // 取消后不会再被认领。
+        let next = store
+            .claim_next_job(&queue)
+            .await
+            .expect("claim")
+            .expect("job");
+        assert_eq!(next.job_id, format!("{queue}-other"));
+
+        // --- 保留期清理：只删超期终态 ---
+        let mut old = store
+            .get_job(&format!("{queue}-other"))
+            .await
+            .expect("get")
+            .expect("job");
+        old.state = JOB_SUCCEEDED.to_string();
+        old.finished_at = Some(DateTime::in_days(-8));
+        store.save_job(&old).await.expect("finish old");
+        assert_eq!(
+            store
+                .delete_terminal_jobs_before(&queue, &DateTime::in_days(-7))
+                .await
+                .expect("cleanup"),
+            1
+        );
+        assert!(
+            store
+                .get_job(&format!("{queue}-other"))
+                .await
+                .expect("get")
+                .is_none()
+        );
+        assert!(
+            store
+                .get_job(&format!("{queue}-low"))
+                .await
+                .expect("get")
+                .is_some(),
+            "刚取消的任务未超期，不能删"
+        );
+
+        // 清理本次运行的全部任务。
+        sqlx::query("DELETE FROM jobs WHERE queue = $1")
+            .bind(&queue)
+            .execute(&store.pool)
+            .await
+            .expect("cleanup jobs");
     }
 }

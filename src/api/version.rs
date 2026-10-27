@@ -44,6 +44,11 @@ mod tests {
     fn test_state() -> super::super::ApiState {
         let store_path = std::env::temp_dir().join("wist-center-version-test.json");
         let artifact_dir = std::env::temp_dir().join("wist-center-version-artifacts");
+        let store: Arc<dyn crate::infra::Store> = Arc::new(FileStore::new(&store_path));
+        let artifact_store: Arc<dyn crate::infra::ArtifactStore> = Arc::new(
+            crate::infra::LocalArtifactStore::new(artifact_dir.clone(), "http://127.0.0.1:3100"),
+        );
+        let jobs = crate::infra::release_job_queue(store.clone(), artifact_store.clone());
         super::super::ApiState {
             config: CenterConfig {
                 listen_addr: "127.0.0.1:3100".to_string(),
@@ -72,11 +77,8 @@ mod tests {
                 wparse_release: Default::default(),
                 log: Default::default(),
             },
-            store: Arc::new(FileStore::new(&store_path)),
-            artifact_store: Arc::new(crate::infra::LocalArtifactStore::new(
-                artifact_dir,
-                "http://127.0.0.1:3100",
-            )),
+            store,
+            artifact_store,
             gateway_ca: Arc::new(
                 crate::infra::gateway_ca::GatewayCa::generate("Wist Center Version Test CA")
                     .expect("gateway ca")
@@ -86,6 +88,7 @@ mod tests {
             rate_limits: Arc::new(Mutex::new(
                 super::super::rate_limit::RateLimitState::default(),
             )),
+            jobs,
         }
     }
 

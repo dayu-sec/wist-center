@@ -1,6 +1,8 @@
 // 管理面接口：网关创建 + 列表聚合 / 状态卡片列表 / 单网关状态。
 // 数据来自 center store（ReceiveGatewayStatusReport 落库的最新状态）。
 
+use std::time::Duration;
+
 use axum::{
     Json,
     extract::{Path, State},
@@ -25,9 +27,6 @@ use super::{
     extract::{ApiJson, ApiQuery},
     rate_limit, rollout,
 };
-
-/// 知识库包组件名（与 `wist-knowledge` 仓 / 网关 `[[families]]` 目录同一命名）。
-const KNOWLEDGE_COMPONENT: &str = "wist-knowledge";
 
 /// 创建网关实例请求体：对齐模型 `AdminCreateGatewayInstanceRequest`（gateway_name/requested_by）。
 /// **不含接入凭据**：接入券由「生成/轮换」端点产出（设计 §8）。
@@ -131,7 +130,7 @@ fn gateway_instance_view(
     }
 }
 
-/// 列表类查询的共用开关：是否把**已归档**的网关也带上（默认不带）。
+/// 列表类查询的共用开关：是否把**已归档**的记录（网关 / 执行计划）也带上（默认不带）。
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct IncludeArchivedQuery {
     #[serde(default)]
@@ -711,7 +710,11 @@ pub struct PublishReleaseRequest {
 // 不再自留一份（原先这里的副本是抽取时漏删的）。
 
 /// 发布版本：POST /api/v1/admin/releases/:component（wist-agentd / wist-gateway-stack / galaxy-ops / galaxy-flow）。
-/// 从外部 artifact_url 下载制品 → 镜像到本地文件/对象存储 → 返回快的下载地址。
+///
+/// **异步**：这里只做不需要下载的入参校验，随即落一条下载任务并返回 `202 Accepted` +
+/// [`crate::infra::ReleaseJobPayload`]；真正的「取包 → 核对摘要 → 镜像 → 落库」由
+/// [`crate::infra::JobQueue`] 的 `release-download` handler 串行完成。调用方用
+/// `GET /api/v1/admin/release-jobs/{job_id}` 查进度。
 pub async fn admin_publish_release(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -743,299 +746,35 @@ pub async fn admin_publish_release(
         )
         .into_response();
     }
-    // 「组件 ↔ 包」的来源侧预检：来源文件名就能看出是别的组件 → 立刻拒，**不下载**。
-    // （把 gwlinkd 包录成 wist-agentd 这类录入，不该等下载完、落库前才报。）
-    if let Some(detail) = source_component_mismatch(&component, &request.artifact_url) {
+    // 「组件 ↔ 包」的来源侧预检：来源文件名就能看出是别的组件 → 立刻拒，**不排队**。
+    if let Some(detail) = crate::infra::source_component_mismatch(&component, &request.artifact_url)
+    {
         return super::error::ApiError::bad_request(
             super::codes::ARTIFACT_COMPONENT_MISMATCH,
             detail,
         )
         .into_response();
     }
-    // 读来源（本机绝对路径 / https URL）+ **必须**核对期望摘要（不符即 502，不落记录）。
-    let (bytes, package_sha256) =
-        match crate::infra::read_verified_package(&request.artifact_url, Some(expected_sha256))
-            .await
-        {
-            Ok(verified) => verified,
-            Err(err) => {
-                return super::error::internal_response(
-                    StatusCode::BAD_GATEWAY,
-                    super::codes::ARTIFACT_FETCH_FAILED,
-                    "failed to fetch artifact",
-                    err,
-                );
-            }
-        };
-    // 从包里读身份：包内目录名，读不出再回落来源文件名。
-    // 覆盖 agentd 包（目录名带身份）与 gateway-stack / galaxy-ops / galaxy-flow 包（文件名带版本）。
-    // 第二项是目标平台（target-triple）：二进制包能切出，部署栈包为空串 —— 空串不落库（界面显示「通用」）。
-    let (package_version, package_arch) =
-        crate::infra::read_package_identity(&request.artifact_url, &bytes);
-    // 版本以**包自报为准**，不让运维手输：
-    // - 请求带了 version → 与自报版本**核对**（不一致 → 400）；
-    // - 请求没带 version → 直接用自报版本；
-    // - 两边都没有 → 400（包名里没版本号，请用带版本的文件名）。
     let declared_version = request
         .version
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let version = match declared_version {
-        Some(declared) => {
-            if !package_version.is_empty()
-                && crate::infra::normalize_version(declared)
-                    != crate::infra::normalize_version(&package_version)
-            {
-                return super::error::ApiError::bad_request(
-                    super::codes::VERSION_MISMATCH,
-                    format!(
-                        "version mismatch: request declares {declared} but the package self-reports {package_version}"
-                    ),
-                )
-                .into_response();
-            }
-            declared.to_string()
-        }
-        None if !package_version.is_empty() => package_version,
-        None => {
-            return super::error::ApiError::bad_request(super::codes::VERSION_UNDERIVABLE, "cannot derive version from the package: use an artifact whose name carries a version, or pass `version` explicitly")
-                .into_response();
-        }
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let job = match build_release_job(crate::infra::ReleaseJobPayload {
+        mode: crate::infra::RELEASE_JOB_PUBLISH.to_string(),
+        component: component.clone(),
+        requested_by: request.requested_by.trim().to_string(),
+        declared_version,
+        artifacts: vec![crate::infra::ReleaseJobArtifact {
+            artifact_url: request.artifact_url.clone(),
+            expected_sha256: expected_sha256.to_string(),
+        }],
+    }) {
+        Ok(job) => job,
+        Err(response) => return response,
     };
-    // 版本号会拼进制品目录 —— 手输的那份也要过同一道关。
-    if !crate::infra::is_safe_path_segment(&version) {
-        return super::error::ApiError::bad_request(
-            super::codes::INVALID_VERSION,
-            "version must be a single safe path segment",
-        )
-        .into_response();
-    }
-    let platform = (!package_arch.is_empty()).then_some(package_arch.as_str());
-    match record_verified_release(
-        &state,
-        &component,
-        &version,
-        &request.artifact_url,
-        bytes,
-        &package_sha256,
-        platform,
-    )
-    .await
-    {
-        Ok(_record) => {
-            // 知识库包：签名旁文件（`<来源>.sig`）一并镜像 —— 中心下发时 gwlinkd 会把
-            // `<制品地址>` 与 `<制品地址>.sig` 一起取到网关投放目录，网关再验签。
-            if component == KNOWLEDGE_COMPONENT {
-                mirror_knowledge_signature(&state, &component, &version, &request.artifact_url)
-                    .await;
-            }
-            match load_package(&state, &component, &version).await {
-                Ok(Some(package)) => Json(package).into_response(),
-                Ok(None) => super::error::ApiError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    super::codes::RELEASE_NOT_FOUND_AFTER_WRITE,
-                    "release recorded but not found",
-                )
-                .into_response(),
-                Err(response) => response,
-            }
-        }
-        Err(response) => response,
-    }
-}
-
-/// 知识库包的**签名旁文件**（`<来源>.sig`）随包镜像到中心制品存储（best-effort）。
-///
-/// 为何要在中心做：中心「知识库下发」让 gwlinkd 把 `<制品地址>` 与 `<制品地址>.sig` 一起取到网关
-/// 投放目录，网关按 `<本地包>.sig` 验签。中心若不镜像 `.sig`，配了验签公钥的网关会拒收所有
-/// 中心推送的知识库包（错误在计划条目里可见，但那样才发现就晚了）。
-///
-/// 取不到 / 存储失败只告警不阻断发布：未配公钥的网关本来就只校验摘要。
-async fn mirror_knowledge_signature(
-    state: &ApiState,
-    component: &str,
-    version: &str,
-    artifact_url: &str,
-) {
-    let signature_url = format!("{artifact_url}.sig");
-    let bytes = match crate::infra::read_package_source(&signature_url).await {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            log::warn!(
-                "event=KnowledgeSignatureNotMirrored component={component} version={version} url={signature_url} err={err}"
-            );
-            return;
-        }
-    };
-    // 与包本体同目录、同名 + `.sig` —— 与网关 `read_signature`（`<source>.sig`）同一约定。
-    let filename = format!(
-        "{}.sig",
-        crate::infra::artifact_filename(artifact_url, component, version)
-    );
-    if let Err(err) = state
-        .artifact_store
-        .store(component, version, &filename, bytes)
-        .await
-    {
-        log::warn!(
-            "event=KnowledgeSignatureStoreFailed component={component} version={version} err={err}"
-        );
-    }
-}
-
-/// 读取某组件某版本的「安装包」视图（把该组件全部发布记录归组成包后取该版本）。
-#[allow(clippy::result_large_err)]
-async fn load_package(
-    state: &ApiState,
-    component: &str,
-    version: &str,
-) -> Result<Option<crate::infra::ReleasePackageRecord>, Response> {
-    match state.store.list_releases(component).await {
-        Ok(records) => Ok(crate::infra::group_release_packages(component, records)
-            .into_iter()
-            .find(|package| package.package.version == version)),
-        Err(err) => Err(super::error::internal_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            super::codes::RELEASE_LIST_FAILED,
-            "failed to load releases",
-            err.display_chain(),
-        )),
-    }
-}
-
-/// 多平台组件一次录入的**必需平台集**（一次必须齐备）。`None` = 不受限（单制品组件）。
-fn required_platforms(component: &str) -> Option<&'static [&'static str]> {
-    match component {
-        // Agentd / Gops / Gx / gwlinkd：一次录入必须覆盖三平台
-        // （macOS-ARM + Linux x86_64 / ARM64 的 musl 静态版）。
-        // agentd 与网关侧（`wist-gateway` `install_package.rs` 的 `PLATFORM_*`）是**同一份发布矩阵**：
-        // 网关按平台分别托管 agent 安装包，少一个平台就有主机装不上。
-        // gwlinkd 是**宿主侧**常驻（容器外），按宿主平台取件，同样三平台。
-        // gateway-stack 是单制品包，不受限。
-        "wist-agentd" | "galaxy-ops" | "galaxy-flow" | "wist-gwlinkd" => Some(&[
-            "aarch64-apple-darwin",
-            "x86_64-unknown-linux-musl",
-            "aarch64-unknown-linux-musl",
-        ]),
-        _ => None,
-    }
-}
-
-/// 把一个**已验证**的制品镜像并落库（单条与批量共用）：
-/// - 同一 `(component, version, sha)` 已存在 → 幂等（不重复下副本；旧记录缺平台则补齐）；
-/// - 否则镜像到制品存储并写一条 `published` 记录。
-///
-/// `platform` 为目标平台（target-triple），无平台概念的包传 `None`。
-/// 「组件 ↔ 包」一致性校验（**fail-closed**）：解析包名（包内顶层目录名 / 来源文件名），
-/// **必须与组件一致**。取不出包名（`pkg-<hash>`、临时名）**也拒** —— 否则「发错组件」的包会一路
-/// 被派发，直到网关取到、agentd 解包时才报 `artifact_invalid`。
-///
-/// 拦的就是「把 gwlinkd 包录成 wist-agentd」这类录入。
-fn component_package_mismatch(component: &str, source: &str, bytes: &[u8]) -> Option<String> {
-    let name = crate::infra::read_package_name(source, bytes);
-    if name == component {
-        return None;
-    }
-    if name.is_empty() {
-        return Some(format!(
-            "cannot tell which component this package belongs to (source: {source}); \
-             expected a package named `{component}-<version>[-<platform>]`"
-        ));
-    }
-    Some(component_mismatch_detail(component, source, &name))
-}
-
-/// 「组件 ↔ 包」不一致的**统一措辞**（来源能读出包名时用）；指出该发到哪个组件。
-fn component_mismatch_detail(component: &str, source: &str, name: &str) -> String {
-    format!(
-        "package looks like `{name}`, not `{component}` (source: {source}); \
-         publish it under the `{name}` component"
-    )
-}
-
-/// 「组件 ↔ 包」一致性的**来源侧预检**：**只看来源文件名、不下载**。
-///
-/// 来源能读出包名且与组件不符 → 当场拒（省下一次注定失败的下载）；读不出包名
-/// （`pkg-<hash>` / 临时名）→ 放行，交给下载后的 [`component_package_mismatch`]
-/// 用包内顶层目录名做权威判定。
-fn source_component_mismatch(component: &str, source: &str) -> Option<String> {
-    let name = crate::infra::read_source_package_name(source);
-    (!name.is_empty() && name != component)
-        .then(|| component_mismatch_detail(component, source, &name))
-}
-
-#[allow(clippy::result_large_err)]
-async fn record_verified_release(
-    state: &ApiState,
-    component: &str,
-    version: &str,
-    artifact_url: &str,
-    bytes: Vec<u8>,
-    package_sha256: &str,
-    platform: Option<&str>,
-) -> Result<crate::infra::ReleaseRecord, Response> {
-    // 「组件 ↔ 包」校验（fail-closed）：包名必须与组件一致，否则在落盘 / 记库**之前**拒。
-    if let Some(detail) = component_package_mismatch(component, artifact_url, &bytes) {
-        return Err(super::error::ApiError::bad_request(
-            super::codes::ARTIFACT_COMPONENT_MISMATCH,
-            detail,
-        )
-        .into_response());
-    }
-    // 同一 (component, version) 已镜像过**同一份内容** → 幂等返回，不重复下副本。
-    if let Ok(existing) = state.store.list_releases(component).await
-        && let Some(record) = existing.iter().find(|record| {
-            record.version == version && record.package_sha256.as_deref() == Some(package_sha256)
-        })
-    {
-        // 幂等命中：若旧记录缺平台而现在能解析出来（身份解析改好前的历史记录），顺手补齐，
-        // 避免列表一直显示「通用」（同一份内容不会重复下副本）。按 sha 精确定位该**制品行**，
-        // 不碰同版本其它平台的制品行。
-        if record.platform.is_none()
-            && let Some(platform) = platform
-            && let Ok(Some(updated)) = state
-                .store
-                .set_release_platform(component, version, package_sha256, Some(platform))
-                .await
-        {
-            return Ok(updated);
-        }
-        return Ok(record.clone());
-    }
-    // 落盘 / 下发文件名用来源原名（URL 末段就是原名，人看着清楚）；内容寻址靠 DB 的
-    // `package_sha256` + `(component, version, sha)` 幂等。版本号会拼进目录，调用方已校验过。
-    let filename = crate::infra::artifact_filename(artifact_url, component, version);
-    let mirrored_url = state
-        .artifact_store
-        .store(component, version, &filename, bytes)
-        .await
-        .map_err(|err| {
-            super::error::internal_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                super::codes::ARTIFACT_STORE_FAILED,
-                "failed to store artifact",
-                err,
-            )
-        })?;
-    state
-        .store
-        .publish_release(
-            component,
-            version,
-            &mirrored_url,
-            Some(package_sha256),
-            platform,
-        )
-        .await
-        .map_err(|err| {
-            super::error::internal_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                super::codes::RELEASE_PUBLISH_FAILED,
-                "failed to record release",
-                err.display_chain(),
-            )
-        })
+    enqueue_release_job(&state, job, !prefers_async(&headers)).await
 }
 
 /// 批量录入请求体：多平台组件（galaxy-ops / galaxy-flow）一次覆盖三个平台。
@@ -1058,6 +797,11 @@ pub struct BatchArtifact {
 /// 一次请求覆盖**同一版本**的多个平台（wist-agentd / galaxy-ops / galaxy-flow 必须
 /// macOS-ARM / Linux-ARM / Linux-X86 三平台齐备）。所有制品先**下载 + 校验摘要 + 解析身份**，
 /// 任一不合格即整体拒绝（**不落任何记录**）；全部通过后再逐个镜像落库。
+/// 批量录入某组件的多平台制品：POST /api/v1/admin/releases/:component/batch。
+///
+/// **异步**：与单制品发布同一套下载队列。这里只校验入参（组件 / 平台来源预检 / 摘要必填），
+/// 落一条 `publish_batch` 任务后立即返回 `202 Accepted`；worker 会先全部下载 + 校验 + 解析身份，
+/// 任一不合格即整体失败（不落任何发布记录），全部通过后再逐个镜像落库。
 pub async fn admin_publish_release_batch(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -1091,30 +835,7 @@ pub async fn admin_publish_release_batch(
         .into_response();
     }
 
-    // 下载前先按**来源文件名**扫一遍「组件 ↔ 包」：任一个明显是别的组件即整体拒，**不下载任何制品**。
-    // （灌 gwlinkd 的三平台地址到 wist-agentd 页这类录入，过去要等全部下载完才报。）
-    for artifact in &request.artifacts {
-        if let Some(detail) = source_component_mismatch(&component, &artifact.artifact_url) {
-            return super::error::ApiError::bad_request(
-                super::codes::ARTIFACT_COMPONENT_MISMATCH,
-                detail,
-            )
-            .into_response();
-        }
-    }
-
-    // 单个制品的校验结果（下载 / 摘要 / 身份都在此步完成）。
-    struct Prepared {
-        version: String,
-        /// 完整 target-triple（如 `aarch64-apple-darwin`），即该制品的平台身份。
-        arch: String,
-        artifact_url: String,
-        bytes: Vec<u8>,
-        package_sha256: String,
-    }
-
-    // 第一阶段：全部下载 + 校验 + 解析身份，任一不合格即整体拒绝。
-    let mut prepared: Vec<Prepared> = Vec::with_capacity(request.artifacts.len());
+    let mut jobs = Vec::with_capacity(request.artifacts.len());
     for artifact in &request.artifacts {
         let expected = artifact.expected_sha256.trim();
         if artifact.artifact_url.trim().is_empty() || expected.is_empty() {
@@ -1124,116 +845,370 @@ pub async fn admin_publish_release_batch(
             )
             .into_response();
         }
-        let (bytes, package_sha256) =
-            match crate::infra::read_verified_package(&artifact.artifact_url, Some(expected)).await
-            {
-                Ok(verified) => verified,
-                Err(err) => {
-                    return super::error::internal_response(
-                        StatusCode::BAD_GATEWAY,
-                        super::codes::ARTIFACT_FETCH_FAILED,
-                        "failed to fetch artifact",
-                        err,
-                    );
-                }
-            };
-        let (version, arch) = crate::infra::read_package_identity(&artifact.artifact_url, &bytes);
-        if version.is_empty() {
+        // 下载前先按**来源文件名**扫一遍「组件 ↔ 包」：任一个明显是别的组件即整体拒，**不排队**。
+        if let Some(detail) =
+            crate::infra::source_component_mismatch(&component, &artifact.artifact_url)
+        {
             return super::error::ApiError::bad_request(
-                super::codes::VERSION_UNDERIVABLE,
-                format!(
-                    "cannot derive version from `{}`: use an artifact whose name carries a version",
-                    artifact.artifact_url
-                ),
+                super::codes::ARTIFACT_COMPONENT_MISMATCH,
+                detail,
             )
             .into_response();
         }
-        if !crate::infra::is_safe_path_segment(&version) {
-            return super::error::ApiError::bad_request(
-                super::codes::INVALID_VERSION,
-                "version must be a single safe path segment",
-            )
-            .into_response();
-        }
-        if arch.is_empty() {
-            return super::error::ApiError::bad_request(
-                super::codes::PLATFORM_UNDERIVABLE,
-                format!(
-                    "cannot derive platform (target-triple) from `{}`",
-                    artifact.artifact_url
-                ),
-            )
-            .into_response();
-        }
-        prepared.push(Prepared {
-            version,
-            arch,
+        jobs.push(crate::infra::ReleaseJobArtifact {
             artifact_url: artifact.artifact_url.clone(),
-            bytes,
-            package_sha256,
+            expected_sha256: expected.to_string(),
         });
     }
 
-    // 版本必须一致。
-    let version = prepared[0].version.clone();
-    if prepared.iter().any(|item| item.version != version) {
-        return super::error::ApiError::bad_request(
-            super::codes::ARTIFACTS_VERSION_MISMATCH,
-            "all artifacts must share the same version",
-        )
-        .into_response();
-    }
-    // 平台：不得重复；多平台组件必须**覆盖**必需平台集。
-    let package = crate::infra::ReleasePackage::new(
-        version.clone(),
-        prepared
-            .iter()
-            .map(|item| crate::infra::ReleaseArtifact {
-                platform: Some(item.arch.clone()),
-                sha256: item.package_sha256.clone(),
-                source: item.artifact_url.clone(),
-            })
-            .collect(),
-    );
-    let required = required_platforms(&component).unwrap_or(&[]);
-    if let Err(err) = crate::infra::validate_platforms(&package, required) {
-        return super::error::ApiError::bad_request(
-            super::codes::ARTIFACT_INVALID,
-            format!("component `{component}`: {err}"),
-        )
-        .into_response();
-    }
+    let job = match build_release_job(crate::infra::ReleaseJobPayload {
+        mode: crate::infra::RELEASE_JOB_PUBLISH_BATCH.to_string(),
+        component: component.clone(),
+        requested_by: request.requested_by.trim().to_string(),
+        declared_version: None,
+        artifacts: jobs,
+    }) {
+        Ok(job) => job,
+        Err(response) => return response,
+    };
+    enqueue_release_job(&state, job, !prefers_async(&headers)).await
+}
 
-    // 第二阶段：逐个镜像落库（此时全部制品已校验通过）。
-    let mut records = Vec::with_capacity(prepared.len());
-    for item in prepared {
-        let platform = (!item.arch.is_empty()).then_some(item.arch.as_str());
-        match record_verified_release(
-            &state,
-            &component,
-            &item.version,
-            &item.artifact_url,
-            item.bytes,
-            &item.package_sha256,
-            platform,
-        )
-        .await
-        {
-            Ok(record) => records.push(record),
-            Err(response) => return response,
-        }
-    }
-    let _ = records;
-    // 返回归组后的「安装包」。
-    match load_package(&state, &component, &version).await {
-        Ok(Some(package)) => Json(package).into_response(),
-        Ok(None) => super::error::ApiError::new(
+/// 把业务载荷包成通用任务（序列化失败也是入队失败）。
+#[allow(clippy::result_large_err)]
+fn build_release_job(
+    payload: crate::infra::ReleaseJobPayload,
+) -> Result<crate::infra::JobRecord, Response> {
+    crate::infra::release_job(payload).map_err(|err| {
+        super::error::internal_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            super::codes::RELEASE_NOT_FOUND_AFTER_WRITE,
-            "release recorded but not found",
+            super::codes::RELEASE_JOB_CREATE_FAILED,
+            "failed to build release job",
+            err.display_chain(),
+        )
+    })
+}
+
+/// `Prefer: respond-async` → 只入队并回 `202`（中心前端用这个）。
+///
+/// 不带该头的老调用方走**兼容等待**：同样入队、由 worker 执行，但请求会等到任务终态再把
+/// 结果折回旧形状（成功 = 安装包，失败 = 原来的状态码 / 错误码）—— 下载仍然走队列，只是旧
+/// 客户端不必改。
+fn prefers_async(headers: &HeaderMap) -> bool {
+    headers
+        .get("prefer")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("respond-async"))
+}
+
+/// 同步兼容模式最长等多久（批量三平台 × 取包超时也要留余量）。
+const RELEASE_JOB_SYNC_WAIT: Duration = Duration::from_secs(15 * 60);
+
+/// 落一条下载任务并返回：异步模式 `202 + job`；兼容模式等终态后折回旧形状。
+async fn enqueue_release_job(
+    state: &ApiState,
+    job: crate::infra::JobRecord,
+    wait: bool,
+) -> Response {
+    let job = match state.jobs.enqueue(job).await {
+        Ok(job) => job,
+        Err(err) => {
+            return super::error::internal_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                super::codes::RELEASE_JOB_CREATE_FAILED,
+                "failed to enqueue release job",
+                err.display_chain(),
+            );
+        }
+    };
+    if !wait {
+        return match crate::infra::ReleaseJobView::from_job(&job) {
+            Some(view) => (StatusCode::ACCEPTED, Json(view)).into_response(),
+            None => super::error::internal_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                super::codes::RELEASE_JOB_CREATE_FAILED,
+                "enqueued release job is not readable",
+                job.job_id,
+            ),
+        };
+    }
+    match state
+        .jobs
+        .wait_for_terminal(&job.job_id, RELEASE_JOB_SYNC_WAIT)
+        .await
+    {
+        Ok(Some(done)) if done.state == crate::infra::JOB_SUCCEEDED => {
+            match done.result.as_ref().and_then(|value| {
+                serde_json::from_value::<crate::infra::ReleasePackageRecord>(value.clone()).ok()
+            }) {
+                Some(package) => Json(package).into_response(),
+                None => super::error::internal_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    super::codes::RELEASE_NOT_FOUND_AFTER_WRITE,
+                    "release job succeeded without a package",
+                    done.job_id,
+                ),
+            }
+        }
+        Ok(Some(done)) if done.state == crate::infra::JOB_CANCELED => {
+            super::error::ApiError::conflict(
+                super::codes::JOB_CANCELED,
+                format!("release job {} was canceled", done.job_id),
+            )
+            .into_response()
+        }
+        Ok(Some(done)) => {
+            let status = done
+                .error_status
+                .and_then(|value| StatusCode::from_u16(value).ok())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let code = done
+                .error_code
+                .clone()
+                .unwrap_or_else(|| super::codes::ARTIFACT_FETCH_FAILED.to_string());
+            let message = done.error_detail.clone().unwrap_or_default();
+            super::error::ApiError::new(status, code, message).into_response()
+        }
+        Ok(None) => super::error::ApiError::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            super::codes::RELEASE_JOB_TIMEOUT,
+            format!(
+                "release job {} is still running; poll GET /api/v1/admin/release-jobs/{}",
+                job.job_id, job.job_id
+            ),
         )
         .into_response(),
-        Err(response) => response,
+        Err(err) => super::error::internal_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            super::codes::RELEASE_JOBS_LOAD_FAILED,
+            "failed to load release job",
+            err.display_chain(),
+        ),
+    }
+}
+
+/// 查一条下载任务：`GET /api/v1/admin/release-jobs/{job_id}`。
+///
+/// `state` = `queued` / `running` / `succeeded` / `failed`；成功回执带发布后的安装包视图，
+/// 失败回执带 `error_code` / `error_detail`。
+pub async fn admin_get_release_job(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    client: PeerConnectInfo,
+    Path(job_id): Path<String>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    let job_id = job_id.trim().to_string();
+    match state.jobs.get(&job_id).await {
+        Ok(Some(job)) => match crate::infra::ReleaseJobView::from_job(&job) {
+            Some(view) if job.queue == crate::infra::RELEASE_JOB_QUEUE => {
+                Json(view).into_response()
+            }
+            _ => super::error::ApiError::not_found(
+                super::codes::RELEASE_JOB_NOT_FOUND,
+                format!("unknown release job {job_id}"),
+            )
+            .into_response(),
+        },
+        Ok(None) => super::error::ApiError::not_found(
+            super::codes::RELEASE_JOB_NOT_FOUND,
+            format!("unknown release job {job_id}"),
+        )
+        .into_response(),
+        Err(err) => super::error::internal_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            super::codes::RELEASE_JOBS_LOAD_FAILED,
+            "failed to load release job",
+            err.display_chain(),
+        ),
+    }
+}
+
+/// 下载任务列表的查询参数。
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct ReleaseJobsQuery {
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// 只看某个组件（录入页按当前 tab 取）。
+    #[serde(default)]
+    pub component: Option<String>,
+}
+
+/// 最近的下载任务：`GET /api/v1/admin/release-jobs?limit=&component=`（新→旧）。
+///
+/// 任务列表是「队列进度」的主要视图：页面刷新后也能看到在飞 / 失败的下载，不必守着提交时的
+/// 那一次请求。默认 20 条，最多 200 条。
+pub async fn admin_list_release_jobs(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    client: PeerConnectInfo,
+    ApiQuery(query): ApiQuery<ReleaseJobsQuery>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    let limit = query.limit.unwrap_or(20).clamp(1, 200);
+    let component = query
+        .component
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match state
+        .store
+        .list_jobs_filtered(
+            Some(crate::infra::RELEASE_JOB_QUEUE),
+            None,
+            None,
+            component,
+            limit,
+        )
+        .await
+    {
+        Ok(jobs) => Json(
+            jobs.iter()
+                .filter_map(crate::infra::ReleaseJobView::from_job)
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(err) => super::error::internal_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            super::codes::RELEASE_JOBS_LOAD_FAILED,
+            "failed to load release jobs",
+            err.display_chain(),
+        ),
+    }
+}
+/// 通用任务列表的查询参数。
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct JobsQuery {
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// 按队列过滤（如 `release-download`）。
+    #[serde(default)]
+    pub queue: Option<String>,
+    /// 按 handler kind 过滤。
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// 按状态过滤（`queued` / `running` / `succeeded` / `failed` / `canceled`）。
+    #[serde(default)]
+    pub state: Option<String>,
+    /// 按业务主体过滤（release 任务的主体是 component）。
+    #[serde(default)]
+    pub subject: Option<String>,
+}
+
+/// 通用任务读面：`GET /api/v1/admin/jobs?queue=&kind=&state=&limit=`（新→旧）。
+///
+/// 只读、只暴露任务本身（`payload` / `result` / `progress` / `error_*`）；各域自己的
+/// 形状（如 `/release-jobs`）仍由领域端点提供。默认 20 条，最多 200 条。
+pub async fn admin_list_jobs(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    client: PeerConnectInfo,
+    ApiQuery(query): ApiQuery<JobsQuery>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    let limit = query.limit.unwrap_or(20).clamp(1, 200);
+    let normalized = |value: Option<String>| {
+        value
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let queue = normalized(query.queue);
+    let kind = normalized(query.kind);
+    let state_filter = normalized(query.state);
+    let subject = normalized(query.subject);
+    match state
+        .store
+        .list_jobs_filtered(
+            queue.as_deref(),
+            kind.as_deref(),
+            state_filter.as_deref(),
+            subject.as_deref(),
+            limit,
+        )
+        .await
+    {
+        Ok(jobs) => Json(jobs).into_response(),
+        Err(err) => super::error::internal_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            super::codes::JOBS_LOAD_FAILED,
+            "failed to load jobs",
+            err.display_chain(),
+        ),
+    }
+}
+
+/// 通用任务详情：`GET /api/v1/admin/jobs/{job_id}`。
+pub async fn admin_get_job(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    client: PeerConnectInfo,
+    Path(job_id): Path<String>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    let job_id = job_id.trim().to_string();
+    match state.jobs.get(&job_id).await {
+        Ok(Some(job)) => Json(job).into_response(),
+        Ok(None) => super::error::ApiError::not_found(
+            super::codes::JOB_NOT_FOUND,
+            format!("unknown job {job_id}"),
+        )
+        .into_response(),
+        Err(err) => super::error::internal_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            super::codes::JOBS_LOAD_FAILED,
+            "failed to load job",
+            err.display_chain(),
+        ),
+    }
+}
+
+/// 取消一条**排队中**的任务：`POST /api/v1/admin/jobs/{job_id}/cancel`。
+///
+/// 只受理 `queued`：已开始执行 / 已终结的任务回 409（带回当前状态），不会影响正在跑的工作。
+pub async fn admin_cancel_job(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    client: PeerConnectInfo,
+    Path(job_id): Path<String>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    let job_id = job_id.trim().to_string();
+    match state.jobs.cancel(&job_id).await {
+        Ok(crate::infra::CancelOutcome::Canceled(job)) => Json(job).into_response(),
+        Ok(crate::infra::CancelOutcome::NotCancelable(job)) => super::error::ApiError::conflict(
+            super::codes::JOB_NOT_CANCELABLE,
+            format!(
+                "job {job_id} is {}, only a queued job can be canceled",
+                job.state
+            ),
+        )
+        .into_response(),
+        Ok(crate::infra::CancelOutcome::NotFound) => super::error::ApiError::not_found(
+            super::codes::JOB_NOT_FOUND,
+            format!("unknown job {job_id}"),
+        )
+        .into_response(),
+        Err(err) => super::error::internal_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            super::codes::JOB_CANCEL_FAILED,
+            "failed to cancel job",
+            err.display_chain(),
+        ),
     }
 }
 
@@ -1674,15 +1649,24 @@ pub async fn admin_set_release_status(
             super::error::ApiError::not_found(super::codes::RELEASE_NOT_FOUND, "release not found")
                 .into_response()
         }
-        Ok(_) => match load_package(&state, &component, &version).await {
-            Ok(Some(package)) => Json(package).into_response(),
-            Ok(None) => super::error::ApiError::not_found(
-                super::codes::RELEASE_NOT_FOUND,
-                "release not found",
-            )
-            .into_response(),
-            Err(response) => response,
-        },
+        Ok(_) => {
+            match crate::infra::load_release_package(state.store.as_ref(), &component, &version)
+                .await
+            {
+                Ok(Some(package)) => Json(package).into_response(),
+                Ok(None) => super::error::ApiError::not_found(
+                    super::codes::RELEASE_NOT_FOUND,
+                    "release not found",
+                )
+                .into_response(),
+                Err(err) => super::error::internal_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    super::codes::RELEASE_LIST_FAILED,
+                    "failed to load releases",
+                    err.display_chain(),
+                ),
+            }
+        }
         Err(err) => super::error::internal_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             super::codes::RELEASE_STATUS_UPDATE_FAILED,
@@ -1977,21 +1961,157 @@ pub async fn admin_create_upgrade_plan(
 }
 
 /// 列出灰度发布计划：`GET /api/v1/admin/rollout-plans`（模型 `AdminListUpgradePlans`）。
+///
+/// 默认**不带**已归档的执行记录（`?include_archived=true` 才带）—— 归档就是为了把历史计划
+/// 从发布执行页收起来；要看/恢复它们时再显式带上。
 pub async fn admin_list_upgrade_plans(
     State(state): State<ApiState>,
     headers: HeaderMap,
     client: PeerConnectInfo,
+    ApiQuery(query): ApiQuery<IncludeArchivedQuery>,
 ) -> Response {
     let client_key = rate_limit::client_key(client);
     if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
         return response;
     }
     match state.store.list_upgrade_plans().await {
-        Ok(plans) => Json(plans.iter().map(rollout::plan_view).collect::<Vec<_>>()).into_response(),
+        Ok(plans) => Json(
+            plans
+                .into_iter()
+                .filter(|plan| query.include_archived || plan.archived_at.is_none())
+                .map(|plan| rollout::plan_view(&plan))
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
         Err(err) => super::error::internal_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             super::codes::ROLLOUT_PLANS_LOAD_FAILED,
             "failed to load rollout plans",
+            err.display_chain(),
+        ),
+    }
+}
+
+/// 归档 / 取消归档一份灰度发布计划（执行记录）：
+/// `POST /api/v1/admin/rollout-plans/{plan_id}/archive`。
+///
+/// 归档是**标记**（`archived_at`）：默认列表不再显示它，计划与逐目标条目全留；
+/// `{"archived": false}` 随时恢复。**只允许归档终结态**（completed / failed / canceled）——
+/// draft / rolling 还在推进，藏起来会让人找不到「批准 / 推进」入口。
+pub async fn admin_set_upgrade_plan_archived(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    client: PeerConnectInfo,
+    Path(plan_id): Path<String>,
+    ApiJson(request): ApiJson<rollout::ArchiveRolloutPlanRequest>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    let plan_id = plan_id.trim().to_string();
+    let Some(mut plan) = (match state.store.get_upgrade_plan(&plan_id).await {
+        Ok(value) => value,
+        Err(err) => {
+            return super::error::internal_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                super::codes::ROLLOUT_PLAN_LOAD_FAILED,
+                "failed to load rollout plan",
+                err.display_chain(),
+            );
+        }
+    }) else {
+        return super::error::ApiError::not_found(
+            super::codes::ROLLOUT_PLAN_NOT_FOUND,
+            format!("unknown rollout plan {plan_id}"),
+        )
+        .into_response();
+    };
+    if request.archived && !rollout::is_terminal(&plan.status) {
+        return super::error::ApiError::conflict(
+            super::codes::PLAN_NOT_ARCHIVABLE,
+            format!(
+                "rollout plan {plan_id} is {}, only a finished plan can be archived",
+                plan.status
+            ),
+        )
+        .into_response();
+    }
+    // 重复归档不刷新时刻（幂等，便于审计「什么时候收的」）；取消归档清空标记。
+    plan.archived_at = if request.archived {
+        plan.archived_at.clone().or_else(|| Some(DateTime::now()))
+    } else {
+        None
+    };
+    if let Err(err) = state.store.save_upgrade_plan(&plan).await {
+        return super::error::internal_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            super::codes::ROLLOUT_PLAN_ARCHIVE_FAILED,
+            "failed to archive rollout plan",
+            err.display_chain(),
+        );
+    }
+    Json(rollout::plan_view(&plan)).into_response()
+}
+
+/// **删除**一份执行记录：`DELETE /api/v1/admin/rollout-plans/{plan_id}`。
+///
+/// 与归档不同，删除是**物理删除**（计划 + 逐目标条目，不可恢复）—— 想留证据的请用归档。
+/// 只受理**终结态**（completed / failed / canceled）：draft / rolling 还在推进，删掉会丢在飞的工作。
+/// 回执是**被删前**的计划视图，便于调用方确认删的是哪一份。
+pub async fn admin_delete_upgrade_plan(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    client: PeerConnectInfo,
+    Path(plan_id): Path<String>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    let plan_id = plan_id.trim().to_string();
+    let plan = match state.store.get_upgrade_plan(&plan_id).await {
+        Ok(Some(plan)) => plan,
+        Ok(None) => {
+            return super::error::ApiError::not_found(
+                super::codes::ROLLOUT_PLAN_NOT_FOUND,
+                format!("unknown rollout plan {plan_id}"),
+            )
+            .into_response();
+        }
+        Err(err) => {
+            return super::error::internal_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                super::codes::ROLLOUT_PLAN_LOAD_FAILED,
+                "failed to load rollout plan",
+                err.display_chain(),
+            );
+        }
+    };
+    // 与归档同口径：只删终结态，执行中的计划还有在飞的工作。
+    if !rollout::is_terminal(&plan.status) {
+        return super::error::ApiError::conflict(
+            super::codes::PLAN_NOT_DELETABLE,
+            format!(
+                "rollout plan {plan_id} is {}, only a finished plan can be deleted",
+                plan.status
+            ),
+        )
+        .into_response();
+    }
+    match state.store.delete_upgrade_plan(&plan_id).await {
+        // 视图在删除**前**拍好：回执说的是「刚被删掉的那一份」。
+        Ok(true) => Json(rollout::plan_view(&plan)).into_response(),
+        // 读到之后被并发删掉：按不存在处理（幂等语义对调用方一致）。
+        Ok(false) => super::error::ApiError::not_found(
+            super::codes::ROLLOUT_PLAN_NOT_FOUND,
+            format!("unknown rollout plan {plan_id}"),
+        )
+        .into_response(),
+        Err(err) => super::error::internal_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            super::codes::ROLLOUT_PLAN_DELETE_FAILED,
+            "failed to delete rollout plan",
             err.display_chain(),
         ),
     }
@@ -2613,6 +2733,8 @@ pub async fn admin_dispatch_agent_fleet_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 包身份 / 组件一致性判定已下沉到 `infra::release_jobs`（下载 worker 也用同一份口径）。
+    use crate::infra::{component_package_mismatch, source_component_mismatch};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2671,6 +2793,13 @@ mod tests {
 
     /// 以给定 store 拼一个 ApiState（其余配置与 `test_state` 相同）。
     fn state_with_store(store: FileStore) -> ApiState {
+        let store: std::sync::Arc<dyn crate::infra::Store> = std::sync::Arc::new(store);
+        let artifact_store: std::sync::Arc<dyn crate::infra::ArtifactStore> =
+            std::sync::Arc::new(crate::infra::LocalArtifactStore::new(
+                std::env::temp_dir().join("wic-artifacts"),
+                "http://127.0.0.1:3100",
+            ));
+        let jobs = crate::infra::release_job_queue(store.clone(), artifact_store.clone());
         ApiState {
             config: CenterConfig {
                 listen_addr: "127.0.0.1:3100".to_string(),
@@ -2699,16 +2828,14 @@ mod tests {
                 wparse_release: Default::default(),
                 log: Default::default(),
             },
-            store: std::sync::Arc::new(store),
-            artifact_store: std::sync::Arc::new(crate::infra::LocalArtifactStore::new(
-                std::env::temp_dir().join("wic-artifacts"),
-                "http://127.0.0.1:3100",
-            )),
+            store,
+            artifact_store,
             gateway_ca: test_gateway_ca(),
             proxy: None,
             rate_limits: std::sync::Arc::new(std::sync::Mutex::new(
                 super::super::rate_limit::RateLimitState::default(),
             )),
+            jobs,
         }
     }
 
@@ -2806,6 +2933,36 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
+                    .uri(uri)
+                    .header("authorization", "Bearer admin-tok")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let status = response.status();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    async fn delete_json(app: &axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+        use axum::{body::Body, http::Request};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
                     .uri(uri)
                     .header("authorization", "Bearer admin-tok")
                     .body(Body::empty())
@@ -3507,6 +3664,157 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
+    /// 归档是**标记**：只受理终结态；默认列表不再带它，`include_archived=true` 才带；
+    /// 取消归档回到默认视图；重复归档不刷新时刻（幂等）。
+    #[tokio::test]
+    async fn archive_hides_a_finished_plan_from_the_default_list() {
+        let (state, app, plan_id) = create_plan(2, 1).await;
+        let archive_path = format!("/api/v1/admin/rollout-plans/{plan_id}/archive");
+
+        // draft / rolling 都不能归档：还在推进，藏起来会让人找不到批准 / 推进入口。
+        let (status, _) =
+            post_json(&app, &archive_path, serde_json::json!({ "archived": true })).await;
+        assert_eq!(status, StatusCode::CONFLICT, "draft 不受理归档");
+        let (status, _) = post_json(
+            &app,
+            "/api/v1/admin/rollout-plans/approve",
+            serde_json::json!({ "plan_id": plan_id }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) =
+            post_json(&app, &archive_path, serde_json::json!({ "archived": true })).await;
+        assert_eq!(status, StatusCode::CONFLICT, "rolling 不受理归档");
+
+        // 造一份终结态（completed）再归档：回执带 archived_at。
+        {
+            let mut plan = state
+                .store
+                .get_upgrade_plan(&plan_id)
+                .await
+                .expect("load plan")
+                .expect("plan exists");
+            plan.status = "completed".to_string();
+            for entry in plan.entries.iter_mut() {
+                entry.status = "succeeded".to_string();
+            }
+            state.store.save_upgrade_plan(&plan).await.expect("save");
+        }
+        let (status, view) =
+            post_json(&app, &archive_path, serde_json::json!({ "archived": true })).await;
+        assert_eq!(status, StatusCode::OK);
+        let archived_at = view["archived_at"]
+            .as_str()
+            .expect("归档回执带时刻")
+            .to_string();
+
+        // 默认列表不收；显式 include_archived=true 才收。
+        let (_, list) = get_json(&app, "/api/v1/admin/rollout-plans").await;
+        assert!(
+            !plan_ids(&list).contains(&plan_id),
+            "默认列表不应有已归档计划"
+        );
+        let (_, list) = get_json(&app, "/api/v1/admin/rollout-plans?include_archived=true").await;
+        assert!(
+            plan_ids(&list).contains(&plan_id),
+            "include_archived=true 才可见"
+        );
+
+        // 重复归档不刷新时刻（幂等，审计「什么时候收的」不会变）。
+        let (status, again) =
+            post_json(&app, &archive_path, serde_json::json!({ "archived": true })).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(again["archived_at"], archived_at);
+
+        // 取消归档 → 回到默认列表。
+        let (status, view) = post_json(
+            &app,
+            &archive_path,
+            serde_json::json!({ "archived": false }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(view["archived_at"].is_null());
+        let (_, list) = get_json(&app, "/api/v1/admin/rollout-plans").await;
+        assert!(plan_ids(&list).contains(&plan_id));
+
+        // 未知计划 → 404（归档与取消归档都一样）。
+        for archived in [true, false] {
+            let (status, _) = post_json(
+                &app,
+                "/api/v1/admin/rollout-plans/plan-nope/archive",
+                serde_json::json!({ "archived": archived }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        }
+    }
+
+    /// 从计划列表响应里取 plan_id（用来断言归档后的可见集合）。
+    fn plan_ids(list: &serde_json::Value) -> Vec<String> {
+        list.as_array()
+            .expect("list")
+            .iter()
+            .map(|item| item["plan_id"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// 删除是**物理删除**，只受理终结态：draft / rolling → 409；删掉后列表与详情都看不到，
+    /// 再删同一份 → 404（幂等语义对调用方一致）。
+    #[tokio::test]
+    async fn delete_only_accepts_finished_plans() {
+        let (state, app, plan_id) = create_plan(2, 1).await;
+        let path = format!("/api/v1/admin/rollout-plans/{plan_id}");
+
+        // draft / rolling 都不能删：还在推进，删掉会丢在飞的工作。
+        let (status, body) = delete_json(&app, &path).await;
+        assert_eq!(status, StatusCode::CONFLICT, "draft 不受理删除");
+        assert_eq!(
+            body["error"]["code"],
+            super::super::codes::PLAN_NOT_DELETABLE
+        );
+        let (status, _) = post_json(
+            &app,
+            "/api/v1/admin/rollout-plans/approve",
+            serde_json::json!({ "plan_id": plan_id }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = delete_json(&app, &path).await;
+        assert_eq!(status, StatusCode::CONFLICT, "rolling 不受理删除");
+
+        // 造一份终结态（completed）再删：回执带被删前那一份的计划视图。
+        {
+            let mut plan = state
+                .store
+                .get_upgrade_plan(&plan_id)
+                .await
+                .expect("load plan")
+                .expect("plan exists");
+            plan.status = "completed".to_string();
+            for entry in plan.entries.iter_mut() {
+                entry.status = "succeeded".to_string();
+            }
+            state.store.save_upgrade_plan(&plan).await.expect("save");
+        }
+        let (status, view) = delete_json(&app, &path).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(view["plan_id"], plan_id.as_str());
+        assert_eq!(view["status"], "completed");
+
+        // 真删了：列表里没有，详情 404，再删一次也是 404。
+        let (_, list) = get_json(&app, "/api/v1/admin/rollout-plans").await;
+        assert!(!plan_ids(&list).contains(&plan_id), "删除后列表不应再有它");
+        let (status, _) = get_json(&app, &path).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = delete_json(&app, &path).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // 未知计划 → 404。
+        let (status, _) = delete_json(&app, "/api/v1/admin/rollout-plans/plan-nope").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
     /// 查看：返回计划 + 逐目标条目（建计划时按全量目标落 `pending`）。
     #[tokio::test]
     async fn view_returns_plan_with_entries() {
@@ -3699,6 +4007,241 @@ mod tests {
         assert_eq!(bad.status(), StatusCode::BAD_GATEWAY);
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 异步契约：`Prefer: respond-async` 只入队（`202` + job），worker 完成后可按 job 轮询到
+    /// 结果；失败也落在 job 上（状态码 / 错误码 / 原因），不再靠一次长连接。
+    #[tokio::test]
+    async fn async_publish_returns_a_job_and_exposes_the_result() {
+        use axum::{body::Body, http::Request};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("wic-async-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let pkg = dir.join("wist-gateway-stack-9.9.9.tar.gz");
+        std::fs::write(&pkg, b"async-artifact-bytes").expect("write");
+        let source = pkg.to_string_lossy().to_string();
+        let sha = crate::infra::sha256_hex_bytes(b"async-artifact-bytes");
+
+        let state = test_state();
+        let app = super::super::router_for(state.clone());
+        let publish = |artifact_url: String, expected: String| {
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/admin/releases/wist-gateway-stack")
+                .header("authorization", "Bearer admin-tok")
+                .header("content-type", "application/json")
+                .header("prefer", "respond-async")
+                .body(Body::from(
+                    serde_json::json!({
+                        "artifact_url": artifact_url,
+                        "expected_sha256": expected,
+                        "requested_by": "tester",
+                    })
+                    .to_string(),
+                ))
+                .expect("request")
+        };
+
+        let response = app
+            .clone()
+            .oneshot(publish(source, sha.clone()))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let job: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let job_id = job["job_id"].as_str().expect("job id").to_string();
+        assert_eq!(job["kind"], crate::infra::RELEASE_JOB_PUBLISH);
+
+        // worker 可能已经执行完（入队即唤醒）；等到终态再看结果。
+        let done = state
+            .jobs
+            .wait_for_terminal(&job_id, Duration::from_secs(10))
+            .await
+            .expect("wait")
+            .expect("terminal");
+        assert_eq!(done.state, crate::infra::JOB_SUCCEEDED);
+        assert_eq!(done.progress.completed, 1);
+        let package: crate::infra::ReleasePackageRecord =
+            serde_json::from_value(done.result.clone().expect("result")).expect("package");
+        assert_eq!(package.package.version, "9.9.9");
+
+        // 任务查询 / 列表都可见（列表按组件筛）。
+        let (status, one) = get_json(&app, &format!("/api/v1/admin/release-jobs/{job_id}")).await;
+        assert_eq!(status, StatusCode::OK, "{one}");
+        assert_eq!(one["state"], crate::infra::JOB_SUCCEEDED);
+        assert_eq!(one["package"]["version"], "9.9.9");
+        let (status, list) = get_json(
+            &app,
+            "/api/v1/admin/release-jobs?component=wist-gateway-stack",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        assert!(
+            list.as_array()
+                .expect("list")
+                .iter()
+                .any(|item| item["job_id"] == job_id.as_str()),
+            "{list}"
+        );
+
+        // 取包失败：同样 202 入队，失败原因落在 job 上（状态码 + 错误码）。
+        let response = app
+            .clone()
+            .oneshot(publish(
+                format!("{}/missing-pkg.tar.gz", dir.display()),
+                sha,
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let failed: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let failed_id = failed["job_id"].as_str().expect("job id").to_string();
+        let done = state
+            .jobs
+            .wait_for_terminal(&failed_id, Duration::from_secs(10))
+            .await
+            .expect("wait")
+            .expect("terminal");
+        assert_eq!(done.state, crate::infra::JOB_FAILED);
+        assert_eq!(done.error_status, Some(502));
+        assert_eq!(
+            done.error_code.as_deref(),
+            Some(super::super::codes::ARTIFACT_FETCH_FAILED)
+        );
+
+        // 未知任务 → 404。
+        let (status, _) = get_json(&app, "/api/v1/admin/release-jobs/rel-nope").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 通用任务读面 + 取消：排队中的任务可取消，取消后 release 视图也显示 `canceled`；
+    /// 已终结的任务再取消回 409。
+    #[tokio::test]
+    async fn generic_jobs_can_be_listed_and_queued_jobs_canceled() {
+        let state = test_state();
+        let app = super::super::router_for(state.clone());
+        let job = crate::infra::release_job(crate::infra::ReleaseJobPayload {
+            mode: crate::infra::RELEASE_JOB_PUBLISH.to_string(),
+            component: "wist-agentd".to_string(),
+            requested_by: "admin".to_string(),
+            declared_version: None,
+            artifacts: vec![crate::infra::ReleaseJobArtifact {
+                artifact_url: "https://example/pkg.tar.gz".to_string(),
+                expected_sha256: "0".repeat(64),
+            }],
+        })
+        .expect("job");
+        let job_id = job.job_id.clone();
+        // 直接落库（不启动 worker），保证任务停在 `queued`。
+        state.store.create_job(&job).await.expect("create job");
+        // 再落一条更新、但主体不同的任务：按组件过滤必须在 limit 之前生效。
+        let mut other = crate::infra::release_job(crate::infra::ReleaseJobPayload {
+            mode: crate::infra::RELEASE_JOB_PUBLISH.to_string(),
+            component: "wist-gateway-stack".to_string(),
+            requested_by: "admin".to_string(),
+            declared_version: None,
+            artifacts: vec![crate::infra::ReleaseJobArtifact {
+                artifact_url: "https://example/other.tar.gz".to_string(),
+                expected_sha256: "1".repeat(64),
+            }],
+        })
+        .expect("other job");
+        other.job_id = "job-newer-other".to_string();
+        state.store.create_job(&other).await.expect("create other");
+
+        let (status, filtered) = get_json(
+            &app,
+            "/api/v1/admin/jobs?queue=release-download&subject=wist-agentd&limit=1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{filtered}");
+        let filtered = filtered.as_array().expect("list");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0]["job_id"], job_id.as_str());
+
+        let (status, release_list) = get_json(
+            &app,
+            "/api/v1/admin/release-jobs?component=wist-agentd&limit=1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{release_list}");
+        assert_eq!(release_list.as_array().expect("list").len(), 1);
+        assert_eq!(release_list[0]["job_id"], job_id.as_str());
+
+        let (status, list) = get_json(
+            &app,
+            "/api/v1/admin/jobs?queue=release-download&state=queued",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        assert!(
+            list.as_array()
+                .expect("list")
+                .iter()
+                .any(|item| item["job_id"] == job_id.as_str()),
+            "{list}"
+        );
+
+        let (status, one) = get_json(&app, &format!("/api/v1/admin/jobs/{job_id}")).await;
+        assert_eq!(status, StatusCode::OK, "{one}");
+        assert_eq!(one["state"], crate::infra::JOB_QUEUED);
+
+        let (status, canceled) = post_json(
+            &app,
+            &format!("/api/v1/admin/jobs/{job_id}/cancel"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{canceled}");
+        assert_eq!(canceled["state"], crate::infra::JOB_CANCELED);
+
+        // release 领域视图同步显示已取消。
+        let (status, view) = get_json(&app, &format!("/api/v1/admin/release-jobs/{job_id}")).await;
+        assert_eq!(status, StatusCode::OK, "{view}");
+        assert_eq!(view["state"], crate::infra::JOB_CANCELED);
+
+        // 已是终态 → 不能再取消。
+        let (status, body) = post_json(
+            &app,
+            &format!("/api/v1/admin/jobs/{job_id}/cancel"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            body["error"]["code"],
+            super::super::codes::JOB_NOT_CANCELABLE
+        );
+
+        // 未知任务 → 404。
+        let (status, _) = get_json(&app, "/api/v1/admin/jobs/job-nope").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = post_json(
+            &app,
+            "/api/v1/admin/jobs/job-nope/cancel",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     /// 单条录入：来源文件名就能看出是别的组件 → **下载前**即拒（不碰网络 / 磁盘）。
@@ -4638,6 +5181,13 @@ mod tests {
                 }
             })
             .expect("update");
+        let store: std::sync::Arc<dyn crate::infra::Store> = std::sync::Arc::new(store);
+        let artifact_store: std::sync::Arc<dyn crate::infra::ArtifactStore> =
+            std::sync::Arc::new(crate::infra::LocalArtifactStore::new(
+                std::env::temp_dir().join("wic-artifacts"),
+                "http://127.0.0.1:3100",
+            ));
+        let jobs = crate::infra::release_job_queue(store.clone(), artifact_store.clone());
         let state = ApiState {
             config: CenterConfig {
                 listen_addr: "127.0.0.1:3100".to_string(),
@@ -4666,16 +5216,14 @@ mod tests {
                 wparse_release: Default::default(),
                 log: Default::default(),
             },
-            store: std::sync::Arc::new(store),
-            artifact_store: std::sync::Arc::new(crate::infra::LocalArtifactStore::new(
-                std::env::temp_dir().join("wic-artifacts"),
-                "http://127.0.0.1:3100",
-            )),
+            store,
+            artifact_store,
             gateway_ca: test_gateway_ca(),
             proxy: None,
             rate_limits: std::sync::Arc::new(std::sync::Mutex::new(
                 super::super::rate_limit::RateLimitState::default(),
             )),
+            jobs,
         };
         let app = super::super::router_for(state);
 
@@ -4852,6 +5400,13 @@ mod tests {
     }
 
     fn create_state_with_store(store: FileStore) -> ApiState {
+        let store: std::sync::Arc<dyn crate::infra::Store> = std::sync::Arc::new(store);
+        let artifact_store: std::sync::Arc<dyn crate::infra::ArtifactStore> =
+            std::sync::Arc::new(crate::infra::LocalArtifactStore::new(
+                std::env::temp_dir().join("wic-artifacts"),
+                "http://127.0.0.1:3100",
+            ));
+        let jobs = crate::infra::release_job_queue(store.clone(), artifact_store.clone());
         ApiState {
             config: CenterConfig {
                 listen_addr: "127.0.0.1:3100".to_string(),
@@ -4880,16 +5435,14 @@ mod tests {
                 wparse_release: Default::default(),
                 log: Default::default(),
             },
-            store: std::sync::Arc::new(store),
-            artifact_store: std::sync::Arc::new(crate::infra::LocalArtifactStore::new(
-                std::env::temp_dir().join("wic-artifacts"),
-                "http://127.0.0.1:3100",
-            )),
+            store,
+            artifact_store,
             gateway_ca: test_gateway_ca(),
             proxy: None,
             rate_limits: std::sync::Arc::new(std::sync::Mutex::new(
                 super::super::rate_limit::RateLimitState::default(),
             )),
+            jobs,
         }
     }
 
@@ -5171,6 +5724,13 @@ mod tests {
             .as_nanos();
         let path = std::env::temp_dir().join(format!("wic-create-tb-{nanos}.json"));
         let store = FileStore::new(&path);
+        let store: std::sync::Arc<dyn crate::infra::Store> = std::sync::Arc::new(store);
+        let artifact_store: std::sync::Arc<dyn crate::infra::ArtifactStore> =
+            std::sync::Arc::new(crate::infra::LocalArtifactStore::new(
+                std::env::temp_dir().join("wic-artifacts"),
+                "http://127.0.0.1:3100",
+            ));
+        let jobs = crate::infra::release_job_queue(store.clone(), artifact_store.clone());
         let state = ApiState {
             config: CenterConfig {
                 listen_addr: "127.0.0.1:3100".to_string(),
@@ -5201,16 +5761,14 @@ mod tests {
                 wparse_release: Default::default(),
                 log: Default::default(),
             },
-            store: std::sync::Arc::new(store),
-            artifact_store: std::sync::Arc::new(crate::infra::LocalArtifactStore::new(
-                std::env::temp_dir().join("wic-artifacts"),
-                "http://127.0.0.1:3100",
-            )),
+            store,
+            artifact_store,
             gateway_ca: test_gateway_ca(),
             proxy: None,
             rate_limits: std::sync::Arc::new(std::sync::Mutex::new(
                 super::super::rate_limit::RateLimitState::default(),
             )),
+            jobs,
         };
         let app = super::super::router_for(state);
         let response = app

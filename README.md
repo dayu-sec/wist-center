@@ -246,6 +246,7 @@ be reused. Approval needs an active wparse-proxy as well — if the queue is unr
 | `WARP_INSIGHT_CENTER_PROTOCOL_VERSION` | `1.0` | Gateway ↔ center wire protocol version. |
 | `WARP_INSIGHT_CENTER_GATEWAY_IMAGE` | `wist-gateway:latest` | Image reference used in the generated gateway install command. |
 | `WIST_CENTER_GITHUB_TOKEN` | *(unset; falls back to `GITHUB_TOKEN`)* | Token used to list / resolve GitHub releases (auto-detect latest, one-click fill). Anonymous requests are limited to 60/hour; set it for private repos or frequent checks. |
+| `WIST_CENTER_JOB_RETENTION_DAYS` | `7` | How many days terminal background jobs (succeeded / failed / canceled) are kept before the hourly cleanup removes them. `0` (or a negative / non-numeric value) disables cleanup — the default is never applied to a value you explicitly set, so a typo can't silently delete history. |
 
 All four `..._OBJECT_STORAGE_*` variables must be set together; if any is missing, release
 artifacts are written to `ARTIFACT_DIR` instead.
@@ -291,13 +292,30 @@ All require the admin Bearer token:
 | `POST` | `/api/v1/gateway/agents/dispatch` |
 | `GET` | `/api/v1/admin/package-sources` |
 | `GET` | `/api/v1/admin/package-sources/latest` (`?component=…&base_version=…&source=…`) |
-| `POST` / `GET` | `/api/v1/admin/releases/:component` |
-| `POST` | `/api/v1/admin/releases/:component/batch` |
+| `POST` / `GET` | `/api/v1/admin/releases/:component`（POST 只入队；`Prefer: respond-async` → 202 job） |
+| `POST` | `/api/v1/admin/releases/:component/batch`（同上，异步任务） |
 | `POST` | `/api/v1/admin/releases/:component/:version/status` |
-| `POST` / `GET` | `/api/v1/admin/rollout-plans` |
+| `GET` | `/api/v1/admin/release-jobs`（`?limit=&component=`，新→旧） |
+| `GET` | `/api/v1/admin/release-jobs/:job_id`（`queued` / `running` / `succeeded` / `failed` / `canceled`） |
+| `GET` | `/api/v1/admin/jobs`（`?queue=&kind=&state=&subject=&limit=`，通用任务列表；默认 20、最多 200） |
+| `GET` | `/api/v1/admin/jobs/:job_id`（通用任务详情） |
+| `POST` | `/api/v1/admin/jobs/:job_id/cancel`（仅 `queued` 可取消；其它状态回 409） |
+| `POST` / `GET` | `/api/v1/admin/rollout-plans` (`?include_archived=true` on list) |
 | `POST` | `/api/v1/admin/rollout-plans/approve` |
 | `POST` | `/api/v1/admin/rollout-plans/advance` |
 | `GET` | `/api/v1/admin/rollout-plans/:plan_id` |
+| `DELETE` | `/api/v1/admin/rollout-plans/:plan_id`（只删终结态；物理删除不可恢复） |
+| `POST` | `/api/v1/admin/rollout-plans/:plan_id/archive` |
+
+> Remote package ingestion runs through the generic `jobs` queue (`infra::jobs`,
+> `kind = release-download`). A submit writes one job row and returns a job id; the worker
+> downloads / verifies / mirrors / records it, updating `progress` as it goes. The
+> `/releases/*` and `/release-jobs/*` shapes are unchanged. Queued jobs can be canceled via
+> the generic cancel endpoint; terminal jobs are kept for `WIST_CENTER_JOB_RETENTION_DAYS`
+> (7 by default), then cleaned up. `subject` is the release component, so
+> `/admin/jobs?subject=<component>` and `/admin/release-jobs?component=<component>` return the
+> same rows — filtering happens in the store, before `limit`, so a busy queue can't push the
+> tasks you asked for out of the window.
 
 > `POST /api/v1/gateway/agents/dispatch` sits under the `/gateway/` prefix but is an admin-side
 > command (dispatching an agent-fleet command), so it takes the admin token.

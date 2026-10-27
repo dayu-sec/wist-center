@@ -5,6 +5,43 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.23.0-alpha] - 2026-10-28
+
+### 新增
+
+- **发布执行记录支持归档 / 取消归档**：`POST /api/v1/admin/rollout-plans/{plan_id}/archive`，
+  body `{"archived": true|false}`。归档是**标记**（`archived_at`）：计划与逐目标条目全留，
+  默认列表 `GET /api/v1/admin/rollout-plans` 不再展示，`?include_archived=true` 才带。
+  只受理**终结态**（completed / failed / canceled）—— draft / rolling 还要批准 / 推进，
+  藏起来会让人找不到入口。
+- **发布执行记录支持删除**：`DELETE /api/v1/admin/rollout-plans/{plan_id}`。删除是**物理删除**
+  （计划 + 逐目标条目，不可恢复），回执是被删前的计划视图；同样只受理**终结态**，
+  draft / rolling 回 409（`plan_not_deletable`）—— 执行中的计划还有在飞的工作。
+  想留证据的用归档，清理失败堆积用删除。
+- **远程包下载全部改为队列异步**：`POST /api/v1/admin/releases/{component}`（以及 `/batch`）
+  不再在一次请求里同步取包，而是落一条**持久化下载任务**并交给 worker 串行执行
+  （取包 → 摘要校验 → 镜像 → 落库）。带 `Prefer: respond-async` 直接回 `202 + job`；
+  不带该头的老调用方走兼容等待（同样由队列执行，成功 / 失败折回旧状态码与回执形状）。
+  新增 `GET /api/v1/admin/release-jobs/{job_id}` 与 `GET /api/v1/admin/release-jobs`
+  （`?limit=&component=`）查进度；任务存 PostgreSQL 通用 `jobs` 表（`kind/queue` 区分业务），
+  多平台任务每完成一个制品就回写 `completed_artifacts` / `message`（前端可显示「取包 2/3」）。
+  中心重启时残留的 `running` 任务会自动排回 `queued`（下载 / 落库幂等，重跑安全）。
+- **通用后台任务队列**：新增 `infra::jobs`（`JobRecord` / `JobQueue` / `JobHandler` /
+  `JobContext`），按 `kind` 注册执行器、按 `queue` 串行认领，支持进度 / 结果 / 失败码；
+  `release-download` 是第一个 handler。存储从 `release_download_jobs` 泛化为 `jobs`，
+  对外 `/releases/*` 与 `/release-jobs/*` 的路径、回执形状保持不变（前端零改动）。
+- **任务取消（仅排队中）**：`POST /api/v1/admin/jobs/{job_id}/cancel`。原子条件更新，
+  只受理 `queued`；运行中 / 已终结回 409 `job_not_cancelable`。取消后状态为 `canceled`，
+  不会被执行，也不会产生发布记录。
+- **任务保留期 / 自动清理**：终态任务（成功 / 失败 / 已取消）默认保留 **7 天**，后台每小时
+  按 `finished_at` 清理一次；排队中 / 执行中的任务永不清理。保留期可用
+  `WIST_CENTER_JOB_RETENTION_DAYS` 调整，`0`（或负数 / 非数字）表示不自动清理 ——
+  显式配错时**不**回退默认值，避免运维手滑把历史删掉。
+- **通用任务读面**：`GET /api/v1/admin/jobs?queue=&kind=&state=&subject=&limit=` 与
+  `GET /api/v1/admin/jobs/{job_id}`，直接返回任务本体（`payload` / `result` / `progress` /
+  `error_*`）；领域形状（`/release-jobs`）继续保留。任务新增 `subject` 字段（release 任务
+  是 component），过滤在存储层、`limit` 之前生效，任务多时不会把目标任务挤出窗口。
+
 ## [0.22.2-alpha] - 2026-10-25
 
 ### 新增
