@@ -10,6 +10,7 @@
 //! 本模块是两者共用的**入参形状、读投影与推进逻辑**。
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 use wist_control::types::DateTime;
 
@@ -237,12 +238,108 @@ struct UpgradeSpecTarget {
 /// 现模型的 `GatewayUpgradePlan` 只承载**单组件**目标（多组件计划取第一个）；`spec` 解不出
 /// 组件（缺字段 / 非 JSON）时返回 `None`，由调用方回落成「无组件」（地址也就派生不出来）。
 pub(super) fn first_upgrade_target(spec: &str) -> Option<(String, String)> {
-    let parsed: UpgradeSpec = serde_json::from_str(spec).ok()?;
+    let parsed = serde_json::from_str::<UpgradeSpec>(spec).ok()?;
     let target = parsed.targets.into_iter().next()?;
     if target.component.is_empty() {
         return None;
     }
     Some((target.component, target.target_version))
+}
+
+/// 按计划里的目标组件版本，逐台检查它上报的 `version` / `gwlinkd_version` 是否满足
+/// 包内 `compat.json` 的 `requires`。返回人类可读的不兼容项；空 = 通过。
+///
+/// - `Err` = 读存储失败（调用方按 500 处理）；
+/// - 没有 release 记录 / 没有 `compat.json` / 网关没上报版本 → 只告警，不阻断；
+/// - 只有 `requires` 被明确违反才是硬阻断（`report.is_blocking()`）。
+pub(super) async fn target_compatibility_errors(
+    state: &ApiState,
+    plan: &UpgradePlanRecord,
+) -> Result<Vec<String>, String> {
+    if plan.action == ACTION_WPARSE_RELEASE {
+        return Ok(Vec::new());
+    }
+    let Some((component, version)) = first_upgrade_target(&plan.spec) else {
+        return Ok(Vec::new());
+    };
+    let releases = state
+        .store
+        .list_releases(&component)
+        .await
+        .map_err(|err| format!("failed to load releases for {component}: {err}"))?;
+    // 同版本多平台行共用同一份 compat.json；取任一仍可派发且带声明的行即可。
+    let Some(compat) = releases
+        .iter()
+        .find(|record| {
+            record.version == version && record.status != "expired" && record.compat.is_some()
+        })
+        .and_then(|record| record.compat.clone())
+    else {
+        return Ok(Vec::new());
+    };
+
+    let mut errors = Vec::new();
+    let mut seen = HashSet::new();
+    for entry in &plan.entries {
+        if !seen.insert(entry.gateway_id.clone()) {
+            continue;
+        }
+        let gateway = match state.store.get_gateway(&entry.gateway_id).await {
+            Ok(Some(gateway)) => gateway,
+            Ok(None) => continue,
+            Err(err) => {
+                return Err(format!(
+                    "failed to load gateway {}: {err}",
+                    entry.gateway_id
+                ));
+            }
+        };
+        let current = gateway_compat_current(&gateway);
+        let report = wist_release::compat::check(
+            Some(&compat),
+            &component,
+            &version,
+            &current,
+            &chrono::Utc::now().to_rfc3339(),
+        );
+        if report.is_blocking() {
+            errors.push(format!(
+                "gateway {}: {}",
+                entry.gateway_id,
+                report.summary()
+            ));
+        } else if report.status != wist_release::compat::CompatStatus::Ok {
+            log::warn!(
+                "event=RolloutCompatibilityWarn plan_id={} gateway_id={} component={component} version={version} status={} detail={}",
+                plan.plan_id,
+                entry.gateway_id,
+                report.status.as_str(),
+                report.summary()
+            );
+        }
+    }
+    Ok(errors)
+}
+
+fn gateway_compat_current(
+    gateway: &crate::infra::StoredGateway,
+) -> std::collections::BTreeMap<String, String> {
+    let mut current = std::collections::BTreeMap::new();
+    current.insert(
+        "wist-center".to_string(),
+        env!("CARGO_PKG_VERSION").to_string(),
+    );
+    if let Some(version) = gateway.version.as_deref().filter(|value| !value.is_empty()) {
+        current.insert("wist-gateway".to_string(), version.to_string());
+    }
+    if let Some(version) = gateway
+        .gwlinkd_version
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        current.insert("wist-gwlinkd".to_string(), version.to_string());
+    }
+    current
 }
 
 /// 「知识库包下发」的 `activate`（缺省 false）：spec 形如

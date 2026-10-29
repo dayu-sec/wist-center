@@ -3,7 +3,7 @@
 
 [package]
 name = "wist-center"
-version = "0.23.0" #@gxl:set(version)
+version = "0.24.0" #@gxl:set(version)
 edition = "2024"
 
 [dependencies]
@@ -32,11 +32,9 @@ rcgen = { version = "0.13", features = ["x509-parser"] }
 x509-parser = "0.16"
 time = { version = "0.3", features = ["std"] }
 
-# 读安装包顶层目录名，取 version/arch 自述（与网关侧 install_package.rs 同口径）。
-# 来源读取 / 摘要校验 / 身份解析 / 命名已收进共享 crate `wist-release`，本仓只做薄适配。
-#wist-release = "0.6.0"
-# 本地联调：按 rust-gx 约定切下面这行用 path 指向本地 `wist-release`；发版/无关本仓改动时切回上面的 registry。
-wist-release = { version = "0.6" }
+# 读安装包顶层目录名，取 version/arch 自述（与网关侧 install_package.rs 同口径）+ 升级兼容声明检查。
+wist-release = "0.6"
+# 本地联调：按 rust-gx 约定切下面这行用 path 指向本地 `wist-release`；发版时切回上面的 registry。
 #wist-release = { version = "0.6", path = "../wist-release" }
 # 运行日志：共享 crate（级别 / 格式 / 落点 / 轮转 统一口径）。
 # 本地联调切 path。

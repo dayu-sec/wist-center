@@ -151,6 +151,9 @@ ALTER TABLE release_records ADD COLUMN IF NOT EXISTS package_sha256 TEXT;
 -- 幂等补列（既有库）：目标平台（target-triple；部署栈类包为空）。
 ALTER TABLE release_records ADD COLUMN IF NOT EXISTS platform TEXT;
 
+-- 幂等补列（既有库）：包内 compat.json（升级兼容声明，发布时解析并落库）。
+ALTER TABLE release_records ADD COLUMN IF NOT EXISTS compat_json TEXT;
+
 -- 升级计划（payload 为 JSON，含多目标/网关范围/多步执行）。
 CREATE TABLE IF NOT EXISTS upgrade_plans (
   plan_id TEXT PRIMARY KEY,

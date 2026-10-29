@@ -1602,7 +1602,24 @@ pub async fn admin_list_releases(
             );
         }
     };
-    Json(crate::infra::group_release_packages(&component, releases)).into_response()
+    let mut packages = crate::infra::group_release_packages(&component, releases);
+    // 列表读投影：按**当前中心版本**给每个包算一份兼容报告。网关侧的最终校验仍在
+    // 包入库 / 计划批准时做（那里才知道每台网关的 version / gwlinkd_version）。
+    let current = std::collections::BTreeMap::from([(
+        "wist-center".to_string(),
+        env!("CARGO_PKG_VERSION").to_string(),
+    )]);
+    let checked_at = chrono::Utc::now().to_rfc3339();
+    for package in &mut packages {
+        package.compatibility = Some(wist_release::compat::check(
+            package.compat.as_ref(),
+            &package.component,
+            &package.package.version,
+            &current,
+            &checked_at,
+        ));
+    }
+    Json(packages).into_response()
 }
 
 /// 改托管状态请求体：`status` ∈ {published, expired}。
@@ -1949,6 +1966,26 @@ pub async fn admin_create_upgrade_plan(
         )
         .into_response();
     }
+    // 逐台按它上报的 version / gwlinkd_version 检查包内 `compat.json`：
+    // 不兼容就在**建计划时**拒绝，并点名是哪台、要先升哪个组件。
+    match rollout::target_compatibility_errors(&state, &record).await {
+        Ok(errors) if errors.is_empty() => {}
+        Ok(errors) => {
+            return super::error::ApiError::conflict(
+                super::codes::ROLLOUT_TARGET_INCOMPATIBLE,
+                errors.join("; "),
+            )
+            .into_response();
+        }
+        Err(err) => {
+            return super::error::internal_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                super::codes::ROLLOUT_PLAN_LOAD_FAILED,
+                "failed to check target compatibility",
+                err,
+            );
+        }
+    }
     match state.store.create_upgrade_plan(&record).await {
         Ok(plan) => (StatusCode::CREATED, Json(rollout::plan_view(&plan))).into_response(),
         Err(err) => super::error::internal_response(
@@ -2156,6 +2193,27 @@ pub async fn admin_approve_upgrade_plan(
             ),
         )
         .into_response();
+    }
+    // 批准前再按**当前**上报版本校验一次：计划创建后网关可能升级/降级过。
+    if plan.action != rollout::ACTION_WPARSE_RELEASE {
+        match rollout::target_compatibility_errors(&state, &plan).await {
+            Ok(errors) if errors.is_empty() => {}
+            Ok(errors) => {
+                return super::error::ApiError::conflict(
+                    super::codes::ROLLOUT_TARGET_INCOMPATIBLE,
+                    errors.join("; "),
+                )
+                .into_response();
+            }
+            Err(err) => {
+                return super::error::internal_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    super::codes::ROLLOUT_PLAN_LOAD_FAILED,
+                    "failed to check target compatibility",
+                    err,
+                );
+            }
+        }
     }
     if !rollout::approve_plan(&mut plan) {
         return super::error::ApiError::conflict(
@@ -3129,6 +3187,195 @@ mod tests {
     }
 
     /// 阶段由**服务端**按阶梯切：客户端只给目标与阶段数，不自己切。
+    #[tokio::test]
+    async fn create_upgrade_plan_rejects_a_target_whose_gateway_is_too_old() {
+        let store = gateway_store(1);
+        store
+            .update(|snapshot| {
+                if let Some(gateway) = snapshot.gateways.get_mut("gw-001") {
+                    gateway.version = Some("0.8.2".to_string());
+                    gateway.gwlinkd_version = Some("0.18.0".to_string());
+                }
+            })
+            .expect("seed versions");
+        let manifest: wist_release::compat::CompatManifest =
+            serde_json::from_str(r#"{"requires":{"wist-gateway":">=9.0.0"}}"#).expect("manifest");
+        store
+            .publish_release_with_compat(
+                "wist-gateway-stack",
+                "0.1.28",
+                "https://example/stack.tar.gz",
+                None,
+                None,
+                Some(manifest),
+            )
+            .expect("release");
+        let refs = ["gw-001"];
+        let (status, body) = post_json(
+            &super::super::router_for(state_with_store(store)),
+            "/api/v1/admin/rollout-plans",
+            create_body(&refs, 1),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], "rollout_target_incompatible");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .expect("message")
+                .contains("请先升级"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_upgrade_plan_allows_a_compatible_target() {
+        let store = gateway_store(1);
+        store
+            .update(|snapshot| {
+                if let Some(gateway) = snapshot.gateways.get_mut("gw-001") {
+                    gateway.version = Some("0.25.0".to_string());
+                    gateway.gwlinkd_version = Some("0.20.0".to_string());
+                }
+            })
+            .expect("seed versions");
+        let manifest: wist_release::compat::CompatManifest =
+            serde_json::from_str(r#"{"requires":{"wist-gateway":">=0.0.1"}}"#).expect("manifest");
+        store
+            .publish_release_with_compat(
+                "wist-gateway-stack",
+                "0.1.28",
+                "https://example/stack.tar.gz",
+                None,
+                None,
+                Some(manifest),
+            )
+            .expect("release");
+        let refs = ["gw-001"];
+        let (status, body) = post_json(
+            &super::super::router_for(state_with_store(store)),
+            "/api/v1/admin/rollout-plans",
+            create_body(&refs, 1),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    #[tokio::test]
+    async fn approve_upgrade_plan_rechecks_the_current_gateway_version() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("wic-approve-compat-{nanos}.json"));
+        let store = FileStore::new(&path);
+        store
+            .seed(&[GatewayCredentialSeed {
+                gateway_id: "gw-001".to_string(),
+                token: "tok-a".to_string(),
+                expires_at: None,
+            }])
+            .expect("seed");
+        store
+            .update(|snapshot| {
+                if let Some(gateway) = snapshot.gateways.get_mut("gw-001") {
+                    gateway.version = Some("0.25.0".to_string());
+                    gateway.gwlinkd_version = Some("0.20.0".to_string());
+                }
+            })
+            .expect("versions");
+        let manifest: wist_release::compat::CompatManifest =
+            serde_json::from_str(r#"{"requires":{"wist-gateway":">=0.9.0"}}"#).expect("manifest");
+        store
+            .publish_release_with_compat(
+                "wist-gateway-stack",
+                "0.1.28",
+                "https://example/stack.tar.gz",
+                None,
+                None,
+                Some(manifest),
+            )
+            .expect("release");
+        let state = state_with_store(store);
+        let refs = ["gw-001"];
+        let (status, plan) = post_json(
+            &super::super::router_for(state.clone()),
+            "/api/v1/admin/rollout-plans",
+            create_body(&refs, 1),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{plan}");
+        let plan_id = plan["plan_id"].as_str().expect("plan_id").to_string();
+
+        // 创建后网关被降级：批准时必须重新发现“现在不兼容”。
+        FileStore::new(&path)
+            .update(|snapshot| {
+                if let Some(gateway) = snapshot.gateways.get_mut("gw-001") {
+                    gateway.version = Some("0.8.2".to_string());
+                }
+            })
+            .expect("downgrade");
+
+        let (status, body) = post_json(
+            &super::super::router_for(state),
+            "/api/v1/admin/rollout-plans/approve",
+            serde_json::json!({ "plan_id": plan_id }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"]["code"], "rollout_target_incompatible");
+    }
+
+    #[tokio::test]
+    async fn list_releases_reports_compatibility_against_the_current_center() {
+        let store = test_store();
+        let compatible: wist_release::compat::CompatManifest =
+            serde_json::from_str(r#"{"requires":{"wist-center":">=0.0.1"}}"#)
+                .expect("compatible manifest");
+        let incompatible: wist_release::compat::CompatManifest =
+            serde_json::from_str(r#"{"requires":{"wist-center":">=99.0.0"}}"#)
+                .expect("incompatible manifest");
+        store
+            .publish_release_with_compat(
+                "wist-gateway-stack",
+                "0.1.27",
+                "https://example/stack-0.1.27.tar.gz",
+                None,
+                None,
+                Some(compatible),
+            )
+            .expect("compatible release");
+        store
+            .publish_release_with_compat(
+                "wist-gateway-stack",
+                "0.1.28",
+                "https://example/stack-0.1.28.tar.gz",
+                None,
+                None,
+                Some(incompatible),
+            )
+            .expect("incompatible release");
+        let (status, body) = get_json(
+            &super::super::router_for(state_with_store(store)),
+            "/api/v1/admin/releases/wist-gateway-stack",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let packages = body.as_array().expect("packages");
+        let package = |version: &str| {
+            packages
+                .iter()
+                .find(|package| package["version"] == version)
+                .unwrap_or_else(|| panic!("missing {version}: {body}"))
+        };
+        assert_eq!(package("0.1.27")["compatibility"]["status"], "ok");
+        assert_eq!(package("0.1.28")["compatibility"]["status"], "error");
+        assert_eq!(
+            package("0.1.28")["compatibility"]["checks"][0]["peer"],
+            "wist-center"
+        );
+    }
+
     #[tokio::test]
     async fn create_upgrade_plan_splits_phases_on_the_server() {
         let ids = gateway_refs(10);

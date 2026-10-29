@@ -789,24 +789,29 @@ impl Store for PgStore {
             .collect())
     }
 
-    async fn publish_release(
+    async fn publish_release_with_compat(
         &self,
         component: &str,
         version: &str,
         artifact_url: &str,
         package_sha256: Option<&str>,
         platform: Option<&str>,
+        compat: Option<wist_release::compat::CompatManifest>,
     ) -> Result<ReleaseRecord, StoreError> {
         let published_at = chrono::Utc::now();
+        let compat_json = compat
+            .as_ref()
+            .and_then(|manifest| serde_json::to_string(manifest).ok());
         sqlx::query(
-            "INSERT INTO release_records (component, version, artifact_url, package_sha256, platform, status, published_at) \
-             VALUES ($1, $2, $3, $4, $5, 'published', $6)",
+            "INSERT INTO release_records (component, version, artifact_url, package_sha256, platform, compat_json, status, published_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, 'published', $7)",
         )
         .bind(component)
         .bind(version)
         .bind(artifact_url)
         .bind(package_sha256)
         .bind(platform)
+        .bind(compat_json.as_deref())
         .bind(published_at)
         .execute(&self.pool)
         .await
@@ -819,12 +824,13 @@ impl Store for PgStore {
             status: "published".to_string(),
             published_at: DateTime::from_rfc3339(&published_at.to_rfc3339())
                 .unwrap_or_else(DateTime::now),
+            compat,
         })
     }
 
     async fn list_releases(&self, component: &str) -> Result<Vec<ReleaseRecord>, StoreError> {
         let rows: Vec<ReleaseRow> = sqlx::query_as(
-            "SELECT version, artifact_url, package_sha256, platform, status, published_at FROM release_records \
+            "SELECT version, artifact_url, package_sha256, platform, compat_json, status, published_at FROM release_records \
              WHERE component = $1 ORDER BY published_at DESC",
         )
         .bind(component)
@@ -861,7 +867,7 @@ impl Store for PgStore {
     ) -> Result<Option<ReleaseRecord>, StoreError> {
         let row: Option<ReleaseRow> = sqlx::query_as(
             "UPDATE release_records SET platform = $1 WHERE component = $2 AND version = $3 AND package_sha256 = $4 \
-             RETURNING version, artifact_url, package_sha256, platform, status, published_at",
+             RETURNING version, artifact_url, package_sha256, platform, compat_json, status, published_at",
         )
         .bind(platform)
         .bind(component)
@@ -1390,6 +1396,7 @@ struct ReleaseRow {
     artifact_url: String,
     package_sha256: Option<String>,
     platform: Option<String>,
+    compat_json: Option<String>,
     status: String,
     published_at: chrono::DateTime<chrono::Utc>,
 }
@@ -1404,6 +1411,9 @@ impl ReleaseRow {
             status: self.status,
             published_at: DateTime::from_rfc3339(&self.published_at.to_rfc3339())
                 .unwrap_or_else(DateTime::now),
+            compat: self
+                .compat_json
+                .and_then(|json| serde_json::from_str(&json).ok()),
         }
     }
 }

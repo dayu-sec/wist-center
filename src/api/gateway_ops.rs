@@ -2782,6 +2782,7 @@ mod tests {
             platform: Some("aarch64-apple-darwin".to_string()),
             status: "published".to_string(),
             published_at: at,
+            compat: None,
         };
         // 乱序两种：新的在前 / 新的在后 —— 都必须选到新的。
         for records in [

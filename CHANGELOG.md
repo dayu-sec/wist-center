@@ -5,6 +5,27 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.24.0-alpha] - 2026-10-29
+
+### 新增（升级兼容检查）
+
+按包内可选的 `compat.json`（`requires` / `supports` / `coexists_with` / `compat_mode` /
+`bridge` / `reversible`）在**中心侧所有托管入口**做检查，口径统一在 `wist-release::compat`：
+
+- **发布入库**（单制品 / 多平台批量）：镜像前先检查，不满足 → `409 release_incompatible`
+  （detail 里点名“请先升级”）；批量是**全部平台预检通过**后才落库，不会留半套记录。
+  `release_records` 新增 `compat_json` 列（幂等 `ALTER TABLE`），把声明随发布记录一起存下。
+- **建升级计划 / 批准升级计划**：按**目标网关**上报的 `version` / `gwlinkd_version` 与中心自身版本
+  二次检查（建计划一次、批准时再检查一次），不满足 → `409 rollout_target_incompatible`，
+  并点名是哪台网关、要先升哪个组件。
+- **包列表** `GET /api/v1/admin/releases/{component}`：每包附 `compatibility` 报告（按当前 center
+  版本算）；`release_jobs` 完成的任务视图同样带 `compatibility`。
+- 新增错误码：`release_incompatible` / `rollout_target_incompatible`。
+
+### 依赖
+
+- `wist-release` 升到 **0.6.1**（新增 `compat` 模块；本仓已切回 registry 依赖，不再走 path）。
+
 ## [0.23.0-alpha] - 2026-10-28
 
 ### 新增

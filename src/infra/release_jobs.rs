@@ -433,6 +433,11 @@ async fn execute_batch(
     }
 
     // 全部校验通过后再逐个镜像落库。
+    // 兼容性在**落库前统一预检**：否则一台不兼容时，前面的平台已经被镜像/记库，
+    // 留下一批「半套」的发布记录。
+    for item in &prepared {
+        ensure_release_compatible(&payload.component, &item.version, &item.bytes)?;
+    }
     ctx.report(|progress| progress.message = Some("镜像 / 落库中".to_string()))
         .await;
     for item in prepared {
@@ -459,6 +464,41 @@ async fn execute_batch(
             )
         })
 }
+/// 兼容性检查：包声明的上游（当前节点）不满足 → 409，阻止镜像/落库。
+fn ensure_release_compatible(
+    component: &str,
+    version: &str,
+    bytes: &[u8],
+) -> Result<Option<wist_release::compat::CompatManifest>, ReleaseFailure> {
+    let manifest = wist_release::compat::read_manifest_from_tar(bytes);
+    let current = std::collections::BTreeMap::from([(
+        "wist-center".to_string(),
+        env!("CARGO_PKG_VERSION").to_string(),
+    )]);
+    let report = wist_release::compat::check(
+        manifest.as_ref(),
+        component,
+        version,
+        &current,
+        &chrono::Utc::now().to_rfc3339(),
+    );
+    if report.is_blocking() {
+        return Err(ReleaseFailure::new(
+            409,
+            crate::api::codes::RELEASE_INCOMPATIBLE,
+            report.summary(),
+        ));
+    }
+    if report.status != wist_release::compat::CompatStatus::Ok {
+        log::warn!(
+            "event=ReleaseCompatibilityWarn component={component} version={version} status={} detail={}",
+            report.status.as_str(),
+            report.summary()
+        );
+    }
+    Ok(manifest)
+}
+
 /// 把一个**已验证**的制品镜像并落库（单条与批量共用）：
 /// - 同一 `(component, version, sha)` 已存在 → 幂等（不重复下副本；旧记录缺平台则补齐）；
 /// - 否则镜像到制品存储并写一条 `published` 记录。
@@ -480,6 +520,9 @@ async fn record_verified_release(
             detail,
         ));
     }
+    // 兼容性：包内 `compat.json` 的 `requires`（上游，如 `wist-center`）不满足当前节点时，
+    // 在镜像/落库**之前**拒，并明确提示“先升级当前节点”。没有声明 → 只告警。
+    let compat = ensure_release_compatible(component, version, &bytes)?;
     // 同一 (component, version) 已镜像过**同一份内容** → 幂等返回，不重复下副本。
     if let Ok(existing) = store.list_releases(component).await
         && let Some(record) = existing.iter().find(|record| {
@@ -510,12 +553,13 @@ async fn record_verified_release(
             )
         })?;
     store
-        .publish_release(
+        .publish_release_with_compat(
             component,
             version,
             &mirrored_url,
             Some(package_sha256),
             platform,
+            compat,
         )
         .await
         .map_err(|err| {
@@ -632,6 +676,85 @@ mod tests {
             artifact_url: "https://example/pkg.tar.gz".to_string(),
             expected_sha256: "0".repeat(64),
         }
+    }
+
+    fn tar_gz_with_compat(compat: &str) -> Vec<u8> {
+        use std::io::Write;
+        let mut builder = tar::Builder::new(Vec::new());
+        let payload = compat.as_bytes();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(payload.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "pkg-1.0.0/compat.json", payload)
+            .expect("append");
+        let tar = builder.into_inner().expect("tar");
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&tar).expect("gzip");
+        encoder.finish().expect("gzip finish")
+    }
+
+    #[test]
+    fn release_rejects_a_package_that_requires_a_newer_center() {
+        let bytes = tar_gz_with_compat(r#"{"requires":{"wist-center":">=99.0.0"}}"#);
+        let err = ensure_release_compatible("wist-gateway-stack", "0.9.4", &bytes)
+            .expect_err("must block");
+        assert_eq!(err.status, 409);
+        assert_eq!(err.code, crate::api::codes::RELEASE_INCOMPATIBLE);
+        assert!(err.detail.contains("请先升级"), "{}", err.detail);
+    }
+
+    #[test]
+    fn release_allows_a_package_without_a_compat_manifest() {
+        // 空字节 = 没有可读的 tar.gz；兼容性按 `unknown` 处理，不阻止发布。
+        assert!(ensure_release_compatible("wist-gateway-stack", "0.9.4", &[]).is_ok());
+    }
+
+    #[test]
+    fn release_allows_a_compatible_package() {
+        let bytes = tar_gz_with_compat(r#"{"requires":{"wist-center":">=0.0.1"}}"#);
+        assert!(ensure_release_compatible("wist-gateway-stack", "0.9.4", &bytes).is_ok());
+    }
+
+    #[test]
+    fn release_does_not_block_a_compat_mode_package_that_coexists() {
+        let bytes = tar_gz_with_compat(
+            r#"{
+                "requires":{"wist-center":">=99.0.0"},
+                "coexists_with":{"wist-center":">=0.0.1"},
+                "compat_mode":true
+            }"#,
+        );
+        assert!(ensure_release_compatible("wist-gateway-stack", "0.9.4", &bytes).is_ok());
+    }
+
+    #[test]
+    fn release_does_not_block_on_a_downstream_supports_miss() {
+        let bytes = tar_gz_with_compat(r#"{"supports":{"wist-gateway-stack":">=99.0.0"}}"#);
+        assert!(ensure_release_compatible("wist-agentd", "0.1.20", &bytes).is_ok());
+    }
+
+    #[test]
+    fn release_blocks_when_one_of_many_requirements_fails() {
+        let bytes = tar_gz_with_compat(
+            r#"{"requires":{"wist-center":">=0.0.1","wist-gwlinkd":">=99.0.0"}}"#,
+        );
+        // center 当前版本满足第一条；gwlinkd 不在 center 的已知版本里 → 只是 warn，不阻断。
+        assert!(ensure_release_compatible("wist-gateway-stack", "0.9.4", &bytes).is_ok());
+
+        let bytes = tar_gz_with_compat(
+            r#"{"requires":{"wist-center":">=99.0.0","wist-gwlinkd":">=0.1.0"}}"#,
+        );
+        let err = ensure_release_compatible("wist-gateway-stack", "0.9.4", &bytes)
+            .expect_err("must block");
+        assert_eq!(err.code, crate::api::codes::RELEASE_INCOMPATIBLE);
+    }
+
+    #[test]
+    fn release_treats_an_unparsable_manifest_as_unknown() {
+        let bytes = tar_gz_with_compat(r#"{not json"#);
+        assert!(ensure_release_compatible("wist-gateway-stack", "0.9.4", &bytes).is_ok());
     }
 
     #[test]

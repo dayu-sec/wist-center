@@ -351,6 +351,9 @@ pub struct ReleaseRecord {
     /// 托管状态：`published`（已录入）/ `expired`（已过期）。
     pub status: String,
     pub published_at: DateTime,
+    /// 包内 `compat.json`（升级兼容声明）；老记录/无声明为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compat: Option<wist_release::compat::CompatManifest>,
 }
 
 /// 管理面「安装包」视图：共享的 `ReleasePackage`（version + artifacts）外挂目录字段。
@@ -364,6 +367,12 @@ pub struct ReleasePackageRecord {
     pub status: String,
     /// 首次录入时间（组内最早）。
     pub published_at: DateTime,
+    /// 包内 `compat.json`（同版本多平台行共用一份；老记录为 `None`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compat: Option<wist_release::compat::CompatManifest>,
+    /// 按**当前中心版本**算出的兼容性报告（列表读投影；不落库）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<wist_release::compat::CompatReport>,
     #[serde(flatten)]
     pub package: ReleasePackage,
 }
@@ -391,12 +400,17 @@ pub fn group_release_packages(
             if record.published_at.to_chrono() < existing.published_at.to_chrono() {
                 existing.published_at = record.published_at;
             }
+            if existing.compat.is_none() && record.compat.is_some() {
+                existing.compat = record.compat.clone();
+            }
             existing.package.artifacts.push(artifact);
         } else {
             packages.push(ReleasePackageRecord {
                 component: component.to_string(),
                 status: record.status,
                 published_at: record.published_at,
+                compat: record.compat,
+                compatibility: None,
                 package: ReleasePackage::new(record.version, vec![artifact]),
             });
         }
@@ -727,6 +741,27 @@ pub trait Store: Send + Sync + std::fmt::Debug {
         artifact_url: &str,
         package_sha256: Option<&str>,
         platform: Option<&str>,
+    ) -> Result<ReleaseRecord, StoreError> {
+        self.publish_release_with_compat(
+            component,
+            version,
+            artifact_url,
+            package_sha256,
+            platform,
+            None,
+        )
+        .await
+    }
+
+    /// 同 [`Store::publish_release`]，但带上包内 `compat.json`（发布时已解析）。
+    async fn publish_release_with_compat(
+        &self,
+        component: &str,
+        version: &str,
+        artifact_url: &str,
+        package_sha256: Option<&str>,
+        platform: Option<&str>,
+        compat: Option<wist_release::compat::CompatManifest>,
     ) -> Result<ReleaseRecord, StoreError>;
     /// 查询某组件的历史发布记录（新→旧）。
     async fn list_releases(&self, component: &str) -> Result<Vec<ReleaseRecord>, StoreError>;
@@ -1246,6 +1281,26 @@ impl FileStore {
         package_sha256: Option<&str>,
         platform: Option<&str>,
     ) -> Result<ReleaseRecord, StoreError> {
+        self.publish_release_with_compat(
+            component,
+            version,
+            artifact_url,
+            package_sha256,
+            platform,
+            None,
+        )
+    }
+
+    /// 同 [`Self::publish_release`]，但带上包内 `compat.json`。
+    pub fn publish_release_with_compat(
+        &self,
+        component: &str,
+        version: &str,
+        artifact_url: &str,
+        package_sha256: Option<&str>,
+        platform: Option<&str>,
+        compat: Option<wist_release::compat::CompatManifest>,
+    ) -> Result<ReleaseRecord, StoreError> {
         let record = ReleaseRecord {
             version: version.to_string(),
             artifact_url: artifact_url.to_string(),
@@ -1253,6 +1308,7 @@ impl FileStore {
             platform: platform.map(str::to_string),
             status: "published".to_string(),
             published_at: DateTime::now(),
+            compat,
         };
         self.update(|snapshot| {
             snapshot
@@ -2003,21 +2059,23 @@ impl Store for FileStore {
         FileStore::list_lifecycle_events(self, gateway_id)
     }
 
-    async fn publish_release(
+    async fn publish_release_with_compat(
         &self,
         component: &str,
         version: &str,
         artifact_url: &str,
         package_sha256: Option<&str>,
         platform: Option<&str>,
+        compat: Option<wist_release::compat::CompatManifest>,
     ) -> Result<ReleaseRecord, StoreError> {
-        FileStore::publish_release(
+        FileStore::publish_release_with_compat(
             self,
             component,
             version,
             artifact_url,
             package_sha256,
             platform,
+            compat,
         )
     }
 
