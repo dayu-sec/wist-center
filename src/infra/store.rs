@@ -1493,6 +1493,9 @@ impl FileStore {
     /// 原子认领某队列最早的一条 `queued` 任务（整个 `update` 在同一把锁里）。
     ///
     /// 顺序：`priority` 大者优先，同优先级按 `created_at` 从早到晚。
+    /// `created_at` 同值时按**入队顺序**（`jobs` 是「新→旧」，索引大者更早入队）——
+    /// 时钟粒度粗时两条任务可能拿到同一个时间戳，此时若没有稳定的 tie-break，
+    /// 取哪条取决于存储迭代顺序，FIFO 就不成立了。
     pub fn claim_next_job(&self, queue: &str) -> Result<Option<JobRecord>, StoreError> {
         self.update(|snapshot| {
             let index = snapshot
@@ -1500,12 +1503,16 @@ impl FileStore {
                 .iter()
                 .enumerate()
                 .filter(|(_, job)| job.queue == queue && job.state == super::jobs::JOB_QUEUED)
-                .min_by(|(_, left), (_, right)| {
-                    right.priority.cmp(&left.priority).then_with(|| {
-                        left.created_at
-                            .to_chrono()
-                            .cmp(&right.created_at.to_chrono())
-                    })
+                .min_by(|(left_index, left), (right_index, right)| {
+                    right
+                        .priority
+                        .cmp(&left.priority)
+                        .then_with(|| {
+                            left.created_at
+                                .to_chrono()
+                                .cmp(&right.created_at.to_chrono())
+                        })
+                        .then_with(|| right_index.cmp(left_index))
                 })
                 .map(|(index, _)| index)?;
             let job = &mut snapshot.jobs[index];
@@ -3259,6 +3266,29 @@ mod tests {
         store.save_job(&done).expect("save");
         let loaded = store.get_job("job-first").expect("get").expect("job");
         assert_eq!(loaded.state, super::super::jobs::JOB_SUCCEEDED);
+        let _ = fs::remove_file(path);
+    }
+
+    /// 同优先级的 `created_at` 撞同一时刻（时钟粒度粗时真实会发生）时，
+    /// 仍必须按入队顺序 FIFO：`jobs` 是「新→旧」，不能退化成 LIFO。
+    #[test]
+    fn jobs_claim_ties_are_fifo_by_insertion_order() {
+        let path = test_store_path();
+        let store = FileStore::new(&path);
+        let payload = serde_json::json!({ "component": "wist-agentd" });
+
+        let mut first = JobRecord::queued("tie", "tie", payload.clone(), 0);
+        first.job_id = "job-older".to_string();
+        let mut second = JobRecord::queued("tie", "tie", payload, 0);
+        second.job_id = "job-newer".to_string();
+        // 强行同一个时间戳，复现时钟分辨率不足的情形。
+        second.created_at = first.created_at.clone();
+
+        store.create_job(&first).expect("create first");
+        store.create_job(&second).expect("create second");
+
+        let claimed = store.claim_next_job("tie").expect("claim").expect("job");
+        assert_eq!(claimed.job_id, "job-older", "同时间戳时按入队顺序");
         let _ = fs::remove_file(path);
     }
 
