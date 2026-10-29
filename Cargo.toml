@@ -25,6 +25,10 @@ wist-control = "0.18"
 wist-error =  "0.2"
 # 错误投影 wire 类型（`ProtocolError` / `ProtocolErrorEnvelope`）：与 gateway / gwlinkd / agentd 共用同一份。
 wist-shared = "0.2"
+# 管理面鉴权原语（Bearer token / sha256 / 常数时间比较 / 失败限流桶）。
+# 已发布到 crates.io（CI 发版）。本地联调可临时切 path：
+#wist-auth = { path = "../wist-auth" }
+wist-auth = "0.1.1"
 
 # 网关客户端证书（mTLS）签发：中心当 CA-G，按网关 CSR 签「每网关一张」客户端证书。
 # 与网关侧 infra/agent_ca.rs 同口径（rcgen 签、x509-parser 读 URI SAN）。

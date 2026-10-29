@@ -62,19 +62,7 @@ pub fn verify_upgrade_script_token(
     signature: &str,
 ) -> bool {
     let expected = derive_upgrade_script_token(secret, gateway_id, component, version, expires);
-    constant_time_eq(expected.as_bytes(), signature.as_bytes())
-}
-
-/// 常量时间比较（长度不等直接 false；相等长度下不提前返回）。
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (left, right) in left.iter().zip(right) {
-        diff |= left ^ right;
-    }
-    diff == 0
+    wist_auth::constant_time_eq(expected.as_bytes(), signature.as_bytes())
 }
 
 fn upgrade_script_payload(

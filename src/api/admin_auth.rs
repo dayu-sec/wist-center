@@ -1,13 +1,13 @@
 // 管理面鉴权：Admin Token（Bearer，sha256 常数时间比较）+ 鉴权失败限流。
-// 镜像 wist-gateway 的 require_admin_bearer；绑定声明 actor_identity from jwt.sub，
-// 代码库统一采用 admin bearer token 模式（jwt 后续对齐）。
+//
+// token 原语（Bearer 提取 / sha256 / 常数时间比较）与限流桶都来自共享 crate `wist-auth`，
+// 与 wist-gateway / wist-ingest-ctrl 是同一份实现；这里只保留本服务的"允许空 token（= 不鉴权）"
+// 策略与错误码。
 
 use axum::{
-    http::{HeaderMap, header},
+    http::HeaderMap,
     response::{IntoResponse, Response},
 };
-
-use crate::infra::sha256_hex;
 
 use super::{ApiState, rate_limit};
 
@@ -28,7 +28,7 @@ pub(super) fn require_admin_bearer(
         // 便于前端/联调直接查看真实数据；生产必须配置 token。
         return Ok(());
     };
-    let Some(token) = bearer_token(headers) else {
+    let Some(token) = wist_auth::bearer_token(headers) else {
         // 缺 token 属未认证请求，不计入暴力尝试（否则无 token 的轮询会锁死客户端）。
         log::warn!(
             "event=AdminAuthMissingBearer scope={} client={client_key}",
@@ -41,7 +41,7 @@ pub(super) fn require_admin_bearer(
         .with_no_store()
         .into_response());
     };
-    if !constant_time_eq(sha256_hex(token).as_bytes(), expected_hash.as_bytes()) {
+    if !wist_auth::token_matches(token, expected_hash) {
         // 错 token：计入暴力尝试（`record_auth_failure` 会记 `event=AuthFailure` / `event=AuthBlocked`）。
         rate_limit::record_auth_failure(state, client_key, ADMIN_AUTH_SCOPE);
         return Err(super::error::ApiError::unauthorized(
@@ -53,25 +53,4 @@ pub(super) fn require_admin_bearer(
     }
     rate_limit::clear_auth_failures(state, client_key, ADMIN_AUTH_SCOPE);
     Ok(())
-}
-
-fn bearer_token(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(header::AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    let mut diff = left.len() ^ right.len();
-    let max_len = left.len().max(right.len());
-    for index in 0..max_len {
-        let left_byte = left.get(index).copied().unwrap_or(0);
-        let right_byte = right.get(index).copied().unwrap_or(0);
-        diff |= (left_byte ^ right_byte) as usize;
-    }
-    diff == 0
 }

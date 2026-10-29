@@ -4,9 +4,12 @@
 use axum::{
     Json,
     extract::{Extension, Path, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+
+#[cfg(test)]
+use axum::http::header;
 
 use wist_control::{
     ACTION_PUSH_AGENT_PACKAGE, ACTION_PUSH_KNOWLEDGE_PACKAGE, AgentStatusAcceptedReturned,
@@ -21,8 +24,11 @@ use wist_control::{
 use crate::infra::{
     EnrollmentTokenIssue, GatewayStatusUpdate, ReleaseRecord, StoreReason, StoredAgent,
     StoredGateway, StoredGatewayCredentialStatus, VerifiedGatewayIdentity, derive_regist_token,
-    new_secret_token, normalize_platform, platform_family, sha256_hex,
+    new_secret_token, normalize_platform, platform_family,
 };
+
+#[cfg(test)]
+use crate::infra::sha256_hex;
 
 use super::{
     ApiState, PeerConnectInfo, build_control_center_trust_bundle, control_center_tls_required,
@@ -766,7 +772,7 @@ async fn provision_gateway_initial_config(
     gateway: &StoredGateway,
     client_key: &str,
 ) -> Response {
-    let Some(link_token) = bearer_token(headers) else {
+    let Some(link_token) = wist_auth::bearer_token(headers) else {
         return super::error::ApiError::unauthorized(
             super::codes::MISSING_BEARER_CREDENTIAL,
             "missing bearer credential",
@@ -774,7 +780,7 @@ async fn provision_gateway_initial_config(
         .with_no_store()
         .into_response();
     };
-    if sha256_hex(link_token) != gateway.link_token_hash {
+    if !wist_auth::token_matches(link_token, &gateway.link_token_hash) {
         rate_limit::record_auth_failure(state, client_key, GATEWAY_AUTH_SCOPE);
         return super::error::ApiError::unauthorized(
             super::codes::INVALID_LINK_TOKEN,
@@ -1162,7 +1168,7 @@ pub(super) async fn authorize_gateway_certificate(
         }
     };
     // 登记在册的凭据指纹必须与出示证书一致：轮换 / 吊销后旧证书立即失效。
-    if !constant_time_eq(
+    if !wist_auth::constant_time_eq(
         gateway.credential_token_hash.as_bytes(),
         identity.fingerprint_sha256.as_bytes(),
     ) {
@@ -1188,17 +1194,6 @@ fn unauthorized_code(code: &'static str) -> Response {
         .into_response()
 }
 
-/// 一次性 link 的 Bearer 解析（link-upstream 置备路径仍用接入券，非长期身份）。
-fn bearer_token(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(header::AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-}
-
 fn credential_is_expired(expires_at: &str) -> bool {
     let Ok(expires_at) = chrono::DateTime::parse_from_rfc3339(expires_at) else {
         return true;
@@ -1211,17 +1206,6 @@ fn credential_is_expired(expires_at: &str) -> bool {
 /// `GatewayCa` 以 `to_rfc3339` 产出（必然可解析）；万一解析失败回落到「现在」，不 panic。
 fn ca_time(value: &str) -> DateTime {
     DateTime::from_rfc3339(value).unwrap_or_else(DateTime::now)
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    let mut diff = left.len() ^ right.len();
-    let max_len = left.len().max(right.len());
-    for index in 0..max_len {
-        let left_byte = left.get(index).copied().unwrap_or(0);
-        let right_byte = right.get(index).copied().unwrap_or(0);
-        diff |= (left_byte ^ right_byte) as usize;
-    }
-    diff == 0
 }
 
 /// 校验网关通讯凭据（VerifyGatewayCredentialFlow）：以 mTLS 客户端证书鉴权，

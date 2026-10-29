@@ -4195,8 +4195,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "wist-auth"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2115b61b4c87f042e6af7780362e9e8ebc9900214d4ebf0b775c0c06f4fc754c"
+dependencies = [
+ "http 1.5.0",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "wist-center"
-version = "0.24.0"
+version = "0.24.1"
 dependencies = [
  "async-trait",
  "aws-sdk-s3",
@@ -4226,6 +4236,7 @@ dependencies = [
  "tokio-rustls 0.26.6",
  "toml",
  "tower",
+ "wist-auth",
  "wist-config",
  "wist-control",
  "wist-error",
