@@ -55,7 +55,9 @@ jobs:
         run: |
           mkdir -p artifacts
           cp "target/${{ matrix.target }}/release/wist-center" artifacts/wist-center
-          tar -czf "wist-center-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" -C artifacts wist-center
+          # 升级兼容声明随包走（中心/网关入库时读它：缺了只告警，有它才能在派发前拦住不兼容组合）。
+          cp compat.json artifacts/compat.json
+          tar -czf "wist-center-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" -C artifacts wist-center compat.json
 
       - uses: actions/upload-artifact@v7
         with:
@@ -88,7 +90,8 @@ jobs:
         run: |
           mkdir -p artifacts
           cp "target/aarch64-apple-darwin/release/wist-center" artifacts/wist-center
-          tar -czf "wist-center-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz" -C artifacts wist-center
+          cp compat.json artifacts/compat.json
+          tar -czf "wist-center-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz" -C artifacts wist-center compat.json
 
       - uses: actions/upload-artifact@v7
         with:
