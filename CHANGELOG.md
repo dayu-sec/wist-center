@@ -5,6 +5,30 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.25.0-alpha] - 2026-10-30
+
+### 变更（网关全量安装：先 clone 部署工程，再装栈）
+
+- **全新安装不再现生成工程**：`/api/v1/gateway/install-all` 生成的脚本改为 `git clone` 一个
+  **部署工程模板仓库**（默认 `https://wgc-git.beta.jingang.cloud/gateway-tx.git`）。工程里自带
+  `ops-prj.yml` 与 `values/wist-gateway-stack/sys_value.yml`（现场值模板），省掉「新工程 + 手工补值」。
+  重跑时：已是 git 仓库则拉取更新（失败不阻断，沿用现有内容），目录存在但不是仓库则明确报错。
+- **仓库地址可配**：新增 `[artifacts] gateway_project_repo`（env
+  `WARP_INSIGHT_CENTER_GATEWAY_PROJECT_REPO`）。部署栈里该键由 `sys_value.yml` 的
+  `GATEWAY_PRJ_TPL_REPO` 渲染，换仓库不必换二进制；留空回落内置默认。
+- **网关对外域名**：仍写进 `values/<系统名>/sys_value.yml` 的 `WEB_DOMAIN`（站点证书 SAN +
+  `public_base_url` 的 host），文件路径改为绝对路径。
+- **安装前置新增 `git`**：缺失时明确提示先跑环境准备脚本；`prepare-script` 的补齐清单也加上 `git`。
+
+### 修复
+
+- **「安装材料不全」的 503 提示点不到点子上**：点名缺的是哪个组件，并区分「没录过」
+  （`galaxy-flow (no release recorded)`）与「被标过期」
+  （`wist-gateway-stack (newest v0.7.0-alpha is expired — restore it to `published` or publish a new version)`）；
+  不再笼统地让人去 publish 三个组件（现场看不出到底差谁）。
+
+> 升级注意：上述流程只影响「新装 / 重跑安装脚本」，已部署网关不受影响。
+
 ## [0.24.2-alpha] - 2026-10-29
 
 ### 修复
