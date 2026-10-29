@@ -64,6 +64,7 @@ const ENV_DATABASE_URL: &str = "WARP_INSIGHT_CENTER_DATABASE_URL";
 const ENV_VICTORIAMETRICS_URL: &str = "WARP_INSIGHT_CENTER_VICTORIAMETRICS_URL";
 const ENV_PUBLIC_URL: &str = "WARP_INSIGHT_CENTER_PUBLIC_URL";
 const ENV_GATEWAY_IMAGE: &str = "WARP_INSIGHT_CENTER_GATEWAY_IMAGE";
+const ENV_GATEWAY_PROJECT_REPO: &str = "WARP_INSIGHT_CENTER_GATEWAY_PROJECT_REPO";
 const ENV_ARTIFACT_DIR: &str = "WARP_INSIGHT_CENTER_ARTIFACT_DIR";
 const ENV_OBJECT_STORAGE_ENDPOINT: &str = "WARP_INSIGHT_CENTER_OBJECT_STORAGE_ENDPOINT";
 const ENV_OBJECT_STORAGE_BUCKET: &str = "WARP_INSIGHT_CENTER_OBJECT_STORAGE_BUCKET";
@@ -80,6 +81,9 @@ const ENV_LINK_TTL_SECONDS: &str = "WARP_INSIGHT_CENTER_LINK_TTL_SECONDS";
 /// 默认对外地址使用域名（初始化 URL / 控制中心端点需要可被 Gateway 从外网访问）。
 const DEFAULT_PUBLIC_URL: &str = "https://center.warpinsight.example";
 const DEFAULT_GATEWAY_IMAGE: &str = "wist-gateway:latest";
+/// 网关部署工程（ops-prj）模板仓库：`install-all` 脚本 clone 它来落工程（不再用 `gops prj new`）。
+/// 部署栈里由 vars 的 `GATEWAY_PRJ_TPL_REPO` 渲染进 `[artifacts] gateway_project_repo`。
+const DEFAULT_GATEWAY_PROJECT_REPO: &str = "https://wgc-git.beta.jingang.cloud/gateway-tx.git";
 const DEFAULT_ARTIFACT_DIR: &str = "artifacts";
 /// 网关 ↔ 中心 wire 协议版本（写入网关 config.toml 的 [protocol] version）。
 const DEFAULT_PROTOCOL_VERSION: &str = "1.0";
@@ -129,6 +133,11 @@ pub struct CenterConfig {
     pub public_url: String,
     /// gateway 镜像名（docker 安装命令 / 云镜像地址），默认 `wist-gateway:latest`。
     pub gateway_image: String,
+    /// gateway 部署工程（ops-prj）模板仓库：`install-all` 脚本 clone 它来落工程
+    /// （替代早先的 `gops prj new` 现生成）。工程自带 `ops-prj.yml` 与 `values/<系统名>/sys_value.yml`。
+    /// 来源：`[artifacts] gateway_project_repo` 或 env `WARP_INSIGHT_CENTER_GATEWAY_PROJECT_REPO`；
+    /// 部署栈里该键由 vars 的 `GATEWAY_PRJ_TPL_REPO` 渲染（现场可在 `sys_value.yml` 覆盖）。
+    pub gateway_project_repo: String,
     /// 本地制品目录（版本发布镜像制品落盘），默认 `artifacts/`。
     pub artifact_dir: PathBuf,
     /// 云对象存储（可选，S3 兼容 / MinIO）；配置了 endpoint 则发布制品存对象存储，否则本地。
@@ -353,6 +362,7 @@ struct RawSecurityConfig {
 struct RawArtifactsConfig {
     dir: Option<String>,
     gateway_image: Option<String>,
+    gateway_project_repo: Option<String>,
     object_storage_endpoint: Option<String>,
     object_storage_bucket: Option<String>,
     object_storage_access_key: Option<String>,
@@ -580,6 +590,8 @@ impl CenterConfig {
             gateway_image: artifacts
                 .gateway_image
                 .unwrap_or_else(|| DEFAULT_GATEWAY_IMAGE.to_string()),
+            gateway_project_repo: normalize_optional(artifacts.gateway_project_repo)
+                .unwrap_or_else(|| DEFAULT_GATEWAY_PROJECT_REPO.to_string()),
             artifact_dir: absolutize_path(
                 config_dir,
                 Path::new(
@@ -711,6 +723,7 @@ fn expand_raw_env(raw: &mut RawCenterConfig, env: &EnvDict) -> Result<(), Config
         &mut raw.security.ca_cert_path,
         &mut raw.artifacts.dir,
         &mut raw.artifacts.gateway_image,
+        &mut raw.artifacts.gateway_project_repo,
         &mut raw.artifacts.object_storage_endpoint,
         &mut raw.artifacts.object_storage_bucket,
         &mut raw.artifacts.object_storage_access_key,
@@ -740,6 +753,10 @@ fn apply_env_overrides(raw: &mut RawCenterConfig) {
     override_scalar(&mut raw.server.public_url, ENV_PUBLIC_URL);
     override_scalar(&mut raw.server.protocol_version, ENV_PROTOCOL_VERSION);
     override_scalar(&mut raw.artifacts.gateway_image, ENV_GATEWAY_IMAGE);
+    override_scalar(
+        &mut raw.artifacts.gateway_project_repo,
+        ENV_GATEWAY_PROJECT_REPO,
+    );
     override_scalar(&mut raw.security.hmac_secret, ENV_HMAC_SECRET);
     override_scalar(&mut raw.security.ca_cert_path, ENV_CA_CERT_PATH);
     override_scalar(&mut raw.server.server_cert_path, ENV_SERVER_CERT_PATH);
@@ -1808,6 +1825,7 @@ listen_addr = ""
         assert_eq!(config.public_url, DEFAULT_PUBLIC_URL);
         assert_eq!(config.protocol_version, DEFAULT_PROTOCOL_VERSION);
         assert_eq!(config.gateway_image, DEFAULT_GATEWAY_IMAGE);
+        assert_eq!(config.gateway_project_repo, DEFAULT_GATEWAY_PROJECT_REPO);
         assert_eq!(
             config.credential_ttl_seconds,
             DEFAULT_CREDENTIAL_TTL_SECONDS

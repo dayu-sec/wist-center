@@ -1390,6 +1390,8 @@ mod tests {
                 victoriametrics_url: None,
                 public_url: "http://127.0.0.1:3100".to_string(),
                 gateway_image: "wist-gateway:latest".to_string(),
+                gateway_project_repo: "https://wgc-git.beta.jingang.cloud/gateway-tx.git"
+                    .to_string(),
                 artifact_dir: std::env::temp_dir().join("wic-artifacts"),
                 object_storage: None,
                 package_sources: Vec::new(),
@@ -1457,6 +1459,8 @@ mod tests {
                 victoriametrics_url: None,
                 public_url: "http://127.0.0.1:3100".to_string(),
                 gateway_image: "wist-gateway:latest".to_string(),
+                gateway_project_repo: "https://wgc-git.beta.jingang.cloud/gateway-tx.git"
+                    .to_string(),
                 artifact_dir: std::env::temp_dir().join("wic-artifacts"),
                 object_storage: None,
                 package_sources: Vec::new(),
@@ -1511,6 +1515,8 @@ mod tests {
                 victoriametrics_url: None,
                 public_url: "http://127.0.0.1:3100".to_string(),
                 gateway_image: "wist-gateway:latest".to_string(),
+                gateway_project_repo: "https://wgc-git.beta.jingang.cloud/gateway-tx.git"
+                    .to_string(),
                 artifact_dir: std::env::temp_dir().join("wic-artifacts"),
                 object_storage: None,
                 package_sources: Vec::new(),
@@ -3330,6 +3336,8 @@ mod tests {
                 victoriametrics_url: None,
                 public_url: "http://127.0.0.1:3100".to_string(),
                 gateway_image: "wist-gateway:latest".to_string(),
+                gateway_project_repo: "https://wgc-git.beta.jingang.cloud/gateway-tx.git"
+                    .to_string(),
                 artifact_dir: std::env::temp_dir().join("wic-artifacts"),
                 object_storage: None,
                 package_sources: Vec::new(),

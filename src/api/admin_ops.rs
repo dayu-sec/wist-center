@@ -2871,6 +2871,8 @@ mod tests {
                 victoriametrics_url: None,
                 public_url: "http://127.0.0.1:3100".to_string(),
                 gateway_image: "wist-gateway:latest".to_string(),
+                gateway_project_repo: "https://wgc-git.beta.jingang.cloud/gateway-tx.git"
+                    .to_string(),
                 artifact_dir: std::env::temp_dir().join("wic-artifacts"),
                 object_storage: None,
                 package_sources: Vec::new(),
@@ -5448,6 +5450,8 @@ mod tests {
                 victoriametrics_url: None,
                 public_url: "http://127.0.0.1:3100".to_string(),
                 gateway_image: "wist-gateway:latest".to_string(),
+                gateway_project_repo: "https://wgc-git.beta.jingang.cloud/gateway-tx.git"
+                    .to_string(),
                 artifact_dir: std::env::temp_dir().join("wic-artifacts"),
                 object_storage: None,
                 package_sources: Vec::new(),
@@ -5667,6 +5671,8 @@ mod tests {
                 victoriametrics_url: None,
                 public_url: "http://127.0.0.1:3100".to_string(),
                 gateway_image: "wist-gateway:latest".to_string(),
+                // 刻意不用产品默认值：install-all 的断言据此证明脚本里的仓库来自配置（而非硬编码）。
+                gateway_project_repo: "https://git.example.test/gateway-tx.git".to_string(),
                 artifact_dir: std::env::temp_dir().join("wic-artifacts"),
                 object_storage: None,
                 package_sources: Vec::new(),
@@ -5991,6 +5997,8 @@ mod tests {
                 victoriametrics_url: None,
                 public_url: "http://127.0.0.1:3100".to_string(),
                 gateway_image: "wist-gateway:latest".to_string(),
+                gateway_project_repo: "https://wgc-git.beta.jingang.cloud/gateway-tx.git"
+                    .to_string(),
                 artifact_dir: std::env::temp_dir().join("wic-artifacts"),
                 object_storage: None,
                 package_sources: Vec::new(),
@@ -6217,7 +6225,9 @@ mod tests {
         )
         .expect("utf8");
         for needle in [
-            "gops prj new",
+            "git clone",
+            // 仓库地址来自配置 `[artifacts] gateway_project_repo`（部署栈里由 vars 渲染）。
+            "https://git.example.test/gateway-tx.git",
             "gops prj import",
             "gops sys localize",
             "gops run download",
@@ -6263,6 +6273,103 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// 必需组件不齐时的 503 要**点名**：缺哪个组件、是「没录过」还是「被标过期」。
+    /// （旧文案把三个组件一并列出来，现场只能靠翻「包管理」自己找。）
+    #[tokio::test]
+    async fn install_all_names_the_component_that_is_missing_or_expired() {
+        use axum::{body::Body, http::Request};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("wic-install-missing-{nanos}.json"));
+        let state = create_state_with_store(FileStore::new(&path));
+
+        let base = "http://127.0.0.1:3100/api/v1/releases/artifact";
+        state
+            .store
+            .publish_release(
+                "galaxy-ops",
+                "1.2.3",
+                &format!("{base}/galaxy-ops/1.2.3/gops-aarch64-apple-darwin.tar.gz"),
+                Some("deadbeef"),
+                Some("aarch64-apple-darwin"),
+            )
+            .await
+            .expect("publish gops");
+        // galaxy-flow 根本不录 → 文案应写 `no release recorded`；
+        // 栈录了但被标过期 → 文案应写 `expired`（而不是笼统让人去 publish）。
+        state
+            .store
+            .publish_release(
+                "wist-gateway-stack",
+                "0.1.17",
+                &format!("{base}/wist-gateway-stack/0.1.17/wist-gateway-stack-0.1.17.tar.gz"),
+                Some("deadbeef"),
+                None,
+            )
+            .await
+            .expect("publish stack");
+        state
+            .store
+            .set_release_status("wist-gateway-stack", "0.1.17", "expired")
+            .await
+            .expect("expire stack");
+
+        let app = super::super::router_for(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/admin/gateways/instances")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer admin-tok")
+                    .body(Body::from(create_payload("gw-missing")))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let token = rotate_link_token(&app, "gw-missing")
+            .await
+            .install
+            .link_token;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/gateway/install-all?gateway_id=gw-missing&token={token}"
+                    ))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = String::from_utf8(
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes()
+                .to_vec(),
+        )
+        .expect("utf8");
+        assert!(body.contains("galaxy-flow (no release recorded)"), "{body}");
+        assert!(
+            body.contains("wist-gateway-stack (newest 0.1.17 is expired"),
+            "{body}"
+        );
+        // 已就绪的组件不该被点名。
+        assert!(!body.contains("galaxy-ops ("), "{body}");
     }
 
     /// 「只装 gwlinkd」：一次性接入券有效 → 返回只装宿主接入器的 shell 脚本；
