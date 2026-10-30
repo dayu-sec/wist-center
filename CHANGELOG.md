@@ -5,6 +5,20 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.26.1-alpha] - 2026-10-30
+
+### 变更（镜像通道改为**可勾选**：不再与 GitHub 硬绑定）
+
+- `/api/v1/admin/package-sources/latest` 与 `/api/v1/admin/github-release/resolve` 新增可选
+  `use_proxy`（query / body）：
+  - `true` —— 本次走通道；组件 / 仓库没配 `github_proxy` → **400**（文案提示取消勾选）；
+  - `false` —— 直连 `github.com`，即使配了通道；
+  - 不传 —— 按 `[[packages.sources]].github_proxy`（与 0.26.0 行为完全一致）。
+- 明确查 COS 时 `use_proxy` 不参与校验（不再误报「通道未配置」）；地址不像 GitHub Release 时
+  也不在通道这里拦，交给解析器回它自己的错误。
+
+> 兼容：老页面 / 老客户端不传 `use_proxy`，行为不变。修改后再录入 / 解析的发布才体现勾选结果。
+
 ## [0.26.0-alpha] - 2026-10-30
 
 ### 新增（来源级的 GitHub 镜像通道：`[packages.sources].github_proxy`）
