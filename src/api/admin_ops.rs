@@ -1348,7 +1348,14 @@ pub async fn admin_package_source_latest(
                         .into_response();
                     }
                     let url = format!("https://github.com/{repo}/releases/tag/{version}");
-                    match crate::infra::resolve_github_release(&url, token.as_deref()).await {
+                    // 镜像通道来自来源配置（与 COS 同理：解析出来的地址就是录入/下发用的地址）。
+                    match crate::infra::resolve_github_release(
+                        &url,
+                        token.as_deref(),
+                        source.github_proxy.as_deref(),
+                    )
+                    .await
+                    {
                         Ok(resolved) => {
                             return Json(serde_json::json!({
                                 "component": query.component,
@@ -1489,6 +1496,7 @@ pub async fn admin_list_package_sources(
             serde_json::json!({
                 "component": source.component,
                 "github_repo": source.github_repo,
+                "github_proxy": source.github_proxy,
                 "cos_bucket": source.cos_bucket,
                 "cos_prefix": source.cos_prefix,
                 "cos_region": source.cos_region,
@@ -1522,7 +1530,22 @@ pub async fn admin_resolve_github_release(
     let token = std::env::var("WIST_CENTER_GITHUB_TOKEN")
         .ok()
         .or_else(|| std::env::var("GITHUB_TOKEN").ok());
-    match crate::infra::resolve_github_release(release_url, token.as_deref()).await {
+    // 镜像通道：手工粘的地址可能属于某个已配置来源（按 `owner/repo` 对）—— 那就有那个组件的通道。
+    let artifact_proxy = crate::infra::release_repo(release_url).and_then(|repo| {
+        state
+            .config
+            .package_sources
+            .iter()
+            .find(|source| source.github_repo.as_deref() == Some(repo.as_str()))
+            .and_then(|source| source.github_proxy.clone())
+    });
+    match crate::infra::resolve_github_release(
+        release_url,
+        token.as_deref(),
+        artifact_proxy.as_deref(),
+    )
+    .await
+    {
         Ok(resolved) => Json(resolved).into_response(),
         Err(err) => super::error::internal_response(
             StatusCode::BAD_GATEWAY,
@@ -6918,6 +6941,7 @@ mod tests {
             PackageSourceConfig {
                 component: "wist-agentd".into(),
                 github_repo: Some("dayu-sec/wist-agentd".into()),
+                github_proxy: Some("https://githubproxy.cc".into()),
                 cos_bucket: Some("github-1347593047".into()),
                 cos_prefix: Some("wist-agentd".into()),
                 cos_region: Some("ap-hongkong".into()),
@@ -6925,6 +6949,7 @@ mod tests {
             PackageSourceConfig {
                 component: "cos-only".into(),
                 github_repo: None,
+                github_proxy: None,
                 cos_bucket: Some("github-1347593047".into()),
                 cos_prefix: Some("cos-only".into()),
                 cos_region: None,
@@ -6944,8 +6969,11 @@ mod tests {
         assert_eq!(sources[0]["component"], "wist-agentd");
         assert_eq!(sources[0]["github_repo"], "dayu-sec/wist-agentd");
         assert_eq!(sources[0]["cos_region"], "ap-hongkong");
+        // GitHub 镜像通道也是来源的一部分：页面/运维要能看到这个组件走哪个通道。
+        assert_eq!(sources[0]["github_proxy"], "https://githubproxy.cc");
         assert_eq!(sources[1]["component"], "cos-only");
         assert!(sources[1]["github_repo"].is_null());
+        assert!(sources[1]["github_proxy"].is_null());
     }
 
     /// 安装包来源也是管理面：没有 admin bearer 不能读。

@@ -285,6 +285,10 @@ pub struct PackageSourceConfig {
     pub component: String,
     /// `owner/repo`（也接受 `https://github.com/owner/repo`）。
     pub github_repo: Option<String>,
+    /// GitHub 制品**镜像/加速通道**（如 `https://githubproxy.cc`）：配了它，解析 GitHub Release 时
+    /// 每个 `artifact_url` 会写成 `<通道>/<github 原始地址>`（与 COS 一样：**记录进去的就是镜像地址**，
+    /// 安装脚本只管照 URL 下载）。不配 = 直连 github.com。
+    pub github_proxy: Option<String>,
     pub cos_bucket: Option<String>,
     /// 默认取 `github_repo` 的末段（仓库名）。
     pub cos_prefix: Option<String>,
@@ -379,6 +383,7 @@ struct RawPackagesConfig {
 struct RawPackageSource {
     component: String,
     github_repo: Option<String>,
+    github_proxy: Option<String>,
     cos_bucket: Option<String>,
     cos_prefix: Option<String>,
     cos_region: Option<String>,
@@ -973,9 +978,23 @@ fn normalize_package_sources(
                 "packages.sources[] for {component} needs github_repo and/or cos_bucket"
             )));
         }
+        // GitHub 镜像通道：拼出来的是 `<通道>/<https://github.com/...>`，所以必须是 http(s) 基地址、
+        // 不带 query/fragment（否则 `?` 之后的原地址会被吃掉），末尾斜杠去掉以免拼出 `//`。
+        let github_proxy = normalize_optional(item.github_proxy)
+            .map(|proxy| proxy.trim_end_matches('/').to_string());
+        if let Some(proxy) = &github_proxy
+            && (!(proxy.starts_with("https://") || proxy.starts_with("http://"))
+                || proxy.contains(['?', '#'])
+                || proxy.contains(char::is_whitespace))
+        {
+            return Err(config_validation(format!(
+                "packages.sources[].github_proxy must be an http(s) base URL without query/fragment: {proxy}"
+            )));
+        }
         sources.push(PackageSourceConfig {
             component,
             github_repo,
+            github_proxy,
             cos_bucket,
             cos_prefix,
             cos_region,
@@ -1242,6 +1261,7 @@ mod tests {
                 cos_bucket: Some("github-1347593047".into()),
                 cos_prefix: None,
                 cos_region: Some("ap-hongkong".into()),
+                github_proxy: Some("https://githubproxy.cc/".into()),
             },
             RawPackageSource {
                 component: "galaxy-ops".into(),
@@ -1259,7 +1279,40 @@ mod tests {
         // COS 前缀缺省取仓库名。
         assert_eq!(sources[0].cos_prefix.as_deref(), Some("wist-agentd"));
         assert_eq!(sources[0].cos_region.as_deref(), Some("ap-hongkong"));
+        // 通道末尾斜杠归一化（拼接时不会出现 `//`）。
+        assert_eq!(
+            sources[0].github_proxy.as_deref(),
+            Some("https://githubproxy.cc")
+        );
         assert_eq!(sources[1].cos_prefix.as_deref(), Some("galaxy-ops"));
+        // 未配置通道 = 直连（不隐式启用第三方代理）。
+        assert_eq!(sources[1].github_proxy, None);
+    }
+
+    /// 通道会拼成 `<通道>/<https://github.com/...>`：必须是 http(s) 基地址，且不能带 query/fragment。
+    #[test]
+    fn github_proxy_must_be_a_base_url() {
+        fn source(proxy: &str) -> RawPackageSource {
+            RawPackageSource {
+                component: "demo".into(),
+                github_repo: Some("dayu-sec/demo".into()),
+                github_proxy: Some(proxy.into()),
+                ..Default::default()
+            }
+        }
+        assert!(normalize_package_sources(vec![source("https://githubproxy.cc")]).is_ok());
+        assert!(normalize_package_sources(vec![source("http://127.0.0.1:8080")]).is_ok());
+        for bad in [
+            "githubproxy.cc",
+            "https://githubproxy.cc/?url=",
+            "https://githubproxy.cc/#frag",
+            "https://gh example",
+        ] {
+            assert!(
+                normalize_package_sources(vec![source(bad)]).is_err(),
+                "should reject {bad:?}"
+            );
+        }
     }
 
     #[test]
@@ -1309,6 +1362,7 @@ mod tests {
 [[packages.sources]]
 component = "wist-agentd"
 github_repo = "dayu-sec/wist-agentd"
+github_proxy = "https://githubproxy.cc"
 cos_bucket = "github-1347593047"
 "#,
         );
@@ -1317,6 +1371,11 @@ cos_bucket = "github-1347593047"
         assert_eq!(
             config.package_sources[0].cos_prefix.as_deref(),
             Some("wist-agentd")
+        );
+        // 镜像通道是**来源**的一部分（与 COS 位置同级），随来源一起下发到解析流程。
+        assert_eq!(
+            config.package_sources[0].github_proxy.as_deref(),
+            Some("https://githubproxy.cc")
         );
     }
 
@@ -2017,6 +2076,7 @@ max_bytes = 1048576
             RawPackageSource {
                 component: "demo".into(),
                 github_repo: None,
+                github_proxy: None,
                 cos_bucket: Some(bucket.into()),
                 cos_prefix: Some(prefix.into()),
                 cos_region: region.map(str::to_string),

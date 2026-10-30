@@ -71,6 +71,7 @@ object_storage_secret_key = ""
 # [[packages.sources]]
 # component = "wist-agentd"
 # github_repo = "dayu-sec/wist-agentd"     # 也接受 https://github.com/dayu-sec/wist-agentd
+# github_proxy = "https://githubproxy.cc"  # 可选：GitHub 制品镜像/加速通道（<通道>/<原地址>），不配 = 直连
 # cos_bucket = "github-1347593047"
 # cos_prefix = "wist-agentd"               # 缺省取 github_repo 的末段
 # cos_region = "ap-hongkong"              # 可留空：解析器按候选区逐个探测

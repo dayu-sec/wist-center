@@ -71,6 +71,13 @@ fn parse_release_url(url: &str) -> Option<(String, String, String)> {
     Some((owner.to_string(), repo.to_string(), tag.to_string()))
 }
 
+/// release 页面 URL 对应的 `owner/repo`（认不出为 `None`）。
+/// 用于把「手工粘贴的 GitHub 地址」对到 `[packages.sources]` 里的那个组件（进而拿到它的镜像通道）。
+pub fn release_repo(url: &str) -> Option<String> {
+    let (owner, repo, _) = parse_release_url(url)?;
+    Some(format!("{owner}/{repo}"))
+}
+
 /// 一条 release 的摘要（自动探测「最新版本」用，不下载资产）。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct GitHubReleaseSummary {
@@ -144,11 +151,16 @@ pub async fn list_github_releases(
 
 /// 解析 GitHub release：拉 tag 与资产清单。`token` 为空则匿名请求。
 ///
+/// `artifact_proxy` = 该组件配的镜像/加速通道（`[packages.sources].github_proxy`）：
+/// 非空时每个 `artifact_url` 写成 `<通道>/<github 原地址>`（与 COS 同理：**记录进去的就是镜像地址**，
+/// 安装脚本只管照 URL 下载）。`None` → 直连 github.com。
+///
 /// **tag 带不带 `v` 都接受**：录入页的版本号来自包身份（如知识库 `0.3.0`），而 GitHub tag
 /// 通常是 `v0.3.0`。先按原样查；404 时再试另一种写法（带 v / 去 v），避免为前缀差异手工改版本。
 pub async fn resolve_github_release(
     release_url: &str,
     token: Option<&str>,
+    artifact_proxy: Option<&str>,
 ) -> Result<ResolvedRelease, String> {
     let (owner, repo, tag) = parse_release_url(release_url).ok_or_else(|| {
         "not a GitHub release URL (expected https://github.com/<owner>/<repo>/releases/tag/<tag>)"
@@ -162,7 +174,7 @@ pub async fn resolve_github_release(
     let mut last_error = None;
     for candidate in tag_candidates(&tag) {
         match fetch_github_release(&client, &owner, &repo, &candidate, token).await {
-            Ok(release) => return Ok(map_release(release)),
+            Ok(release) => return Ok(map_release(release, artifact_proxy)),
             Err((status, message)) => {
                 last_error = Some(message);
                 // 只有 404 值得换一种 tag 写法；403 / 429 / 5xx 换写法也没用。
@@ -229,8 +241,9 @@ async fn fetch_github_release(
     })
 }
 
-/// `GitHubRelease` → 解析结果：从文件名读平台槽位、从 `digest` 读 sha256。
-fn map_release(release: GitHubRelease) -> ResolvedRelease {
+/// `GitHubRelease` → 解析结果：从文件名读平台槽位、从 `digest` 读 sha256，
+/// 并按需把地址套上镜像通道（`<通道>/<原地址>`）。
+fn map_release(release: GitHubRelease, artifact_proxy: Option<&str>) -> ResolvedRelease {
     let assets = release
         .assets
         .into_iter()
@@ -247,7 +260,7 @@ fn map_release(release: GitHubRelease) -> ResolvedRelease {
                 .filter(|hex| !hex.is_empty());
             ResolvedAsset {
                 name: asset.name,
-                artifact_url: asset.browser_download_url,
+                artifact_url: proxy_artifact_url(&asset.browser_download_url, artifact_proxy),
                 sha256,
                 platform,
             }
@@ -259,9 +272,71 @@ fn map_release(release: GitHubRelease) -> ResolvedRelease {
     }
 }
 
+/// 给 GitHub 制品地址套镜像通道（`<通道>/<原地址>`）；非 github.com 地址或未配通道 → 原样返回。
+///
+/// 只换**地址**、不动内容：摘要（sha256）仍取自 GitHub 资产元数据，安装侧那份校验不受影响。
+fn proxy_artifact_url(url: &str, proxy: Option<&str>) -> String {
+    let Some(proxy) = proxy.map(str::trim).filter(|value| !value.is_empty()) else {
+        return url.to_string();
+    };
+    if !(url.starts_with("https://github.com/") || url.starts_with("http://github.com/")) {
+        return url.to_string();
+    }
+    format!("{}/{url}", proxy.trim_end_matches('/'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxies_github_artifact_urls_only() {
+        let url = "https://github.com/dayu-sec/wist-agentd/releases/download/v0.2.1-alpha/wist-agentd-v0.2.1-alpha-aarch64-apple-darwin.tar.gz";
+        // 未配通道 / 配成空串 → 直连。
+        assert_eq!(proxy_artifact_url(url, None), url);
+        assert_eq!(proxy_artifact_url(url, Some("  ")), url);
+        // 通道末尾斜杠去掉，拼成 `<通道>/<原地址>`。
+        assert_eq!(
+            proxy_artifact_url(url, Some("https://githubproxy.cc/")),
+            format!("https://githubproxy.cc/{url}")
+        );
+        // 非 github 地址（COS / 内网仓库）不动。
+        let cos = "https://github-1347593047.cos.ap-hongkong.myqcloud.com/wist-agentd/v0.2.1-alpha/x.tar.gz";
+        assert_eq!(proxy_artifact_url(cos, Some("https://githubproxy.cc")), cos);
+    }
+
+    /// 手工粘的 GitHub 地址要能对回 `[packages.sources]`（进而拿到该组件的通道）。
+    #[test]
+    fn release_repo_matches_a_configured_source() {
+        assert_eq!(
+            release_repo("https://github.com/dayu-sec/wist-agentd/releases/tag/v0.2.1-alpha")
+                .as_deref(),
+            Some("dayu-sec/wist-agentd")
+        );
+        assert_eq!(release_repo("https://example.com/x"), None);
+    }
+
+    /// 解析结果里的 `artifact_url` 就是录入/下发用的地址：配了通道就是镜像地址。
+    #[test]
+    fn map_release_applies_the_artifact_proxy() {
+        let release = GitHubRelease {
+            tag_name: "v1.0.0".into(),
+            assets: vec![GitHubAsset {
+                name: "demo-v1.0.0-aarch64-apple-darwin.tar.gz".into(),
+                browser_download_url:
+                    "https://github.com/o/r/releases/download/v1.0.0/demo-v1.0.0-aarch64-apple-darwin.tar.gz"
+                        .into(),
+                digest: Some("sha256:ABC".into()),
+            }],
+        };
+        let mapped = map_release(release, Some("https://githubproxy.cc"));
+        assert_eq!(
+            mapped.assets[0].artifact_url,
+            "https://githubproxy.cc/https://github.com/o/r/releases/download/v1.0.0/demo-v1.0.0-aarch64-apple-darwin.tar.gz"
+        );
+        // 摘要仍来自 GitHub 元数据：通道只换地址，不改变校验依据。
+        assert_eq!(mapped.assets[0].sha256.as_deref(), Some("abc"));
+    }
 
     #[test]
     fn tries_tag_with_and_without_v() {
