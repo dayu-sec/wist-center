@@ -5,6 +5,22 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.26.0-alpha] - 2026-10-30
+
+### 新增（来源级的 GitHub 镜像通道：`[packages.sources].github_proxy`）
+
+- **与 COS 同一套逻辑**：通道是**来源**的一部分（每组件一份），在**解析 / 录入时就生效** ——
+  解析 GitHub Release 时把每个 `artifact_url` 写成 `<通道>/<https://github.com/...>`
+  （如 `https://githubproxy.cc/https://github.com/galaxio-labs/galaxy-ops/releases/download/...`）。
+  录入进库、下发给网关的就是这个镜像地址，安装 / 升级脚本不需要知道「通道」这回事。
+- **适用范围**：`/api/v1/admin/package-sources/latest`（自动探测最新）与
+  `/api/v1/admin/github-release/resolve`（手工粘地址；按 `owner/repo` 对到已配置来源取通道）。
+  `/api/v1/admin/package-sources` 响应新增 `github_proxy`，页面/运维能直接看到该组件走哪个通道。
+- **可选、不隐式启用**：不配 = 直连 `github.com`；值必须是 http(s) 基地址（不能带 `?`/`#`），
+  末尾斜杠自动归一化。只换地址、不动内容：`sha256` 仍取自 GitHub 资产元数据，校验依据不变。
+
+> 升级注意：只影响**新解析 / 新录入**的发布；已录入的记录保持录入时写的地址。
+
 ## [0.25.0-alpha] - 2026-10-30
 
 ### 变更（网关全量安装：先 clone 部署工程，再装栈）
