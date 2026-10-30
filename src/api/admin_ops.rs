@@ -1216,6 +1216,10 @@ pub async fn admin_cancel_job(
 #[derive(serde::Deserialize)]
 pub struct ResolveGitHubReleaseRequest {
     pub release_url: String,
+    /// 是否套镜像通道（录入页的勾选框）：`true` 强制走通道（没配 → 400）、`false` 直连；
+    /// 缺省 = 按该地址所属来源的 `github_proxy` 配置。
+    #[serde(default)]
+    pub use_proxy: Option<bool>,
 }
 
 /// 「自动探测最新版本」的查询参数。
@@ -1228,6 +1232,20 @@ pub struct PackageSourceLatestQuery {
     /// 只查某个来源（`github` / `cos`）；缺省先 GitHub、再 COS。
     #[serde(default)]
     pub source: Option<String>,
+    /// 是否套镜像通道（录入页的勾选框）：`true` 强制走通道（没配 → 400）、`false` 直连；
+    /// 缺省 = 按 `[[packages.sources]].github_proxy` 配置（不传时行为不变）。
+    #[serde(default)]
+    pub use_proxy: Option<bool>,
+}
+
+/// 本次请求实际用的 GitHub 镜像通道：勾选框显式取消 → 直连；否则按来源配置（`None` = 直连）。
+/// 「勾了但没配」由调用方判 400 —— 这里只决定这次用不用。
+fn effective_artifact_proxy(configured: Option<&str>, use_proxy: Option<bool>) -> Option<&str> {
+    if use_proxy == Some(false) {
+        None
+    } else {
+        configured
+    }
 }
 
 /// 自动探测某组件的最新版本：GitHub 列 releases；只有 COS 时从已知版本往后探测。
@@ -1289,6 +1307,16 @@ pub async fn admin_package_source_latest(
         )
         .into_response();
     }
+    // 镜像通道：勾了就必须有通道（没配 → 400，而不是默默直连），取消则直连，不传按配置。
+    // 只在这次真的要查 GitHub 时校验 —— 明确查 COS 时勾选框与它无关。
+    if want_github && query.use_proxy == Some(true) && source.github_proxy.is_none() {
+        return super::error::ApiError::bad_request(
+            super::codes::PACKAGE_SOURCE_NOT_CONFIGURED,
+            "github_proxy is not configured for this component; uncheck the channel to download directly",
+        )
+        .into_response();
+    }
+    let artifact_proxy = effective_artifact_proxy(source.github_proxy.as_deref(), query.use_proxy);
 
     let releases = match state.store.list_releases(&query.component).await {
         Ok(releases) => releases,
@@ -1348,11 +1376,10 @@ pub async fn admin_package_source_latest(
                         .into_response();
                     }
                     let url = format!("https://github.com/{repo}/releases/tag/{version}");
-                    // 镜像通道来自来源配置（与 COS 同理：解析出来的地址就是录入/下发用的地址）。
                     match crate::infra::resolve_github_release(
                         &url,
                         token.as_deref(),
-                        source.github_proxy.as_deref(),
+                        artifact_proxy,
                     )
                     .await
                     {
@@ -1530,21 +1557,27 @@ pub async fn admin_resolve_github_release(
     let token = std::env::var("WIST_CENTER_GITHUB_TOKEN")
         .ok()
         .or_else(|| std::env::var("GITHUB_TOKEN").ok());
-    // 镜像通道：手工粘的地址可能属于某个已配置来源（按 `owner/repo` 对）—— 那就有那个组件的通道。
-    let artifact_proxy = crate::infra::release_repo(release_url).and_then(|repo| {
+    // 镜像通道：手工粘的地址可能属于某个已配置来源（按 `owner/repo` 对）。
+    let release_repo = crate::infra::release_repo(release_url);
+    let configured_proxy = release_repo.as_deref().and_then(|repo| {
         state
             .config
             .package_sources
             .iter()
-            .find(|source| source.github_repo.as_deref() == Some(repo.as_str()))
+            .find(|source| source.github_repo.as_deref() == Some(repo))
             .and_then(|source| source.github_proxy.clone())
     });
-    match crate::infra::resolve_github_release(
-        release_url,
-        token.as_deref(),
-        artifact_proxy.as_deref(),
-    )
-    .await
+    // 勾了通道但这个仓库没配 → 400（不默默直连）。地址本身不像 GitHub release 时
+    // 不在这里拦：让解析器回它自己的「不是 GitHub Release 地址」，免得报错跑偏。
+    if request.use_proxy == Some(true) && release_repo.is_some() && configured_proxy.is_none() {
+        return super::error::ApiError::bad_request(
+            super::codes::PACKAGE_SOURCE_NOT_CONFIGURED,
+            "github_proxy is not configured for this release repo; uncheck the channel to download directly",
+        )
+        .into_response();
+    }
+    let artifact_proxy = effective_artifact_proxy(configured_proxy.as_deref(), request.use_proxy);
+    match crate::infra::resolve_github_release(release_url, token.as_deref(), artifact_proxy).await
     {
         Ok(resolved) => Json(resolved).into_response(),
         Err(err) => super::error::internal_response(
@@ -6956,6 +6989,35 @@ mod tests {
             },
         ];
         state
+    }
+
+    /// 线上契约：`use_proxy` 是可选布尔（不传 = 按配置）。前端按勾选框发 `true`/`false`，
+    /// 字段名漂了页面就静默变成「总是按配置」。
+    #[test]
+    fn use_proxy_is_an_optional_body_field() {
+        let body: ResolveGitHubReleaseRequest =
+            serde_json::from_str(r#"{"release_url":"https://github.com/a/b/releases/tag/v1"}"#)
+                .expect("body");
+        assert_eq!(body.use_proxy, None);
+
+        let body: ResolveGitHubReleaseRequest =
+            serde_json::from_str(r#"{"release_url":"x","use_proxy":false}"#).expect("body");
+        assert_eq!(body.use_proxy, Some(false));
+
+        let body: ResolveGitHubReleaseRequest =
+            serde_json::from_str(r#"{"release_url":"x","use_proxy":true}"#).expect("body");
+        assert_eq!(body.use_proxy, Some(true));
+    }
+
+    /// 勾选框语义：取消 = 直连；勾上 / 不传 = 按来源配置（没配就是直连，由调用方判 400）。
+    #[test]
+    fn use_proxy_overrides_the_configured_channel() {
+        let configured = Some("https://githubproxy.cc");
+        assert_eq!(effective_artifact_proxy(configured, None), configured);
+        assert_eq!(effective_artifact_proxy(configured, Some(true)), configured);
+        assert_eq!(effective_artifact_proxy(configured, Some(false)), None);
+        assert_eq!(effective_artifact_proxy(None, None), None);
+        assert_eq!(effective_artifact_proxy(None, Some(false)), None);
     }
 
     /// 配置里的来源要原样返回（页面据此拼 URL），且缺少 GitHub 的组件必须返回 null。
