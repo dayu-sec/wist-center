@@ -69,7 +69,7 @@ jobs:
   # 1b. macOS 二进制：只 gate GitHub Release，不阻塞镜像构建。
   build-macos:
     name: Build aarch64-apple-darwin
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
 
