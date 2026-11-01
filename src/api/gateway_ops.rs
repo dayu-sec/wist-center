@@ -635,6 +635,7 @@ pub async fn report_gateway_upgrade_result(
     if let Err(err) = rollout::reconcile_gateway_upgrade_result(
         &state,
         &input.gateway_id,
+        &input.work_id,
         &input.status,
         &input.detail,
         input.task_id.as_deref(),
@@ -1363,23 +1364,33 @@ mod tests {
     }
 
     fn test_state() -> ApiState {
+        state_with_gateways(&["gw-001"])
+    }
+
+    /// 多个网关都在册（同一指纹）：用来覆盖「同一计划多目标」的回填路径。
+    fn state_with_gateways(gateway_ids: &[&str]) -> ApiState {
         let path = temp_state_path("wic-api-test");
         let store = FileStore::new(&path);
-        store
-            .seed(&[GatewayCredentialSeed {
-                gateway_id: "gw-001".to_string(),
-                token: "secret-token-1".to_string(),
+        let seeds: Vec<GatewayCredentialSeed> = gateway_ids
+            .iter()
+            .enumerate()
+            .map(|(index, gateway_id)| GatewayCredentialSeed {
+                gateway_id: gateway_id.to_string(),
+                token: format!("secret-token-{index}"),
                 expires_at: None,
-            }])
-            .expect("seed");
+            })
+            .collect();
+        store.seed(&seeds).expect("seed");
         // 登记凭据改为「证书指纹」，与 `client_identity` 对齐（mTLS 口径）。
-        store
-            .update_gateway_credential(
-                "gw-001",
-                TEST_FINGERPRINT,
-                Some(TEST_EXPIRES_AT.to_string()),
-            )
-            .expect("credential");
+        for gateway_id in gateway_ids {
+            store
+                .update_gateway_credential(
+                    gateway_id,
+                    TEST_FINGERPRINT,
+                    Some(TEST_EXPIRES_AT.to_string()),
+                )
+                .expect("credential");
+        }
         ApiState {
             config: crate::config::CenterConfig {
                 listen_addr: "127.0.0.1:3100".to_string(),
@@ -2035,6 +2046,339 @@ mod tests {
         let detail: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
         assert_eq!(detail["plan"]["status"], "completed");
         assert_eq!(detail["entries"][0]["status"], "succeeded");
+    }
+
+    // ── 发布计划端到端测试的共用动作（建 / 批准 / 推进 / 拉取 / 回执 / 读视图） ──
+
+    fn plan_uri(plan_id: &str) -> String {
+        format!("/api/v1/admin/rollout-plans/{plan_id}")
+    }
+
+    /// 建一份铺到 `targets`、`phase_count` 段的升级计划，返回 `plan_id`。
+    async fn create_plan(app: &Router, targets: &[&str], phase_count: i64) -> String {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/admin/rollout-plans")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "action": "upgrade",
+                            "spec": "{\"targets\":[{\"component\":\"wist-gateway-stack\",\"target_version\":\"0.1.28\"}]}",
+                            "target_ids": targets,
+                            "phase_count": phase_count,
+                            "deadline_at": "2027-01-01T00:00:00Z",
+                            "timeout_seconds": 600,
+                            "batch_size": 0,
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        created["plan_id"].as_str().expect("plan id").to_string()
+    }
+
+    /// `approve` / `advance`（dev 模式管理面无鉴权）。
+    async fn post_plan_action(app: &Router, uri: &str, plan_id: &str) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "plan_id": plan_id }).to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK, "{uri} for {plan_id}");
+    }
+
+    /// 网关拉计划（带 mTLS 身份）。
+    async fn pull_plan(app: &Router, gateway_id: &str) -> GatewayUpgradePlan {
+        let response = app
+            .clone()
+            .oneshot(with_identity(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/api/v1/gateway/upgrade-plan?gateway_id={gateway_id}"
+                    ))
+                    .body(Body::empty())
+                    .expect("request"),
+                client_identity(gateway_id, TEST_FINGERPRINT),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        serde_json::from_slice(&bytes).expect("json")
+    }
+
+    /// 网关回执：`work_id` 恒为计划 id（gwlinkd 一件工作 = 一份计划）；
+    /// `task_id` 可选（**老网关不带**）；`log_dir` 按网关区分，便于断言结果没串台。
+    async fn report_plan_result(
+        app: &Router,
+        gateway_id: &str,
+        work_id: &str,
+        task_id: Option<&str>,
+        status: &str,
+    ) {
+        let mut body = serde_json::json!({
+            "gateway_id": gateway_id,
+            "work_id": work_id,
+            "from_version": "0.1.27",
+            "to_version": "0.1.28",
+            "step": "verify",
+            "status": status,
+            "detail": "executor exit status: 0",
+            "log_dir": format!("/srv/{gateway_id}/tasks/{work_id}"),
+            "reported_at": "2026-10-07T00:00:00Z",
+        });
+        if let Some(task_id) = task_id {
+            body["task_id"] = serde_json::json!(task_id);
+        }
+        let response = app
+            .clone()
+            .oneshot(with_identity(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/gateway/upgrade-result")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("request"),
+                client_identity(gateway_id, TEST_FINGERPRINT),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// 管理面读一份计划（计划 + 逐目标条目）。
+    async fn plan_detail(app: &Router, plan_id: &str) -> serde_json::Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(plan_uri(plan_id))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        serde_json::from_slice(&bytes).expect("json")
+    }
+
+    fn entry_status(detail: &serde_json::Value, gateway_id: &str) -> String {
+        detail["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .find(|entry| entry["target_id"] == gateway_id)
+            .unwrap_or_else(|| panic!("entry {gateway_id}"))["status"]
+            .as_str()
+            .expect("status")
+            .to_string()
+    }
+
+    /// 回归（现场故障）：两个目标落在不同阶段、回执**共用同一个 `task_id`**（中心计划里
+    /// `task_id` 就是 `plan_id`）时，后一个目标的结果必须回填到**自己的**条目上。
+    ///
+    /// 只用 `task_id` 定位时：DAYU01 先回执把 `task_id` 写进第一条，DAYU02 再回执时命中
+    /// DAYU01 的条目 → DAYU01 变成 DAYU02 的结果、DAYU02 永远停在 `dispatched`，阶段
+    /// 不了结，人工推进被 409「phase N is not settled yet」挡住。
+    #[tokio::test]
+    async fn a_two_target_plan_backfills_each_gateway_when_reports_share_a_task_id() {
+        let app = super::super::router_for(state_with_gateways(&["gw-001", "gw-002"]));
+        // 两阶段计划：阶段 1 = gw-001（manual），阶段 2 = gw-002（all_succeeded）。
+        let plan_id = create_plan(&app, &["gw-001", "gw-002"], 2).await;
+        post_plan_action(&app, "/api/v1/admin/rollout-plans/approve", &plan_id).await;
+
+        // 两个网关的回执带**同一个 `task_id`**（= 计划 id）——网关侧一件工作 = 一份计划。
+        assert!(pull_plan(&app, "gw-001").await.has_plan);
+        report_plan_result(&app, "gw-001", &plan_id, Some(&plan_id), "done").await;
+        post_plan_action(&app, "/api/v1/admin/rollout-plans/advance", &plan_id).await;
+        assert!(pull_plan(&app, "gw-002").await.has_plan);
+        report_plan_result(&app, "gw-002", &plan_id, Some(&plan_id), "done").await;
+
+        // 末阶段全部了结 → 计划收敛 `completed`；两条条目各自 `succeeded`，日志不串台。
+        let view = plan_detail(&app, &plan_id).await;
+        assert_eq!(view["plan"]["status"], "completed");
+        assert_eq!(entry_status(&view, "gw-001"), "succeeded");
+        assert_eq!(
+            entry_status(&view, "gw-002"),
+            "succeeded",
+            "后到的回执不能被前一条目抢走"
+        );
+        let entry_of = |gateway_id: &str| {
+            view["entries"]
+                .as_array()
+                .expect("entries")
+                .iter()
+                .find(|entry| entry["target_id"] == gateway_id)
+                .expect("entry")
+        };
+        assert_eq!(
+            entry_of("gw-001")["log_dir"],
+            format!("/srv/gw-001/tasks/{plan_id}")
+        );
+        assert_eq!(
+            entry_of("gw-002")["log_dir"],
+            format!("/srv/gw-002/tasks/{plan_id}")
+        );
+    }
+
+    /// 条目已 `failed` 后不再下发同一份计划：失败也算了结（人工推进 / 走「重试」新计划），
+    /// 继续下发只会每轮重跑一遍。
+    #[tokio::test]
+    async fn a_failed_entry_stops_the_plan_from_being_served_again() {
+        let app = super::super::router_for(state_with_gateways(&["gw-001", "gw-002"]));
+        // 两阶段计划：阶段 1 = gw-001（manual），阶段 2 = gw-002（all_succeeded）。
+        let plan_id = create_plan(&app, &["gw-001", "gw-002"], 2).await;
+        post_plan_action(&app, "/api/v1/admin/rollout-plans/approve", &plan_id).await;
+
+        assert!(pull_plan(&app, "gw-001").await.has_plan);
+        report_plan_result(&app, "gw-001", &plan_id, Some(&plan_id), "failed").await;
+
+        // 已失败 → 不再下发（之前这里会每轮重跑一遍）。
+        assert!(
+            !pull_plan(&app, "gw-001").await.has_plan,
+            "failed 条目不该再被下发"
+        );
+
+        // 失败也算了结 → 人工可推进到阶段 2；下一阶段的目标照常下发。
+        post_plan_action(&app, "/api/v1/admin/rollout-plans/advance", &plan_id).await;
+        assert!(
+            pull_plan(&app, "gw-002").await.has_plan,
+            "阶段 2 的目标应下发"
+        );
+
+        // 末阶段成功 → 计划收尾；阶段 1 的 `failed` 不被后到的回执覆盖。
+        report_plan_result(&app, "gw-002", &plan_id, Some(&plan_id), "done").await;
+        let view = plan_detail(&app, &plan_id).await;
+        assert_eq!(view["plan"]["status"], "completed");
+        assert_eq!(entry_status(&view, "gw-001"), "failed");
+        assert_eq!(entry_status(&view, "gw-002"), "succeeded");
+    }
+
+    /// 成功也算了结：`manual` 阶段成功后等人工推进，期间不再重复下发同一份计划。
+    #[tokio::test]
+    async fn a_succeeded_entry_is_not_served_again() {
+        let app = super::super::router_for(state_with_gateways(&["gw-001", "gw-002"]));
+        let plan_id = create_plan(&app, &["gw-001", "gw-002"], 2).await;
+        post_plan_action(&app, "/api/v1/admin/rollout-plans/approve", &plan_id).await;
+
+        assert!(pull_plan(&app, "gw-001").await.has_plan);
+        report_plan_result(&app, "gw-001", &plan_id, Some(&plan_id), "done").await;
+
+        let view = plan_detail(&app, &plan_id).await;
+        assert_eq!(
+            view["plan"]["status"], "rolling",
+            "manual 段成功后等人工推进"
+        );
+        assert_eq!(entry_status(&view, "gw-001"), "succeeded");
+        assert!(
+            !pull_plan(&app, "gw-001").await.has_plan,
+            "succeeded 条目不该再被下发"
+        );
+
+        // 推进后下一段照常下发。
+        post_plan_action(&app, "/api/v1/admin/rollout-plans/advance", &plan_id).await;
+        assert!(pull_plan(&app, "gw-002").await.has_plan);
+    }
+
+    /// 中断（升级器被杀）不能因为「了结」而停发：中心只收到过拉取、没收到终态，条目仍是
+    /// `dispatched` —— 必须继续下发，gwlinkd 清游标后才能重驱同一计划。
+    #[tokio::test]
+    async fn an_interrupted_entry_is_still_served() {
+        let app = super::super::router_for(state_with_gateways(&["gw-001"]));
+        let plan_id = create_plan(&app, &["gw-001"], 1).await;
+        post_plan_action(&app, "/api/v1/admin/rollout-plans/approve", &plan_id).await;
+
+        assert!(pull_plan(&app, "gw-001").await.has_plan);
+        let view = plan_detail(&app, &plan_id).await;
+        assert_eq!(entry_status(&view, "gw-001"), "dispatched");
+        assert!(
+            pull_plan(&app, "gw-001").await.has_plan,
+            "dispatched 条目应继续下发（中断续跑）"
+        );
+    }
+
+    /// 回归：同一网关同时落在两份 `rolling` 计划里时（新计划刚批准、老计划还在飞），回执必须按
+    /// `work_id`（= 计划 id）落到**它自己的**计划，不能被最新那份当成「无主回执」吃掉。
+    ///
+    /// 复现要点：新计划的条目还没记下 `task_id`（网关还没回报过它），而回执也不带 `task_id`
+    /// （老网关）—— 只看 `task_id` / 网关的定位会把老计划的结果写进新计划：老计划永远 `dispatched`，
+    /// 新计划带着别人的结果收尾。
+    #[tokio::test]
+    async fn a_late_report_lands_on_its_own_plan_not_the_newer_rolling_one() {
+        let app = super::super::router_for(state_with_gateways(&["gw-001"]));
+
+        let older = create_plan(&app, &["gw-001"], 1).await;
+        post_plan_action(&app, "/api/v1/admin/rollout-plans/approve", &older).await;
+        assert!(pull_plan(&app, "gw-001").await.has_plan);
+
+        // 老计划还在飞时又批准一份新的：两份都是 rolling，网关都「落在当前阶段」。
+        let newer = create_plan(&app, &["gw-001"], 1).await;
+        post_plan_action(&app, "/api/v1/admin/rollout-plans/approve", &newer).await;
+
+        // 老计划的回执（老网关：不带 `task_id`）—— 必须只落在老计划上。
+        report_plan_result(&app, "gw-001", &older, None, "done").await;
+
+        let older_view = plan_detail(&app, &older).await;
+        assert_eq!(older_view["plan"]["status"], "completed");
+        assert_eq!(entry_status(&older_view, "gw-001"), "succeeded");
+
+        let newer_view = plan_detail(&app, &newer).await;
+        assert_eq!(
+            newer_view["plan"]["status"], "rolling",
+            "新计划不能被别人的回执收尾"
+        );
+        assert_eq!(entry_status(&newer_view, "gw-001"), "pending");
+    }
+
+    /// 兼容：`work_id` 不是任何计划 id 时（不属于本服务的契约强约束）**不能把回执丢掉** ——
+    /// 退回按 `task_id` / 网关定位。既有的单计划用例（`work_id: "work-1"`）也走这条路。
+    #[tokio::test]
+    async fn a_report_with_a_foreign_work_id_still_backfills_by_gateway() {
+        let app = super::super::router_for(state_with_gateways(&["gw-001"]));
+        let plan_id = create_plan(&app, &["gw-001"], 1).await;
+        post_plan_action(&app, "/api/v1/admin/rollout-plans/approve", &plan_id).await;
+
+        assert!(pull_plan(&app, "gw-001").await.has_plan);
+        report_plan_result(&app, "gw-001", "work-not-a-plan-id", None, "done").await;
+
+        let view = plan_detail(&app, &plan_id).await;
+        assert_eq!(view["plan"]["status"], "completed");
+        assert_eq!(entry_status(&view, "gw-001"), "succeeded");
     }
 
     /// 升级目标里的 `artifact_url` 由中心**反查已发布的 release** 派生；无对应记录那么为 `None`

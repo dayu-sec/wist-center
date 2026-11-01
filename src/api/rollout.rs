@@ -726,9 +726,18 @@ fn gateway_executes(action: &str) -> bool {
     action != ACTION_WPARSE_RELEASE
 }
 
-/// 找出此刻**该网关该执行**的升级计划：`rolling` 且它落在 `current_phase` 阶段内。
+/// 找出此刻**该网关该执行**的升级计划：`rolling`、它落在 `current_phase` 阶段内，且它在
+/// **本计划里的条目还没了结**。
 ///
 /// 计划列表是「新→旧」，取第一份命中的（与旧实现同序）。
+///
+/// **了结（`succeeded` / `failed`）不再下发**：这份计划对该网关已经没有可做的了 ——
+/// 成功要等人工推进，失败要走「重试」新建补跑计划（新 `plan_id`）。继续下发既有害又无意义：
+/// gwlinkd 的游标只有一个 `last_plan_id`，老计划在别的计划跑完后会重新浮出来被**重复执行**；
+/// 而 `failed` 条目在拉取时不会退回 `dispatched`（见 [`mark_gateway_entry_dispatched`]），
+/// 中心会一直显示「失败」、实际却在跑。
+///
+/// 中断（升级器被杀）不在此列：那种情况网关根本没写过终态、也没回执，条目仍是 `dispatched`。
 pub(super) async fn active_plan_for_gateway(
     state: &ApiState,
     gateway_id: &str,
@@ -752,11 +761,25 @@ pub(super) async fn active_plan_for_gateway(
             continue;
         }
         let phase = plan.phases[idx - 1].clone();
-        if phase.gateway_ids.iter().any(|id| id == gateway_id) {
-            return Ok(Some((plan, phase)));
+        if !phase.gateway_ids.iter().any(|id| id == gateway_id) {
+            continue;
         }
+        if gateway_entry_settled(&plan, gateway_id) {
+            continue;
+        }
+        return Ok(Some((plan, phase)));
     }
     Ok(None)
+}
+
+/// 该网关在这份计划里的条目是否已经**了结**（`succeeded` / `failed`）。
+///
+/// 没找到条目（老计划没条目的兜底）不算了结 —— 宁可多下发一次，也不把活吞掉。
+fn gateway_entry_settled(plan: &UpgradePlanRecord, gateway_id: &str) -> bool {
+    plan.entries
+        .iter()
+        .filter(|entry| entry.gateway_id == gateway_id)
+        .any(|entry| matches!(entry.status.as_str(), "succeeded" | "failed"))
 }
 
 /// 网关拉走待执行计划时，把它在本阶段的条目标 `dispatched`（仅当还是 `pending`，幂等）。
@@ -795,18 +818,22 @@ pub(super) async fn mark_gateway_entry_dispatched(
         .map_err(|err| format!("failed to store upgrade plan: {err}"))
 }
 
-/// 网关升级结果回填：按 `gateway_id` 找到它此刻所在 `rolling` 计划的当前阶段，回填条目状态/明细，
-/// 若是终态（succeeded / failed）再按闸门推进一次。
+/// 网关升级结果回填：按 `gateway_id` + `work_id` 定位它此刻所在 `rolling` 计划的当前阶段，
+/// 回填条目状态/明细，若是终态（succeeded / failed）再按闸门推进一次。
 ///
-/// 回执里没有中心侧的 work_id（中心不物化），但一个网关此刻最多落在一份 `rolling` 计划的
-/// 当前阶段里 —— 按 `gateway_id` + 当前阶段定位就够了。找不到对应计划/条目时静默返回
-/// （不是计划物化出来的结果，无条目可回填）。
+/// `work_id` 就是计划的 `plan_id`（gwlinkd 的一件工作 = 一份计划，见其 `finish_plan` /
+/// `start_with_digest`）—— 用它精确定位，不再靠「一个网关此刻最多落在一份 rolling 计划」这个假设：
+/// 同一网关同时落在两份 rolling 计划里时（新计划刚批准、老计划还在飞），那个假设不成立。
+///
+/// 找不到对应计划/条目时静默返回（不是计划物化出来的结果，无条目可回填）。
 ///
 /// **只看网关自己执行的动作**：`wparse-release` 由中心入队、经 `wparse-proxy` 回填，
 /// 两个回执通道不能互相串台。
+#[allow(clippy::too_many_arguments)] // 与 `reconcile_wparse_result` / `reconcile_plan_result` 同形，拆结构体反而绕。
 pub(super) async fn reconcile_gateway_upgrade_result(
     state: &ApiState,
     gateway_id: &str,
+    work_id: &str,
     status: &str,
     detail: &str,
     task_id: Option<&str>,
@@ -817,6 +844,7 @@ pub(super) async fn reconcile_gateway_upgrade_result(
         state,
         PlanActionFilter::GatewayExecuted,
         gateway_id,
+        Some(work_id),
         status,
         detail,
         task_id,
@@ -843,6 +871,8 @@ pub(super) async fn reconcile_wparse_result(
         state,
         PlanActionFilter::Only(ACTION_WPARSE_RELEASE),
         gateway_id,
+        // 命令回执没有「计划 id」这个概念（`work_id` 是命令 id），定位仍靠 `task_id` + 网关。
+        None,
         status,
         detail,
         task_id,
@@ -850,6 +880,21 @@ pub(super) async fn reconcile_wparse_result(
         log_excerpt,
     )
     .await
+}
+
+/// 这条回执是不是这条条目的？网关必须相同，`task_id` 只用来**区分同一网关的多份计划**。
+fn entry_matches_report(
+    entry: &UpgradePlanEntryRecord,
+    gateway_id: &str,
+    task_id: Option<&str>,
+) -> bool {
+    if entry.gateway_id != gateway_id {
+        return false;
+    }
+    match (entry.task_id.as_deref(), task_id) {
+        (Some(stored), Some(reported)) => stored == reported,
+        _ => true,
+    }
 }
 
 /// 回执该匹配哪类计划：网关执行的动作（默认全部），或只看某一个动作。
@@ -866,6 +911,7 @@ async fn reconcile_plan_result(
     state: &ApiState,
     filter: PlanActionFilter,
     gateway_id: &str,
+    work_id: Option<&str>,
     status: &str,
     detail: &str,
     task_id: Option<&str>,
@@ -877,6 +923,20 @@ async fn reconcile_plan_result(
         .list_upgrade_plans()
         .await
         .map_err(|err| format!("failed to load upgrade plans: {err}"))?;
+    // 网关执行的动作：`work_id` 就是 `plan_id`，**有精确命中就只认那一份**。
+    //
+    // 不能只靠 `task_id`/网关：同一网关可能同时落在两份 rolling 计划里（新计划刚批准、
+    // 老计划还在飞），而新计划的条目还没记下 `task_id`（老网关干脆不送这个键），于是一份
+    // 属于老计划的回执会被当成「无主」写进新计划 —— 老计划永远 `dispatched`、新计划带着
+    // 别人的结果收尾。
+    //
+    // 但**没有精确命中时退回旧口径**（而不是直接丢弃）：`work_id` 填法不属于本服务的契约
+    // 强约束，老客户端/别的入口可能填别的东西 —— 宁可多探测一次，不能把回执吞了。
+    let exact_work_id = match filter {
+        PlanActionFilter::GatewayExecuted => work_id.map(str::trim).filter(|id| !id.is_empty()),
+        PlanActionFilter::Only(_) => None,
+    };
+    let exact_plan = exact_work_id.filter(|id| plans.iter().any(|plan| plan.plan_id == *id));
     for mut plan in plans {
         if plan.status != "rolling" {
             continue;
@@ -888,6 +948,11 @@ async fn reconcile_plan_result(
         if !matches_action {
             continue;
         }
+        if let Some(exact) = exact_plan
+            && plan.plan_id != exact
+        {
+            continue;
+        }
         let idx = plan.current_phase as usize;
         if idx == 0 || idx > plan.phases.len() {
             continue;
@@ -896,19 +961,20 @@ async fn reconcile_plan_result(
         if !phase.gateway_ids.iter().any(|id| id == gateway_id) {
             continue;
         }
-        // 有 `task_id` 时优先按它定位：同一网关可能同时落在两份 `wparse-release` 计划里
-        // （刚批准一份、又重派了一份），只按 `gateway_id` 会回填到错的那份。
-        let entry_index = task_id
-            .and_then(|task_id| {
-                plan.entries
-                    .iter()
-                    .position(|entry| entry.task_id.as_deref() == Some(task_id))
-            })
-            .or_else(|| {
-                plan.entries
-                    .iter()
-                    .position(|entry| entry.gateway_id == gateway_id)
-            });
+        // 条目定位：**先按 `gateway_id` 收窄，再（可选）按 `task_id` 区分** —— 顺序不能反。
+        //
+        // 中心的计划里 `task_id` 就是 `plan_id`（网关侧一件工作 = 一份计划），同一计划的每个目标
+        // **都一样**：先到的回执把 `task_id` 写进自己的条目，后到的回执若只按 `task_id` 定位，就会
+        // 命中**前一个目标**的条目 —— 前一个被覆盖成后一个的结果，后一个永远停在 `dispatched`，
+        // 阶段永不了结、推进被 409 挡住。
+        //
+        // `task_id` 仍要参与比较，但只用来区分**同一网关**的多份计划：同一网关可能同时落在两份
+        // `wparse-release` 计划里（刚批准一份、又重派了一份），那种条目在入队时就带上了不同的
+        // `task_id`。条目还没记下 `task_id`（网关回执先到）或回执没带（老网关）时按网关认。
+        let entry_index = plan
+            .entries
+            .iter()
+            .position(|entry| entry_matches_report(entry, gateway_id, task_id));
         let Some(entry_index) = entry_index else {
             continue;
         };
@@ -936,7 +1002,8 @@ async fn reconcile_plan_result(
             .save_upgrade_plan(&plan)
             .await
             .map_err(|err| format!("failed to store upgrade plan: {err}"))?;
-        // 网关回执：一个网关此刻只落在一份计划的当前阶段里，取第一份命中即可。
+        // 网关回执：一份回执只对应一份计划（`work_id` = 计划 id，精确命中时也只认那一份），
+        // 取第一份命中即可。
         // 命令回执不同：**同一条命令可能被多份 wparse 计划复用**（`publish_reload` 按 body 去重），
         // 所以要把所有命中这条 `task_id` 的条目都回填完，否则后批准的那份会永远停在 `dispatched`。
         if matches!(filter, PlanActionFilter::GatewayExecuted) {
@@ -1160,6 +1227,46 @@ mod tests {
         assert_eq!(parse_task_log_dir("日志: /a/b；"), Some("/a/b".to_string()));
         assert_eq!(parse_task_log_dir("没有日志"), None);
         assert_eq!(parse_task_log_dir("日志: "), None);
+    }
+
+    /// 回归：同一计划里两个目标共用 `task_id`（中心计划里它就是 `plan_id`）时，后到的回执
+    /// 必须落到**自己的**条目上。
+    ///
+    /// 现场故障：DAYU01 先回执 → `task_id` 被写进第一条；DAYU02 再回执时只按 `task_id` 定位，
+    /// 命中 DAYU01 的条目 → DAYU01 变成 DAYU02 的结果（连日志目录都对不上），DAYU02 永远停在
+    /// `dispatched`，阶段不了结、推进被 409「phase N is not settled yet」挡住。
+    #[test]
+    fn a_shared_task_id_does_not_steal_another_targets_entry() {
+        let mut first = entry("gw-1", "succeeded");
+        first.task_id = Some("plan-shared".to_string());
+        let second = entry("gw-2", "dispatched");
+        let entries = [first, second];
+
+        // 同一网关、同一 `task_id`：就是这条回执的条目。
+        assert!(entry_matches_report(
+            &entries[0],
+            "gw-1",
+            Some("plan-shared")
+        ));
+        // 后到的同 `task_id` 回执不能被先到者抢走 —— 必须按网关落到自己的条目。
+        assert!(!entry_matches_report(
+            &entries[0],
+            "gw-2",
+            Some("plan-shared")
+        ));
+        assert!(entry_matches_report(
+            &entries[1],
+            "gw-2",
+            Some("plan-shared")
+        ));
+        // 同一网关、`task_id` 不同 = 另一份计划（`wparse-release` 的复用命令），不能回填。
+        assert!(!entry_matches_report(
+            &entries[0],
+            "gw-1",
+            Some("plan-other")
+        ));
+        // 回执没带 / 条目还没记下 `task_id`：按网关认。
+        assert!(entry_matches_report(&entries[1], "gw-2", None));
     }
 
     fn plan_with(
@@ -1512,6 +1619,30 @@ mod tests {
         ] {
             assert!(gateway_executes(action), "{action} 应由网关执行");
         }
+    }
+
+    /// 条目已了结（`succeeded` / `failed`）就不再把它当成「待执行目标」—— 成功等人工推进、
+    /// 失败走「重试」新计划；否则老计划会在别的计划跑完后重新浮出来被重复执行。
+    #[test]
+    fn a_settled_entry_is_not_an_active_target() {
+        let plan = plan_with(
+            vec![phase(1, &["gw-1"], "manual", "rolling")],
+            vec![
+                entry("gw-1", "succeeded"),
+                entry("gw-2", "failed"),
+                entry("gw-3", "dispatched"),
+                entry("gw-4", "pending"),
+            ],
+            1,
+            "rolling",
+        );
+        assert!(gateway_entry_settled(&plan, "gw-1"));
+        assert!(gateway_entry_settled(&plan, "gw-2"));
+        // 未了结的两种都不算（`dispatched` = 已下发在飞；中断被杀的情况也是它）。
+        assert!(!gateway_entry_settled(&plan, "gw-3"));
+        assert!(!gateway_entry_settled(&plan, "gw-4"));
+        // 没条目的兜底：宁可多下发一次，也不把活吞掉。
+        assert!(!gateway_entry_settled(&plan, "gw-unknown"));
     }
 
     #[test]
