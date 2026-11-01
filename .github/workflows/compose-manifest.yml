@@ -64,18 +64,19 @@ jobs:
             *) echo "::error::tag 必须形如 v1.2.3 或 v1.2.3-alpha，收到：${TAG}"; exit 1 ;;
           esac
 
-      # 方式 1：从已有 run 的 artifact 取 digest。
+      # 方式 1：从已有 run 的 artifact 取 digest（新流水线：每个仓库各一份）。
       - name: Download digests from run
         if: ${{ inputs.run_id != '' }}
         uses: actions/download-artifact@v8
         with:
-          pattern: digest-*
+          pattern: digests-*
           path: /tmp/digests
           merge-multiple: true
           run-id: ${{ inputs.run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      # 方式 2：手工填 digest（artifact 已过期时）。
+      # 方式 2：手工填 digest（artifact 已过期时）。两个仓库的 digest 由内容寻址决定、一致，
+      # 所以一份值写两份文件；两边是否真存在交给后面的 preflight 校验。
       - name: Digests from inputs
         if: ${{ inputs.run_id == '' }}
         env:
@@ -88,22 +89,26 @@ jobs:
             exit 1
           fi
           mkdir -p /tmp/digests
-          printf '%s' "${AMD64}" | sed 's/^sha256://' > /tmp/digests/amd64
-          printf '%s' "${ARM64}" | sed 's/^sha256://' > /tmp/digests/arm64
+          for registry in ghcr tcr; do
+            printf '%s' "${AMD64}" | sed 's/^sha256://' > "/tmp/digests/${registry}-amd64"
+            printf '%s' "${ARM64}" | sed 's/^sha256://' > "/tmp/digests/${registry}-arm64"
+          done
 
       - name: Validate digests
         run: |
           set -euo pipefail
           ls -l /tmp/digests
-          count=$(find /tmp/digests -type f | wc -l | tr -d ' ')
-          [ "${count}" -eq 2 ] || { echo "::error::期望 2 个架构 digest，实际 ${count}"; exit 1; }
-          # 每个文件必须是 64 位小写 hex（格式错时 imagetools 的报错很难懂，提前挡掉）
-          for f in /tmp/digests/*; do
-            name="$(basename "$f")"
-            case "${name}" in
-              *[!0-9a-f]*) echo "::error::digest 必须是 64 位小写 hex，收到：${name}"; exit 1 ;;
-            esac
-            [ "${#name}" -eq 64 ] || { echo "::error::digest 长度应为 64，实际 ${#name}：${name}"; exit 1; }
+          for registry in ghcr tcr; do
+            count=$(find /tmp/digests -name "${registry}-*" -type f | wc -l | tr -d ' ')
+            [ "${count}" -eq 2 ] || { echo "::error::${registry} 期望 2 个架构 digest，实际 ${count}"; exit 1; }
+            # 每个文件必须是 64 位小写 hex（格式错时 imagetools 的报错很难懂，提前挡掉）
+            for f in /tmp/digests/${registry}-*; do
+              value="$(cat "$f")"
+              case "${value}" in
+                *[!0-9a-f]*) echo "::error::digest 必须是 64 位小写 hex，收到：${value}"; exit 1 ;;
+              esac
+              [ "${#value}" -eq 64 ] || { echo "::error::digest 长度应为 64，实际 ${#value}：${value}"; exit 1; }
+            done
           done
 
       - uses: docker/setup-buildx-action@v4
@@ -144,19 +149,23 @@ jobs:
             printf 'tcr_tags<<__EOF__\n%s\n__EOF__\n' "$tcr_tags"
           } >> "$GITHUB_OUTPUT"
 
-      # 同一个 digest 必须**两个仓库都有**（新流水线按 digest 直推双仓）。
+      # 前置检查：每个仓库的 per-arch digest 必须真在那里（新流水线按 digest 直推双仓）。
       # 缺一边就快速失败：不再像旧实现那样从 ghcr 跨区搬到 TCR（那一步会卡死）。
-      - name: Verify per-arch digests in both registries
+      - name: Verify per-arch digests
         env:
           GHCR: ghcr.io/${{ github.repository }}
           TCR: dy-sec.tencentcloudcr.com/cloud/wist-center
         run: |
           set -euo pipefail
-          for f in /tmp/digests/*; do
-            digest="sha256:$(basename "$f")"
+          for f in /tmp/digests/ghcr-*; do
+            digest="sha256:$(cat "$f")"
             docker buildx imagetools inspect "${GHCR}@${digest}" > /dev/null
+            echo "ok ghcr ${digest}"
+          done
+          for f in /tmp/digests/tcr-*; do
+            digest="sha256:$(cat "$f")"
             docker buildx imagetools inspect "${TCR}@${digest}" > /dev/null
-            echo "ok ${digest}"
+            echo "ok tcr ${digest}"
           done
 
       - name: Create ghcr multi-arch manifest
@@ -167,8 +176,8 @@ jobs:
         run: |
           set -euo pipefail
           digests=()
-          for f in /tmp/digests/*; do
-            digests+=("${IMAGE}@sha256:$(basename "$f")")
+          for f in /tmp/digests/ghcr-*; do
+            digests+=("${IMAGE}@sha256:$(cat "$f")")
           done
           args=()
           while IFS= read -r tag; do
@@ -201,8 +210,8 @@ jobs:
         run: |
           set -euo pipefail
           digests=()
-          for f in /tmp/digests/*; do
-            digests+=("${IMAGE}@sha256:$(basename "$f")")
+          for f in /tmp/digests/tcr-*; do
+            digests+=("${IMAGE}@sha256:$(cat "$f")")
           done
           args=()
           while IFS= read -r tag; do
