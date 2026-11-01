@@ -2599,6 +2599,9 @@ pub async fn admin_list_gateway_agents(
             cpu_percent: agent.cpu_percent,
             admin_latency_ms: agent.admin_latency_ms,
             last_seen_at: agent.last_seen_at,
+            node_id: agent.node_id,
+            hostname: agent.hostname,
+            ip_addresses: agent.ip_addresses,
         })
         .collect();
     Json(views).into_response()

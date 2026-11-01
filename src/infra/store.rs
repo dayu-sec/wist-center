@@ -591,6 +591,11 @@ pub struct StoredAgent {
     pub cpu_percent: Option<f64>,
     pub admin_latency_ms: Option<i64>,
     pub last_seen_at: DateTime,
+    /// 机器身份：中心页要能回答“这是哪台机器”。旧生产者不报 → `None`（不是空串）。
+    pub node_id: Option<String>,
+    pub hostname: Option<String>,
+    /// 形如 `en0 192.168.1.5/24`；`None` / 空表 = 还没报过 / 确实没有地址。
+    pub ip_addresses: Option<Vec<String>>,
 }
 
 /// 单次状态上报落库参数（ReceiveGatewayStatusReport → store）。

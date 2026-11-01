@@ -119,9 +119,20 @@ CREATE TABLE IF NOT EXISTS agent_status (
   memory_bytes BIGINT,
   cpu_percent DOUBLE PRECISION,
   admin_latency_ms BIGINT,
-  last_seen_at TIMESTAMPTZ NOT NULL
+  last_seen_at TIMESTAMPTZ NOT NULL,
+  -- 机器身份（中心页“这是哪台机器”）：来自网关注册表的机器画像。
+  -- 旧版 gwlinkd 不报 → 保持 NULL，不写空串。
+  node_id TEXT,
+  hostname TEXT,
+  ip_addresses TEXT[]
 );
 CREATE INDEX IF NOT EXISTS idx_agent_status_gateway ON agent_status (gateway_id);
+
+-- 存量库补列：本文件由 `PgStore::connect` 在**每次启动**时整份执行（全部 `IF NOT EXISTS`
+-- 幂等），所以新加列只需上面 CREATE + 这里各一行，不需要单独的人工迁移。
+ALTER TABLE agent_status ADD COLUMN IF NOT EXISTS node_id TEXT;
+ALTER TABLE agent_status ADD COLUMN IF NOT EXISTS hostname TEXT;
+ALTER TABLE agent_status ADD COLUMN IF NOT EXISTS ip_addresses TEXT[];
 
 -- 网关生命周期转变历史（append-only 过程记录）。
 CREATE TABLE IF NOT EXISTS gateway_lifecycle_events (

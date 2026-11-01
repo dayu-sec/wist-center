@@ -5,6 +5,17 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.27.0-alpha] - 2026-10-31
+
+### 新增（Agent 状态携带机器身份）
+
+- `agent_status` 表新增 `node_id` / `hostname` / `ip_addresses`（`TEXT[]`），
+  `ReportAgentStatus` 的三个新字段落库并在 `GET /api/v1/admin/gateways/{id}/agents` 读出。
+  中心页终于能回答“这是哪台机器”，而不只是一串 `agent_id`。
+- **存量库自动补列**：`PgStore::connect` 每次启动都整份执行 `docker/initdb/01_schema.sql`，
+  里面新增了 `ALTER TABLE agent_status ADD COLUMN IF NOT EXISTS …`，**不需要人工迁移**。
+- 依赖 `wist-control 0.19`（加性字段，旧网关/旧 gwlinkd 不报时为 `null`）。
+
 ## [0.26.1-alpha] - 2026-10-30
 
 ### 变更（镜像通道改为**可勾选**：不再与 GitHub 硬绑定）

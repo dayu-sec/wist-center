@@ -838,6 +838,9 @@ mod tests {
             cpu_percent: Some(33.0),
             admin_latency_ms: Some(12),
             last_seen_at: DateTime::from_rfc3339("2026-08-08T12:00:00Z").expect("ts"),
+            node_id: Some("node-1".to_string()),
+            hostname: Some("host-1".to_string()),
+            ip_addresses: Some(vec!["en0 192.168.1.5/24".to_string()]),
         };
         let text = render_agent_lines("gw-x", &agent);
         let ts = agent.last_seen_at.to_chrono().timestamp_millis();

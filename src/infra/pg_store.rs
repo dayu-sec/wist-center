@@ -224,6 +224,9 @@ struct AgentRow {
     cpu_percent: Option<f64>,
     admin_latency_ms: Option<i64>,
     last_seen_at: chrono::DateTime<chrono::Utc>,
+    node_id: Option<String>,
+    hostname: Option<String>,
+    ip_addresses: Option<Vec<String>>,
 }
 
 impl AgentRow {
@@ -240,6 +243,9 @@ impl AgentRow {
             admin_latency_ms: self.admin_latency_ms,
             last_seen_at: DateTime::from_rfc3339(&self.last_seen_at.to_rfc3339())
                 .unwrap_or_else(DateTime::now),
+            node_id: self.node_id,
+            hostname: self.hostname,
+            ip_addresses: self.ip_addresses,
         }
     }
 }
@@ -685,15 +691,18 @@ impl Store for PgStore {
             sqlx::query(
                 "INSERT INTO agent_status \
                     (agent_id, gateway_id, instance_id, version, status, health, \
-                     memory_bytes, cpu_percent, admin_latency_ms, last_seen_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+                     memory_bytes, cpu_percent, admin_latency_ms, last_seen_at, \
+                     node_id, hostname, ip_addresses) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
                  ON CONFLICT (agent_id) DO UPDATE SET \
                    gateway_id = EXCLUDED.gateway_id, instance_id = EXCLUDED.instance_id, \
                    version = EXCLUDED.version, status = EXCLUDED.status, \
                    health = EXCLUDED.health, memory_bytes = EXCLUDED.memory_bytes, \
                    cpu_percent = EXCLUDED.cpu_percent, \
                    admin_latency_ms = EXCLUDED.admin_latency_ms, \
-                   last_seen_at = EXCLUDED.last_seen_at",
+                   last_seen_at = EXCLUDED.last_seen_at, \
+                   node_id = EXCLUDED.node_id, hostname = EXCLUDED.hostname, \
+                   ip_addresses = EXCLUDED.ip_addresses",
             )
             .bind(&agent.agent_id)
             .bind(gateway_id)
@@ -705,6 +714,9 @@ impl Store for PgStore {
             .bind(agent.cpu_percent)
             .bind(agent.admin_latency_ms)
             .bind(last_seen_at)
+            .bind(&agent.node_id)
+            .bind(&agent.hostname)
+            .bind(agent.ip_addresses.as_deref())
             .execute(&self.pool)
             .await
             .source_raw_err(StoreReason::Sql, "upsert agent status")?;
@@ -718,7 +730,8 @@ impl Store for PgStore {
     ) -> Result<Vec<StoredAgent>, StoreError> {
         let rows: Vec<AgentRow> = sqlx::query_as(
             "SELECT agent_id, gateway_id, instance_id, version, status, health, \
-                    memory_bytes, cpu_percent, admin_latency_ms, last_seen_at \
+                    memory_bytes, cpu_percent, admin_latency_ms, last_seen_at, \
+                    node_id, hostname, ip_addresses \
              FROM agent_status WHERE gateway_id = $1 ORDER BY agent_id",
         )
         .bind(gateway_id)
