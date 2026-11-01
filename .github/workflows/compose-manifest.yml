@@ -13,6 +13,10 @@ name: Compose manifest (repair)
 #   2) amd64_digest / arm64_digest —— 直接填 `sha256:...` 或纯 hex。
 #
 # tag 规则与 release.yml 完全一致：预发布 tag（含 `-`）只推该 tag，不覆盖 :latest。
+#
+# 前置：release.yml 已把**同一个 digest 直推到 ghcr 与 TCR**（新流水线）。本工作流按各仓库
+# 自己的 digest 建 index，不跨仓库搬层；缺一边会在 preflight 直接失败。
+# 旧流水线（只推 ghcr、manifest 阶段跨区复制）产出的 tag 不适用本工作流。
 
 on:
   workflow_dispatch:
@@ -126,20 +130,39 @@ jobs:
           TCR: dy-sec.tencentcloudcr.com/cloud/wist-center
         run: |
           set -euo pipefail
-          tags="$(printf '%s\n%s' "${GHCR}:${TAG}" "${TCR}:${TAG}")"
+          ghcr_tags="${GHCR}:${TAG}"
+          tcr_tags="${TCR}:${TAG}"
           case "${TAG}" in
             *-*) ;; # 预发布：不碰 :latest
             *)
-              tags="$(printf '%s\n%s' "$tags" "${GHCR}:latest")"
-              tags="$(printf '%s\n%s' "$tags" "${TCR}:latest")"
+              ghcr_tags="$(printf '%s\n%s' "$ghcr_tags" "${GHCR}:latest")"
+              tcr_tags="$(printf '%s\n%s' "$tcr_tags" "${TCR}:latest")"
               ;;
           esac
-          printf 'tags<<__EOF__\n%s\n__EOF__\n' "$tags" >> "$GITHUB_OUTPUT"
+          {
+            printf 'ghcr_tags<<__EOF__\n%s\n__EOF__\n' "$ghcr_tags"
+            printf 'tcr_tags<<__EOF__\n%s\n__EOF__\n' "$tcr_tags"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Create multi-arch manifests
+      # 同一个 digest 必须**两个仓库都有**（新流水线按 digest 直推双仓）。
+      # 缺一边就快速失败：不再像旧实现那样从 ghcr 跨区搬到 TCR（那一步会卡死）。
+      - name: Verify per-arch digests in both registries
+        env:
+          GHCR: ghcr.io/${{ github.repository }}
+          TCR: dy-sec.tencentcloudcr.com/cloud/wist-center
+        run: |
+          set -euo pipefail
+          for f in /tmp/digests/*; do
+            digest="sha256:$(basename "$f")"
+            docker buildx imagetools inspect "${GHCR}@${digest}" > /dev/null
+            docker buildx imagetools inspect "${TCR}@${digest}" > /dev/null
+            echo "ok ${digest}"
+          done
+
+      - name: Create ghcr multi-arch manifest
         timeout-minutes: 5
         env:
-          TAGS: ${{ steps.meta.outputs.tags }}
+          TAGS: ${{ steps.meta.outputs.ghcr_tags }}
           IMAGE: ghcr.io/${{ github.repository }}
         run: |
           set -euo pipefail
@@ -160,11 +183,44 @@ jobs:
               break
             fi
             if [ "${i}" -lt 3 ]; then
-              echo "::warning::imagetools create 第 ${i} 次失败，5s 后重试"
+              echo "::warning::ghcr imagetools create 第 ${i} 次失败，5s 后重试"
               sleep 5
             fi
           done
-          [ "${ok}" -eq 1 ] || { echo "::error::imagetools create 连续 3 次失败"; exit 1; }
+          [ "${ok}" -eq 1 ] || { echo "::error::ghcr imagetools create 连续 3 次失败"; exit 1; }
+
+          while IFS= read -r tag; do
+            [ -n "$tag" ] && docker buildx imagetools inspect "$tag"
+          done <<< "${TAGS}"
+
+      - name: Create TCR multi-arch manifest
+        timeout-minutes: 5
+        env:
+          TAGS: ${{ steps.meta.outputs.tcr_tags }}
+          IMAGE: dy-sec.tencentcloudcr.com/cloud/wist-center
+        run: |
+          set -euo pipefail
+          digests=()
+          for f in /tmp/digests/*; do
+            digests+=("${IMAGE}@sha256:$(basename "$f")")
+          done
+          args=()
+          while IFS= read -r tag; do
+            [ -n "$tag" ] && args+=(-t "$tag")
+          done <<< "${TAGS}"
+
+          ok=0
+          for i in 1 2 3; do
+            if docker buildx imagetools create "${args[@]}" "${digests[@]}"; then
+              ok=1
+              break
+            fi
+            if [ "${i}" -lt 3 ]; then
+              echo "::warning::TCR imagetools create 第 ${i} 次失败，5s 后重试"
+              sleep 5
+            fi
+          done
+          [ "${ok}" -eq 1 ] || { echo "::error::TCR imagetools create 连续 3 次失败"; exit 1; }
 
           while IFS= read -r tag; do
             [ -n "$tag" ] && docker buildx imagetools inspect "$tag"
