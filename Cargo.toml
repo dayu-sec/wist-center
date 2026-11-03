@@ -3,7 +3,7 @@
 
 [package]
 name = "wist-center"
-version = "0.28.0" #@gxl:set(version)
+version = "0.29.0" #@gxl:set(version)
 edition = "2024"
 
 [dependencies]
@@ -23,6 +23,10 @@ wist-control = "0.19"
 # 本地联调切 path：
 #wist-control = { version = "0.17", path = "../wist-control" }
 wist-error =  "0.2"
+# 规范指标名 / label 键 / 单位换算的唯一来源（与 agentd、gateway 共用，避免两侧各写字符串漂移）。
+# 本地联调切 path：
+#wist-metrics = { path = "../wist-metrics" }
+wist-metrics = "0.9"
 # 错误投影 wire 类型（`ProtocolError` / `ProtocolErrorEnvelope`）：与 gateway / gwlinkd / agentd 共用同一份。
 wist-shared = "0.2"
 # 管理面鉴权原语（Bearer token / sha256 / 常数时间比较 / 失败限流桶）。

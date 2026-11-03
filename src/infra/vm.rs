@@ -5,6 +5,11 @@ use std::{collections::BTreeMap, time::Duration};
 
 use reqwest::Client;
 
+use wist_metrics::names::{
+    agent as agent_metric, label, millis_to_seconds, percent_to_ratio, ratio_to_percent,
+    seconds_to_millis,
+};
+
 use super::{GatewayStatusUpdate, StoredAgent};
 
 /// 网关在一个采样时刻的历史指标；字段缺失表示该指标在 VM 中没有样本。
@@ -244,6 +249,10 @@ pub async fn query_gateway_history(
 }
 
 /// 查询单个 Agent 的在线、内存、CPU 和管理时延历史。
+///
+/// 序列口径（规范）：label 键是 `agent`（`agent_id` 只是报文里的字段名），指标名与单位来自
+/// `wist_metrics::names` —— 与写入侧、与网关读的是同一份常量。手写字符串正是之前
+/// 「写侧改名、读侧失联，页面曲线全空而两侧单测都能过」的成因。
 pub async fn query_agent_history(
     client: &Client,
     base_url: &str,
@@ -255,15 +264,17 @@ pub async fn query_agent_history(
 ) -> Result<Vec<AgentMetricSample>, String> {
     let gateway_id = escape_label(gateway_id);
     let agent_id = escape_label(agent_id);
-    let online_query =
-        format!("avg(agent_up{{gateway_id=\"{gateway_id}\",agent_id=\"{agent_id}\"}})");
-    let memory_query =
-        format!("avg(agent_memory_bytes{{gateway_id=\"{gateway_id}\",agent_id=\"{agent_id}\"}})");
-    let cpu_query =
-        format!("avg(agent_cpu_percent{{gateway_id=\"{gateway_id}\",agent_id=\"{agent_id}\"}})");
-    let latency_query = format!(
-        "avg(agent_admin_latency_ms{{gateway_id=\"{gateway_id}\",agent_id=\"{agent_id}\"}})"
-    );
+    let selector = |name: &str| {
+        format!(
+            "avg({name}{{gateway_id=\"{gateway_id}\",{agent}=\"{agent_id}\"}})",
+            agent = label::AGENT
+        )
+    };
+    // `agent_up` 是本服务自己的在线态序列（不是规范指标），名字留在本模块即可。
+    let online_query = selector("agent_up");
+    let memory_query = selector(agent_metric::MEMORY_BYTES);
+    let cpu_query = selector(agent_metric::CPU_RATIO);
+    let latency_query = selector(agent_metric::ADMIN_LATENCY_SECONDS);
 
     let (online, memory, cpu, latency) = tokio::try_join!(
         query_range_metric(client, base_url, &online_query, start, end, step_seconds),
@@ -271,6 +282,17 @@ pub async fn query_agent_history(
         query_range_metric(client, base_url, &cpu_query, start, end, step_seconds),
         query_range_metric(client, base_url, &latency_query, start, end, step_seconds),
     )?;
+
+    // 规范单位 → 对外的页面口径：CPU 是**单核比例**（1.0 = 一个核），时延是**秒**；
+    // 响应字段仍然是 `cpu_percent` / `admin_latency_ms`，换算只在这里做一次。
+    let cpu = cpu
+        .into_iter()
+        .map(|(at, ratio)| (at, ratio_to_percent(ratio)))
+        .collect();
+    let latency = latency
+        .into_iter()
+        .map(|(at, seconds)| (at, seconds_to_millis(seconds) as f64))
+        .collect();
 
     Ok(merge_agent_history(online, memory, cpu, latency))
 }
@@ -609,6 +631,9 @@ fn opt_f64(value: Option<i64>) -> Option<f64> {
 }
 
 /// 构造 agent 的 Prometheus 文本（agent_up=online→1 / agent_info / agent_health / 指标可选）。
+///
+/// 序列 label 用规范键 `agent`（不是报文里的 `agent_id`）；三个规范指标的**名字与单位**取自
+/// `wist_metrics::names`：CPU 写**单核比例**、时延写**秒**。
 fn render_agent_lines(gateway_id: &str, agent: &StoredAgent) -> String {
     let ts = agent.last_seen_at.to_chrono().timestamp_millis();
     let up = if agent.status == "online" { 1 } else { 0 };
@@ -616,24 +641,30 @@ fn render_agent_lines(gateway_id: &str, agent: &StoredAgent) -> String {
     let agent_id = escape_label(&agent.agent_id);
     let version = escape_label(&agent.version);
     let health = escape_label(&agent.health);
+    let agent_label = format!("{}=\"{agent_id}\"", label::AGENT);
     let mut text = format!(
-        "agent_up{{agent_id=\"{agent_id}\",gateway_id=\"{gateway_id}\"}} {up} {ts}\n\
-         agent_info{{agent_id=\"{agent_id}\",gateway_id=\"{gateway_id}\",version=\"{version}\"}} 1 {ts}\n\
-         agent_health{{agent_id=\"{agent_id}\",gateway_id=\"{gateway_id}\",health=\"{health}\"}} 1 {ts}\n"
+        "agent_up{{{agent_label},gateway_id=\"{gateway_id}\"}} {up} {ts}\n\
+         agent_info{{{agent_label},gateway_id=\"{gateway_id}\",version=\"{version}\"}} 1 {ts}\n\
+         agent_health{{{agent_label},gateway_id=\"{gateway_id}\",health=\"{health}\"}} 1 {ts}\n"
     );
     if let Some(memory) = agent.memory_bytes {
         text.push_str(&format!(
-            "agent_memory_bytes{{agent_id=\"{agent_id}\",gateway_id=\"{gateway_id}\"}} {memory} {ts}\n"
+            "{name}{{{agent_label},gateway_id=\"{gateway_id}\"}} {memory} {ts}\n",
+            name = agent_metric::MEMORY_BYTES
         ));
     }
     if let Some(cpu) = agent.cpu_percent {
         text.push_str(&format!(
-            "agent_cpu_percent{{agent_id=\"{agent_id}\",gateway_id=\"{gateway_id}\"}} {cpu} {ts}\n"
+            "{name}{{{agent_label},gateway_id=\"{gateway_id}\"}} {value} {ts}\n",
+            name = agent_metric::CPU_RATIO,
+            value = percent_to_ratio(cpu)
         ));
     }
     if let Some(latency) = agent.admin_latency_ms {
         text.push_str(&format!(
-            "agent_admin_latency_ms{{agent_id=\"{agent_id}\",gateway_id=\"{gateway_id}\"}} {latency} {ts}\n"
+            "{name}{{{agent_label},gateway_id=\"{gateway_id}\"}} {value} {ts}\n",
+            name = agent_metric::ADMIN_LATENCY_SECONDS,
+            value = millis_to_seconds(latency.max(0) as u64)
         ));
     }
     text
@@ -845,14 +876,33 @@ mod tests {
         let text = render_agent_lines("gw-x", &agent);
         let ts = agent.last_seen_at.to_chrono().timestamp_millis();
         assert!(text.starts_with(&format!(
-            "agent_up{{agent_id=\"agent-1\",gateway_id=\"gw-x\"}} 1 {ts}"
+            "agent_up{{agent=\"agent-1\",gateway_id=\"gw-x\"}} 1 {ts}"
         )));
         assert!(text.contains(&format!(
-            "agent_info{{agent_id=\"agent-1\",gateway_id=\"gw-x\",version=\"v0.3.2\"}} 1 {ts}"
+            "agent_info{{agent=\"agent-1\",gateway_id=\"gw-x\",version=\"v0.3.2\"}} 1 {ts}"
         )));
         assert!(text.contains(&format!(
-            "agent_health{{agent_id=\"agent-1\",gateway_id=\"gw-x\",health=\"healthy\"}} 1 {ts}"
+            "agent_health{{agent=\"agent-1\",gateway_id=\"gw-x\",health=\"healthy\"}} 1 {ts}"
         )));
+        // 规范名 + 规范单位：CPU 写单核比例（33% → 0.33），时延写秒（12ms → 0.012）。
+        assert!(text.contains(&format!(
+            "agent_memory_bytes{{agent=\"agent-1\",gateway_id=\"gw-x\"}} 268435456 {ts}"
+        )));
+        assert!(
+            text.contains(&format!(
+                "agent_cpu_ratio{{agent=\"agent-1\",gateway_id=\"gw-x\"}} 0.33 {ts}"
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "agent_admin_latency_seconds{{agent=\"agent-1\",gateway_id=\"gw-x\"}} 0.012 {ts}"
+            )),
+            "{text}"
+        );
+        assert!(!text.contains("agent_cpu_percent"), "旧名不得再生产");
+        assert!(!text.contains("agent_admin_latency_ms"), "旧名不得再生产");
+        assert!(!text.contains("agent_id="), "序列 label 只用 agent");
 
         // offline → agent_up 0。
         let offline = StoredAgent {
@@ -861,7 +911,7 @@ mod tests {
         };
         assert!(
             render_agent_lines("gw-x", &offline)
-                .starts_with("agent_up{agent_id=\"agent-1\",gateway_id=\"gw-x\"} 0 ")
+                .starts_with("agent_up{agent=\"agent-1\",gateway_id=\"gw-x\"} 0 ")
         );
     }
 
