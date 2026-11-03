@@ -120,3 +120,20 @@ max_targets = 20
 # 开发时想省掉"先注册一次"的步骤可以填，例如：
 #   gateway_credentials = ["gw-demo:change-me"]
 gateway_credentials = []
+
+# 程序访问凭据（wist-cred 验证方）。开发态默认关闭；
+# 要联调时把 enabled 打开，并用 cred 的接入命令把材料落到 server_cert/server_key/client_ca。
+[credentials]
+enabled = false
+listen_addr = "0.0.0.0:3103"
+store_path = "state/credentials.json"
+audience = "wist-center"
+allowed_issuers = ["wist-cred"]
+known_roles = ["admin", "read"]
+admin_roles = ["admin"]
+server_cert_path = ""
+server_key_path = ""
+client_ca_path = ""
+# 授权记录必须带 cred 的 Ed25519 签名；公钥由接入包落 `issuer-signing.pub`。
+require_signature = true
+issuer_public_key_path = ""

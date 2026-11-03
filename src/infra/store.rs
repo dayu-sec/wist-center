@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use wist_control::GatewayInstanceLifecycleState;
 use wist_control::types::DateTime;
 
+use super::commands::{CommandRecord, TargetCommandRecord};
 use super::jobs::{CancelOutcome, JobProgress, JobRecord};
 use super::{ReleaseArtifact, ReleasePackage, sha256_hex};
 use crate::config::GatewayCredentialSeed;
@@ -55,6 +56,12 @@ pub struct CenterStoreSnapshot {
     /// 网关注册 Token（key = token_id；映射模型 GatewayEnrollmentToken）。
     #[serde(default)]
     pub enrollment_tokens: HashMap<String, StoredEnrollmentToken>,
+    /// 指令（语义层，新→旧）。
+    #[serde(default)]
+    pub commands: Vec<CommandRecord>,
+    /// 逐目标投递记录（与 `commands` 一起写，单独存便于按 id 查）。
+    #[serde(default)]
+    pub target_commands: Vec<TargetCommandRecord>,
 }
 
 /// 签发注册 Token 的入参（映射模型 GatewayEnrollmentToken 的签发侧可变字段）。
@@ -881,6 +888,49 @@ pub trait Store: Send + Sync + std::fmt::Debug {
         &self,
         gateway_id: &str,
     ) -> Result<Vec<StoredAgent>, StoreError>;
+
+    // ── 指令（Command）资源 ─────────────────────────────────────────
+
+    /// 插入一条指令与它的逐目标投递记录（同一事务 / 同一次文件写）。
+    /// `request_id` 已存在 → `StoreReason::Conflict`。
+    async fn insert_command(
+        &self,
+        command: &CommandRecord,
+        targets: &[TargetCommandRecord],
+    ) -> Result<(), StoreError>;
+    /// 取一条指令；无则 `None`。
+    async fn get_command(&self, command_id: &str) -> Result<Option<CommandRecord>, StoreError>;
+    /// 按幂等键查指令（跨重启的重放判定）。
+    async fn find_command_by_request_id(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<CommandRecord>, StoreError>;
+    /// 列表（新→旧），可按状态 / 种类过滤。
+    async fn list_commands(
+        &self,
+        state: Option<&str>,
+        kind: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<CommandRecord>, StoreError>;
+    /// 覆盖保存一条指令（状态流转 / 回填结果后重算聚合）。
+    async fn save_command(&self, command: &CommandRecord) -> Result<(), StoreError>;
+    /// 某指令的全部逐目标记录（按 target_id 排序）。
+    async fn list_target_commands(
+        &self,
+        command_id: &str,
+    ) -> Result<Vec<TargetCommandRecord>, StoreError>;
+    /// 按投递主键取一条目标记录；无则 `None`。
+    async fn get_target_command(
+        &self,
+        target_command_id: &str,
+    ) -> Result<Option<TargetCommandRecord>, StoreError>;
+    /// 覆盖保存一条目标记录（入队 / 回执）。
+    async fn save_target_command(&self, target: &TargetCommandRecord) -> Result<(), StoreError>;
+    /// 批量写入逐目标记录（dispatch 时展开；冲突 → `Conflict`）。
+    async fn insert_target_commands(
+        &self,
+        targets: &[TargetCommandRecord],
+    ) -> Result<(), StoreError>;
 }
 
 impl FileStore {
@@ -1393,6 +1443,152 @@ impl FileStore {
             snapshot.upgrade_plans.insert(0, plan.clone());
         })?;
         Ok(plan.clone())
+    }
+
+    /// 插入一条指令与逐目标记录（同一次文件写；`request_id` / `command_id` 重复 → Conflict）。
+    pub fn insert_command(
+        &self,
+        command: &CommandRecord,
+        targets: &[TargetCommandRecord],
+    ) -> Result<(), StoreError> {
+        self.update(|snapshot| {
+            if snapshot
+                .commands
+                .iter()
+                .any(|existing| existing.request_id == command.request_id)
+            {
+                return Err(StoreReason::Conflict
+                    .to_err()
+                    .with_detail(command.request_id.clone()));
+            }
+            if snapshot
+                .commands
+                .iter()
+                .any(|existing| existing.command_id == command.command_id)
+            {
+                return Err(StoreReason::Conflict
+                    .to_err()
+                    .with_detail(command.command_id.clone()));
+            }
+            snapshot.commands.insert(0, command.clone());
+            snapshot.target_commands.extend(targets.iter().cloned());
+            Ok(())
+        })?
+    }
+
+    pub fn get_command(&self, command_id: &str) -> Result<Option<CommandRecord>, StoreError> {
+        let snapshot = self.load()?;
+        Ok(snapshot
+            .commands
+            .into_iter()
+            .find(|command| command.command_id == command_id))
+    }
+
+    pub fn find_command_by_request_id(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<CommandRecord>, StoreError> {
+        let snapshot = self.load()?;
+        Ok(snapshot
+            .commands
+            .into_iter()
+            .find(|command| command.request_id == request_id))
+    }
+
+    pub fn list_commands(
+        &self,
+        state: Option<&str>,
+        kind: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<CommandRecord>, StoreError> {
+        let snapshot = self.load()?;
+        let mut commands: Vec<CommandRecord> = snapshot
+            .commands
+            .into_iter()
+            .filter(|command| state.is_none_or(|value| command.state == value))
+            .filter(|command| kind.is_none_or(|value| command.kind == value))
+            .collect();
+        commands.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        commands.truncate(limit);
+        Ok(commands)
+    }
+
+    pub fn save_command(&self, command: &CommandRecord) -> Result<(), StoreError> {
+        self.update(|snapshot| {
+            let Some(existing) = snapshot
+                .commands
+                .iter_mut()
+                .find(|existing| existing.command_id == command.command_id)
+            else {
+                return Err(StoreReason::Conflict
+                    .to_err()
+                    .with_detail(command.command_id.clone()));
+            };
+            *existing = command.clone();
+            Ok(())
+        })?
+    }
+
+    pub fn list_target_commands(
+        &self,
+        command_id: &str,
+    ) -> Result<Vec<TargetCommandRecord>, StoreError> {
+        let snapshot = self.load()?;
+        let mut targets: Vec<TargetCommandRecord> = snapshot
+            .target_commands
+            .into_iter()
+            .filter(|target| target.command_id == command_id)
+            .collect();
+        targets.sort_by(|left, right| left.target_id.cmp(&right.target_id));
+        Ok(targets)
+    }
+
+    pub fn get_target_command(
+        &self,
+        target_command_id: &str,
+    ) -> Result<Option<TargetCommandRecord>, StoreError> {
+        let snapshot = self.load()?;
+        Ok(snapshot
+            .target_commands
+            .into_iter()
+            .find(|target| target.target_command_id == target_command_id))
+    }
+
+    pub fn save_target_command(&self, target: &TargetCommandRecord) -> Result<(), StoreError> {
+        self.update(|snapshot| {
+            let Some(existing) = snapshot
+                .target_commands
+                .iter_mut()
+                .find(|existing| existing.target_command_id == target.target_command_id)
+            else {
+                return Err(StoreReason::Conflict
+                    .to_err()
+                    .with_detail(target.target_command_id.clone()));
+            };
+            *existing = target.clone();
+            Ok(())
+        })?
+    }
+
+    pub fn insert_target_commands(
+        &self,
+        targets: &[TargetCommandRecord],
+    ) -> Result<(), StoreError> {
+        self.update(|snapshot| {
+            for target in targets {
+                if snapshot
+                    .target_commands
+                    .iter()
+                    .any(|existing| existing.target_command_id == target.target_command_id)
+                {
+                    return Err(StoreReason::Conflict
+                        .to_err()
+                        .with_detail(target.target_command_id.clone()));
+                }
+            }
+            snapshot.target_commands.extend(targets.iter().cloned());
+            Ok(())
+        })?
     }
 
     /// 列表（新→旧）；顺手把模型升级前的旧记录折算成新形状（迁移，幂等）。
@@ -2049,6 +2245,63 @@ impl Store for FileStore {
         gateway_id: &str,
     ) -> Result<Vec<StoredAgent>, StoreError> {
         FileStore::list_agents_by_gateway(self, gateway_id)
+    }
+
+    async fn insert_command(
+        &self,
+        command: &CommandRecord,
+        targets: &[TargetCommandRecord],
+    ) -> Result<(), StoreError> {
+        FileStore::insert_command(self, command, targets)
+    }
+
+    async fn get_command(&self, command_id: &str) -> Result<Option<CommandRecord>, StoreError> {
+        FileStore::get_command(self, command_id)
+    }
+
+    async fn find_command_by_request_id(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<CommandRecord>, StoreError> {
+        FileStore::find_command_by_request_id(self, request_id)
+    }
+
+    async fn list_commands(
+        &self,
+        state: Option<&str>,
+        kind: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<CommandRecord>, StoreError> {
+        FileStore::list_commands(self, state, kind, limit)
+    }
+
+    async fn save_command(&self, command: &CommandRecord) -> Result<(), StoreError> {
+        FileStore::save_command(self, command)
+    }
+
+    async fn list_target_commands(
+        &self,
+        command_id: &str,
+    ) -> Result<Vec<TargetCommandRecord>, StoreError> {
+        FileStore::list_target_commands(self, command_id)
+    }
+
+    async fn get_target_command(
+        &self,
+        target_command_id: &str,
+    ) -> Result<Option<TargetCommandRecord>, StoreError> {
+        FileStore::get_target_command(self, target_command_id)
+    }
+
+    async fn save_target_command(&self, target: &TargetCommandRecord) -> Result<(), StoreError> {
+        FileStore::save_target_command(self, target)
+    }
+
+    async fn insert_target_commands(
+        &self,
+        targets: &[TargetCommandRecord],
+    ) -> Result<(), StoreError> {
+        FileStore::insert_target_commands(self, targets)
     }
 
     async fn mark_gateway_initializing(&self, gateway_id: &str) -> Result<(), StoreError> {

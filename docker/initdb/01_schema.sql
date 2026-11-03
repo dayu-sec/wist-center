@@ -250,3 +250,30 @@ CREATE TABLE IF NOT EXISTS gateway_wparse_tokens (
 );
 CREATE INDEX IF NOT EXISTS idx_gateway_wparse_tokens_hash
   ON gateway_wparse_tokens (token_sha256);
+
+-- 指令（Command）资源（center-open-api.md §6）：
+-- `commands` 是调用方语义层，`target_commands` 是逐目标投递层。
+-- 整条记录进 payload（与 upgrade_plans 同一写法），只把查询列单独落库。
+CREATE TABLE IF NOT EXISTS commands (
+  command_id TEXT PRIMARY KEY,
+  request_id TEXT NOT NULL UNIQUE,
+  kind TEXT NOT NULL,
+  state TEXT NOT NULL,
+  payload JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_commands_state ON commands (state, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_commands_kind ON commands (kind, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS target_commands (
+  target_command_id TEXT PRIMARY KEY,
+  command_id TEXT NOT NULL,
+  target_id TEXT NOT NULL,
+  state TEXT NOT NULL,
+  payload JSONB NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_target_commands_command
+  ON target_commands (command_id, target_id);
+CREATE INDEX IF NOT EXISTS idx_target_commands_target
+  ON target_commands (target_id);

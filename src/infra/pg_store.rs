@@ -10,6 +10,7 @@ use wist_error::{StoreError, StoreReason};
 
 use crate::config::GatewayCredentialSeed;
 
+use super::commands::{CommandRecord, TargetCommandRecord};
 use super::{
     CancelOutcome, EnrollmentTokenIssue, GatewayBindingAuditEvent, GatewayCustomerBindingRecord,
     GatewayStatusUpdate, JobProgress, JobRecord, LifecycleEvent, ReleaseRecord, Store, StoredAgent,
@@ -739,6 +740,236 @@ impl Store for PgStore {
         .await
         .source_raw_err(StoreReason::Sql, "list agents")?;
         Ok(rows.into_iter().map(AgentRow::into_stored).collect())
+    }
+
+    // ── 指令（Command）资源：整条记录进 payload，只把查询列单独落库 ──────────
+
+    async fn insert_command(
+        &self,
+        command: &CommandRecord,
+        targets: &[TargetCommandRecord],
+    ) -> Result<(), StoreError> {
+        let payload =
+            serde_json::to_value(command).source_err(StoreReason::Json, "serialize command")?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .source_raw_err(StoreReason::Sql, "begin command insert")?;
+        sqlx::query(
+            "INSERT INTO commands (command_id, request_id, kind, state, payload, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(&command.command_id)
+        .bind(&command.request_id)
+        .bind(&command.kind)
+        .bind(&command.state)
+        .bind(payload)
+        .bind(command.created_at.to_chrono())
+        .execute(&mut *tx)
+        .await
+        .map_err(|err| {
+            // 唯一键冲突（request_id / command_id）→ Conflict，由 API 映射 409。
+            if let sqlx::Error::Database(db) = &err
+                && db.code().as_deref() == Some("23505")
+            {
+                return StoreReason::Conflict
+                    .to_err()
+                    .with_detail(command.request_id.clone());
+            }
+            StoreReason::Sql.to_err().with_detail(err.to_string())
+        })?;
+        for target in targets {
+            let payload = serde_json::to_value(target)
+                .source_err(StoreReason::Json, "serialize target command")?;
+            sqlx::query(
+                "INSERT INTO target_commands \
+                     (target_command_id, command_id, target_id, state, payload, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+            )
+            .bind(&target.target_command_id)
+            .bind(&target.command_id)
+            .bind(&target.target_id)
+            .bind(&target.state)
+            .bind(payload)
+            .bind(target.updated_at.to_chrono())
+            .execute(&mut *tx)
+            .await
+            .source_raw_err(StoreReason::Sql, "insert target command")?;
+        }
+        tx.commit()
+            .await
+            .source_raw_err(StoreReason::Sql, "commit command insert")?;
+        Ok(())
+    }
+
+    async fn get_command(&self, command_id: &str) -> Result<Option<CommandRecord>, StoreError> {
+        let row: Option<(serde_json::Value,)> =
+            sqlx::query_as("SELECT payload FROM commands WHERE command_id = $1")
+                .bind(command_id)
+                .fetch_optional(&self.pool)
+                .await
+                .source_raw_err(StoreReason::Sql, "select command")?;
+        row.map(|(payload,)| serde_json::from_value(payload))
+            .transpose()
+            .source_err(StoreReason::Json, "deserialize command")
+    }
+
+    async fn find_command_by_request_id(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<CommandRecord>, StoreError> {
+        let row: Option<(serde_json::Value,)> =
+            sqlx::query_as("SELECT payload FROM commands WHERE request_id = $1")
+                .bind(request_id)
+                .fetch_optional(&self.pool)
+                .await
+                .source_raw_err(StoreReason::Sql, "select command by request_id")?;
+        row.map(|(payload,)| serde_json::from_value(payload))
+            .transpose()
+            .source_err(StoreReason::Json, "deserialize command")
+    }
+
+    async fn list_commands(
+        &self,
+        state: Option<&str>,
+        kind: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<CommandRecord>, StoreError> {
+        let rows: Vec<(serde_json::Value,)> = sqlx::query_as(
+            "SELECT payload FROM commands \
+             WHERE ($1::text IS NULL OR state = $1) \
+               AND ($2::text IS NULL OR kind = $2) \
+             ORDER BY created_at DESC LIMIT $3",
+        )
+        .bind(state)
+        .bind(kind)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .source_raw_err(StoreReason::Sql, "list commands")?;
+        rows.into_iter()
+            .map(|(payload,)| {
+                serde_json::from_value(payload).source_err(StoreReason::Json, "deserialize command")
+            })
+            .collect()
+    }
+
+    async fn save_command(&self, command: &CommandRecord) -> Result<(), StoreError> {
+        let payload =
+            serde_json::to_value(command).source_err(StoreReason::Json, "serialize command")?;
+        let affected =
+            sqlx::query("UPDATE commands SET payload = $2, state = $3 WHERE command_id = $1")
+                .bind(&command.command_id)
+                .bind(payload)
+                .bind(&command.state)
+                .execute(&self.pool)
+                .await
+                .source_raw_err(StoreReason::Sql, "update command")?;
+        if affected.rows_affected() == 0 {
+            return Err(StoreReason::Conflict
+                .to_err()
+                .with_detail(command.command_id.clone()));
+        }
+        Ok(())
+    }
+
+    async fn list_target_commands(
+        &self,
+        command_id: &str,
+    ) -> Result<Vec<TargetCommandRecord>, StoreError> {
+        let rows: Vec<(serde_json::Value,)> = sqlx::query_as(
+            "SELECT payload FROM target_commands WHERE command_id = $1 ORDER BY target_id",
+        )
+        .bind(command_id)
+        .fetch_all(&self.pool)
+        .await
+        .source_raw_err(StoreReason::Sql, "list target commands")?;
+        rows.into_iter()
+            .map(|(payload,)| {
+                serde_json::from_value(payload)
+                    .source_err(StoreReason::Json, "deserialize target command")
+            })
+            .collect()
+    }
+
+    async fn get_target_command(
+        &self,
+        target_command_id: &str,
+    ) -> Result<Option<TargetCommandRecord>, StoreError> {
+        let row: Option<(serde_json::Value,)> =
+            sqlx::query_as("SELECT payload FROM target_commands WHERE target_command_id = $1")
+                .bind(target_command_id)
+                .fetch_optional(&self.pool)
+                .await
+                .source_raw_err(StoreReason::Sql, "select target command")?;
+        row.map(|(payload,)| serde_json::from_value(payload))
+            .transpose()
+            .source_err(StoreReason::Json, "deserialize target command")
+    }
+
+    async fn save_target_command(&self, target: &TargetCommandRecord) -> Result<(), StoreError> {
+        let payload = serde_json::to_value(target)
+            .source_err(StoreReason::Json, "serialize target command")?;
+        let affected = sqlx::query(
+            "UPDATE target_commands SET payload = $2, state = $3, updated_at = $4 \
+             WHERE target_command_id = $1",
+        )
+        .bind(&target.target_command_id)
+        .bind(payload)
+        .bind(&target.state)
+        .bind(target.updated_at.to_chrono())
+        .execute(&self.pool)
+        .await
+        .source_raw_err(StoreReason::Sql, "update target command")?;
+        if affected.rows_affected() == 0 {
+            return Err(StoreReason::Conflict
+                .to_err()
+                .with_detail(target.target_command_id.clone()));
+        }
+        Ok(())
+    }
+
+    async fn insert_target_commands(
+        &self,
+        targets: &[TargetCommandRecord],
+    ) -> Result<(), StoreError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .source_raw_err(StoreReason::Sql, "begin target insert")?;
+        for target in targets {
+            let payload = serde_json::to_value(target)
+                .source_err(StoreReason::Json, "serialize target command")?;
+            sqlx::query(
+                "INSERT INTO target_commands \
+                     (target_command_id, command_id, target_id, state, payload, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+            )
+            .bind(&target.target_command_id)
+            .bind(&target.command_id)
+            .bind(&target.target_id)
+            .bind(&target.state)
+            .bind(payload)
+            .bind(target.updated_at.to_chrono())
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| {
+                if let sqlx::Error::Database(db) = &err
+                    && db.code().as_deref() == Some("23505")
+                {
+                    return StoreReason::Conflict
+                        .to_err()
+                        .with_detail(target.target_command_id.clone());
+                }
+                StoreReason::Sql.to_err().with_detail(err.to_string())
+            })?;
+        }
+        tx.commit()
+            .await
+            .source_raw_err(StoreReason::Sql, "commit target insert")?;
+        Ok(())
     }
 
     async fn mark_gateway_initializing(&self, gateway_id: &str) -> Result<(), StoreError> {

@@ -78,6 +78,7 @@ mod tests {
                 },
                 wparse_release: Default::default(),
                 log: Default::default(),
+                credentials: Default::default(),
             },
             store,
             artifact_store,
@@ -91,6 +92,7 @@ mod tests {
                 super::super::rate_limit::RateLimitState::default(),
             )),
             jobs,
+            credentials: None,
         }
     }
 

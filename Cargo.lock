@@ -83,6 +83,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
 name = "arc-swap"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3151,6 +3157,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
+name = "signal-hook-registry"
+version = "1.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
+dependencies = [
+ "errno",
+ "libc",
+]
+
+[[package]]
 name = "signature"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3610,6 +3626,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2 0.6.5",
  "tokio-macros",
  "windows-sys 0.61.2",
@@ -4196,17 +4213,20 @@ dependencies = [
 
 [[package]]
 name = "wist-auth"
-version = "0.1.1"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2115b61b4c87f042e6af7780362e9e8ebc9900214d4ebf0b775c0c06f4fc754c"
+checksum = "69420ddd0ef2d69c7f96b9fb469fbc9bcca0176c02e102dd87d391a139f3406f"
 dependencies = [
  "http 1.5.0",
+ "ring",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
 ]
 
 [[package]]
 name = "wist-center"
-version = "0.27.1"
+version = "0.28.0"
 dependencies = [
  "async-trait",
  "aws-sdk-s3",
@@ -4239,8 +4259,10 @@ dependencies = [
  "wist-auth",
  "wist-config",
  "wist-control",
+ "wist-cred-peer",
  "wist-error",
  "wist-log",
+ "wist-pki",
  "wist-release",
  "wist-shared",
  "x509-parser",
@@ -4270,6 +4292,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "wist-cred-peer"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6828e916c249702c9c1729b96c81cb62e41e941c8aac5ec1675764a8b7cfd01"
+dependencies = [
+ "anyhow",
+ "axum",
+ "hyper 1.12.0",
+ "hyper-util",
+ "rustls 0.23.46",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-rustls 0.26.6",
+ "tower",
+ "wist-auth",
+ "wist-pki",
+]
+
+[[package]]
 name = "wist-error"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4288,6 +4330,23 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "wist-pki"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7cecf13b6ba6ce5db8476ad7528497029cd36f5cb14acf553203d333ed5589b2"
+dependencies = [
+ "chrono",
+ "pem",
+ "rcgen",
+ "ring",
+ "rustls 0.23.46",
+ "rustls-pki-types",
+ "serde",
+ "time",
+ "x509-parser",
 ]
 
 [[package]]

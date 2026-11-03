@@ -111,6 +111,35 @@ max_targets = 20
 # 例：gateway_credentials = ["gw-demo:change-me"]
 gateway_credentials = []
 
+# ── 程序访问凭据（wist-cred 验证方）─────────────────────────────────────────
+#
+# 启用后中心会多起一个**内网 mTLS listener**（客户端证书由 CA-I 签），接收 cred 推来的
+# 凭据摘要（只存 sha256），并让管理面的 `Authorization: Bearer <token>` 先按这张表验。
+#
+# 材料来自 cred 的一次性接入命令（`--dir` 指定的目录）：
+#   server.crt     本 listener 的服务器证书，**必须由 CA-S 签**（cred 的唯一信任锚）；
+#   server.key     对应私钥（本机生成，永不上送）；
+#   client-ca.pem  CA-I 的公开证书（验 cred 的客户端证书）。
+# 注意：本 listener 的服务器证书与网关面的 `server.server_cert_path` **不是同一张**。
+#
+# 角色：`admin` 可进管理面，`read` 只读。凭据签发时选 `admin` 才能调 `/api/v1/admin/**`。
+[credentials]
+enabled = false
+listen_addr = "0.0.0.0:3103"
+store_path = "state/credentials.json"
+audience = "wist-center"
+allowed_issuers = ["wist-cred"]
+known_roles = ["admin", "read"]
+admin_roles = ["admin"]
+server_cert_path = ""
+server_key_path = ""
+client_ca_path = ""
+# 要求每条授权记录带签发方签名（推荐恒开）：收到时验一次，从磁盘加载时再验一次。
+# 公钥由 cred 接入包下发（`issuer-signing.pub`，裸 32 字节 hex；**一行一把**，
+# 轮换期可同时放新旧两把）。灰度窗口可先设 false（文件缺失不阻断启动）。
+require_signature = true
+issuer_public_key_path = ""
+
 # ── 可选：本进程运行日志（缺省 info / text / stderr；`RUST_LOG` 环境变量优先）──
 # [log]
 # level  = "info"                       # 或 "wist_center=debug,sqlx=warn"

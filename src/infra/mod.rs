@@ -1,5 +1,7 @@
 pub mod artifacts;
 pub use artifacts::*;
+pub mod commands;
+pub use commands::*;
 pub mod cos;
 pub use cos::*;
 pub mod gateway_ca;

@@ -14,12 +14,15 @@ use axum::{
 
 use wist_control::ControlCenterTrustBundle;
 
-use crate::{config::CenterConfig, infra::ArtifactStore, infra::Store};
+use crate::{
+    config::CenterConfig, credentials::CredentialVerifier, infra::ArtifactStore, infra::Store,
+};
 
 mod admin_auth;
 mod admin_ops;
 /// 稳定错误码词表（`{ "error": { "code": … } }` 里 `code` 的唯一来源）。
 pub mod codes;
+mod commands;
 pub mod error;
 pub use error::{ApiError, ProtocolError, ProtocolErrorEnvelope, Severity};
 mod extract;
@@ -68,17 +71,17 @@ pub(crate) fn is_tag_safe(value: &str) -> bool {
 use admin_ops::{
     admin_advance_upgrade_plan, admin_approve_upgrade_plan, admin_bind_gateway_customer,
     admin_cancel_job, admin_create_gateway_instance, admin_create_upgrade_plan,
-    admin_delete_upgrade_plan, admin_dispatch_agent_fleet_command, admin_dispatch_global_policy,
-    admin_get_agent_history, admin_get_gateway_history, admin_get_gateway_initial_config,
-    admin_get_gateway_uptime, admin_get_job, admin_get_release_job, admin_latest_bind_command,
-    admin_list_gateway_agents, admin_list_gateway_binding_history, admin_list_gateway_instances,
-    admin_list_gateway_lifecycle, admin_list_gateway_status, admin_list_jobs,
-    admin_list_package_sources, admin_list_release_jobs, admin_list_releases,
-    admin_list_upgrade_plans, admin_package_source_latest, admin_publish_release,
-    admin_publish_release_batch, admin_resolve_cos, admin_resolve_github_release,
-    admin_retry_upgrade_plan, admin_rotate_gateway_link_token, admin_set_gateway_archived,
-    admin_set_release_status, admin_set_upgrade_plan_archived, admin_show_gateway_status,
-    admin_view_gateway_list, admin_view_upgrade_plan,
+    admin_delete_upgrade_plan, admin_dispatch_global_policy, admin_get_agent_history,
+    admin_get_gateway_history, admin_get_gateway_initial_config, admin_get_gateway_uptime,
+    admin_get_job, admin_get_release_job, admin_latest_bind_command, admin_list_gateway_agents,
+    admin_list_gateway_binding_history, admin_list_gateway_instances, admin_list_gateway_lifecycle,
+    admin_list_gateway_status, admin_list_jobs, admin_list_package_sources,
+    admin_list_release_jobs, admin_list_releases, admin_list_upgrade_plans,
+    admin_package_source_latest, admin_publish_release, admin_publish_release_batch,
+    admin_resolve_cos, admin_resolve_github_release, admin_retry_upgrade_plan,
+    admin_rotate_gateway_link_token, admin_set_gateway_archived, admin_set_release_status,
+    admin_set_upgrade_plan_archived, admin_show_gateway_status, admin_view_gateway_list,
+    admin_view_upgrade_plan,
 };
 use gateway_ops::{
     download_release_artifact, get_gateway_initial_config, get_gateway_upgrade_plan,
@@ -114,6 +117,8 @@ pub struct ApiState {
     pub proxy: Option<Arc<crate::wparse_proxy::WparseProxy>>,
     /// 远程包下载任务的串行队列（发布端点只入队，worker 后台取包 / 校验 / 镜像 / 落库）。
     pub jobs: Arc<crate::infra::JobQueue>,
+    /// 程序访问凭据（`[credentials]` 启用时存在）：管理面 Bearer token 先在这里验。
+    pub credentials: Option<CredentialVerifier>,
 }
 
 /// 控制中心是否要求 TLS：按 `public_url` scheme 推导（https → true，http → false）。
@@ -189,8 +194,16 @@ pub fn router(
     store: Arc<dyn Store>,
     gateway_ca: Arc<crate::infra::gateway_ca::GatewayCa>,
     proxy: Option<Arc<crate::wparse_proxy::WparseProxy>>,
+    credentials: Option<CredentialVerifier>,
 ) -> Router {
-    router_for(state_of(config, store, gateway_ca, proxy, true))
+    router_for(state_of(
+        config,
+        store,
+        gateway_ca,
+        proxy,
+        credentials,
+        true,
+    ))
 }
 
 /// 构造共享状态（两个监听面各用一份，字段都是 `Arc` / `Clone`）。
@@ -202,6 +215,7 @@ fn state_of(
     store: Arc<dyn Store>,
     gateway_ca: Arc<crate::infra::gateway_ca::GatewayCa>,
     proxy: Option<Arc<crate::wparse_proxy::WparseProxy>>,
+    credentials: Option<CredentialVerifier>,
     start_release_worker: bool,
 ) -> ApiState {
     let artifact_store = crate::infra::build_artifact_store(&config);
@@ -220,6 +234,7 @@ fn state_of(
         gateway_ca,
         proxy,
         jobs,
+        credentials,
     }
 }
 
@@ -269,9 +284,10 @@ pub fn gateway_router(
     store: Arc<dyn Store>,
     gateway_ca: Arc<crate::infra::gateway_ca::GatewayCa>,
     proxy: Option<Arc<crate::wparse_proxy::WparseProxy>>,
+    credentials: Option<CredentialVerifier>,
 ) -> Router {
     scoped_router(
-        state_of(config, store, gateway_ca, proxy, false),
+        state_of(config, store, gateway_ca, proxy, credentials, false),
         ListenerScope::Gateway,
     )
 }
@@ -282,9 +298,10 @@ pub fn admin_router(
     store: Arc<dyn Store>,
     gateway_ca: Arc<crate::infra::gateway_ca::GatewayCa>,
     proxy: Option<Arc<crate::wparse_proxy::WparseProxy>>,
+    credentials: Option<CredentialVerifier>,
 ) -> Router {
     scoped_router(
-        state_of(config, store, gateway_ca, proxy, true),
+        state_of(config, store, gateway_ca, proxy, credentials, true),
         ListenerScope::Admin,
     )
 }
@@ -381,10 +398,31 @@ pub fn router_for(state: ApiState) -> Router {
             "/api/v1/admin/policies/global",
             post(admin_dispatch_global_policy),
         )
-        // 管理面：下发 Agent 舰队指令（DispatchAgentFleetCommandFlow）
+        // 管理面：指令资源（center-open-api.md §6）。create / dispatch / cancel / 查询。
+        .route(
+            "/api/v1/admin/commands",
+            post(commands::create_command).get(commands::list_commands),
+        )
+        .route(
+            "/api/v1/admin/commands/{command_id}",
+            get(commands::get_command),
+        )
+        .route(
+            "/api/v1/admin/commands/{command_id}/targets/{target_command_id}",
+            get(commands::get_target_command),
+        )
+        .route(
+            "/api/v1/admin/commands/{command_id}/dispatch",
+            post(commands::dispatch_command),
+        )
+        .route(
+            "/api/v1/admin/commands/{command_id}/cancel",
+            post(commands::cancel_command),
+        )
+        // 旧入口：一个发布周期后删除（410 + Location）。
         .route(
             "/api/v1/gateway/agents/dispatch",
-            post(admin_dispatch_agent_fleet_command),
+            post(commands::agent_fleet_dispatch_moved),
         )
         // 管理面：创建网关实例（AdminCreateGatewayInstance，POST /api/v1/admin/gateways/instances）
         .route(

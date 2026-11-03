@@ -1420,6 +1420,7 @@ mod tests {
                 },
                 wparse_release: Default::default(),
                 log: Default::default(),
+                credentials: Default::default(),
             },
             store: std::sync::Arc::new(store),
             artifact_store: std::sync::Arc::new(crate::infra::LocalArtifactStore::new(
@@ -1432,6 +1433,7 @@ mod tests {
                 super::super::rate_limit::RateLimitState::default(),
             )),
             jobs: inert_jobs(),
+            credentials: None,
         }
     }
 
@@ -1489,6 +1491,7 @@ mod tests {
                 },
                 wparse_release: Default::default(),
                 log: Default::default(),
+                credentials: Default::default(),
             },
             store: std::sync::Arc::new(store),
             artifact_store: std::sync::Arc::new(crate::infra::LocalArtifactStore::new(
@@ -1501,6 +1504,7 @@ mod tests {
                 super::super::rate_limit::RateLimitState::default(),
             )),
             jobs: inert_jobs(),
+            credentials: None,
         }
     }
 
@@ -1545,6 +1549,7 @@ mod tests {
                 },
                 wparse_release: Default::default(),
                 log: Default::default(),
+                credentials: Default::default(),
             },
             store: std::sync::Arc::new(store),
             artifact_store: std::sync::Arc::new(crate::infra::LocalArtifactStore::new(
@@ -1557,6 +1562,7 @@ mod tests {
                 super::super::rate_limit::RateLimitState::default(),
             )),
             jobs: inert_jobs(),
+            credentials: None,
         }
     }
 
@@ -3699,6 +3705,7 @@ mod tests {
                 },
                 wparse_release: Default::default(),
                 log: Default::default(),
+                credentials: Default::default(),
             },
             store: std::sync::Arc::new(file_store),
             artifact_store: std::sync::Arc::new(crate::infra::LocalArtifactStore::new(
@@ -3711,6 +3718,7 @@ mod tests {
                 super::super::rate_limit::RateLimitState::default(),
             )),
             jobs: inert_jobs(),
+            credentials: None,
         };
         let app = super::super::router_for(state);
         let response = app

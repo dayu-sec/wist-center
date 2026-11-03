@@ -90,6 +90,18 @@ const DEFAULT_PROTOCOL_VERSION: &str = "1.0";
 /// 仅开发态兜底：未配置 hmac_secret 时用它派生注册凭据（生产必须显式配置）。
 const DEV_HMAC_SECRET: &str = "dev-center-hmac-secret-change-me";
 const DEFAULT_CREDENTIAL_TTL_SECONDS: i64 = 30 * 24 * 3600;
+/// 凭据服务默认受众：必须与 cred 侧认证系统的 `name` 一致（`wist-center`）。
+const DEFAULT_CREDENTIALS_AUDIENCE: &str = "wist-center";
+/// 凭据服务默认接收地址（容器内）；未启用时无意义。
+const DEFAULT_CREDENTIALS_LISTEN: &str = "0.0.0.0:3103";
+/// 凭据摘要表落点（只存 sha256），相对配置目录解析。
+const DEFAULT_CREDENTIALS_STORE_PATH: &str = "state/credentials.json";
+/// 允许的签发方（cred 客户端证书的身份）。
+const DEFAULT_CREDENTIALS_ISSUERS: &[&str] = &["wist-cred"];
+/// 本服务认识的角色：`admin` 进管理面，`read` 只读。
+const DEFAULT_CREDENTIALS_KNOWN_ROLES: &[&str] = &["admin", "read"];
+/// 进管理面所需角色（空 = 不按角色卡）。
+const DEFAULT_CREDENTIALS_ADMIN_ROLES: &[&str] = &["admin"];
 /// 一次性接入券（link）的**短 TTL** 默认值：15 分钟（带外交付 + 现场执行的短窗口）。
 const DEFAULT_LINK_TTL_SECONDS: i64 = 15 * 60;
 /// 规则发布 tag 列表缓存默认值（秒）。
@@ -168,8 +180,94 @@ pub struct CenterConfig {
     pub wparse_proxy: WparseProxyConfig,
     /// 规则 / 配置发布入口（`[wparse_release]`）：两个可配置 repo 的 tag 候选与发布。
     pub wparse_release: WparseReleaseConfig,
+    /// 程序访问凭据（`[credentials]`）：接收 `wist-cred` 推来的摘要，本地验 token。
+    pub credentials: CredentialsConfig,
     /// `[log]` 段：本进程运行日志（级别 / 格式 / 落点 / 轮转）。
     pub log: wist_log::LogSection,
+}
+
+/// 程序访问凭据（`[credentials]`）：与 `wist-cred` 的「验证方（X）」契约。
+///
+/// 本服务只做三件事：
+/// 1. 起一个 **mTLS listener**（客户端证书由 CA-I 签）接收 `register` / `revoke`；
+/// 2. 把摘要表落本地（只存 sha256，重启不丢）；
+/// 3. 管理面请求带 `Authorization: Bearer <token>` 时，先按这张表验。
+///
+/// 状态**不在 PG 里**：摘要表是验证侧的私有状态，与业务库拆开（换库不影响认证）。
+#[derive(Debug, Clone)]
+pub struct CredentialsConfig {
+    /// 总开关。关闭时既不起 listener，也不参与管理面鉴权。
+    pub enabled: bool,
+    /// mTLS listener 地址（**内网**；与网关面/管理面分开）。
+    pub listen_addr: Option<String>,
+    /// 摘要表落点（只存 sha256）。
+    pub store_path: PathBuf,
+    /// 本服务的名字，也是凭据的 `audience`；必须与 cred 侧的认证系统名一致。
+    pub audience: String,
+    /// 允许的签发方（cred 客户端证书的身份）。空 = 拒绝一切推送。
+    pub allowed_issuers: Vec<String>,
+    /// 本服务认识的角色。不在其中的角色会被裁剪掉。
+    pub known_roles: Vec<String>,
+    /// 进管理面所需角色（交集非空即通过；空 = 不按角色卡）。
+    pub admin_roles: Vec<String>,
+    /// listener 的服务器证书/私钥：必须由 **CA-S** 签（cred 的 `[push].ca` 是唯一信任锚）。
+    /// 与网关面用的 `server.server_cert_path` **不是同一张**——中心自己的 CA 不被 cred 信任。
+    pub server_cert_path: Option<PathBuf>,
+    pub server_key_path: Option<PathBuf>,
+    /// 客户端信任锚：CA-I 的公开证书（验 cred 出示的客户端证书）。
+    pub client_ca_path: Option<PathBuf>,
+    /// 要求每条授权记录带签发方签名（推荐恒开）：
+    /// 收到时验一次，从磁盘加载时再验一次；验不过就拒收 / 丢弃。
+    pub require_signature: bool,
+    /// 签发方 Ed25519 公钥（裸 32 字节 hex 文本），由 cred 接入包下发。
+    /// `require_signature = true` 时必填。
+    pub issuer_public_key_path: Option<PathBuf>,
+}
+
+impl Default for CredentialsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_addr: None,
+            store_path: PathBuf::from(DEFAULT_CREDENTIALS_STORE_PATH),
+            audience: DEFAULT_CREDENTIALS_AUDIENCE.to_string(),
+            allowed_issuers: DEFAULT_CREDENTIALS_ISSUERS
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+            known_roles: DEFAULT_CREDENTIALS_KNOWN_ROLES
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+            admin_roles: DEFAULT_CREDENTIALS_ADMIN_ROLES
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+            server_cert_path: None,
+            server_key_path: None,
+            client_ca_path: None,
+            require_signature: true,
+            issuer_public_key_path: None,
+        }
+    }
+}
+
+impl CredentialsConfig {
+    /// listener 实际监听地址（启用时必填；未配置则用默认值）。
+    pub fn listen(&self) -> &str {
+        self.listen_addr
+            .as_deref()
+            .unwrap_or(DEFAULT_CREDENTIALS_LISTEN)
+    }
+
+    /// 某个角色集合是否能进管理面。`admin_roles` 为空 = 不按角色卡。
+    pub fn grants_admin(&self, roles: &[String]) -> bool {
+        self.admin_roles.is_empty()
+            || self
+                .admin_roles
+                .iter()
+                .any(|required| roles.iter().any(|role| role == required))
+    }
 }
 
 /// 规则 / 配置发布入口配置（`[wparse_release]`）。
@@ -329,6 +427,7 @@ struct RawCenterConfig {
     enrollment: RawEnrollmentConfig,
     wparse_proxy: RawWparseProxyConfig,
     wparse_release: RawWparseReleaseConfig,
+    credentials: RawCredentialsConfig,
     log: wist_log::LogSection,
 }
 
@@ -419,6 +518,22 @@ struct RawWparseRepo {
     repo: String,
     token: Option<String>,
     tags_limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawCredentialsConfig {
+    enabled: Option<bool>,
+    listen_addr: Option<String>,
+    store_path: Option<String>,
+    audience: Option<String>,
+    allowed_issuers: Option<Vec<String>>,
+    known_roles: Option<Vec<String>>,
+    admin_roles: Option<Vec<String>>,
+    server_cert_path: Option<String>,
+    server_key_path: Option<String>,
+    client_ca_path: Option<String>,
+    require_signature: Option<bool>,
+    issuer_public_key_path: Option<String>,
 }
 
 /// 默认配置文件路径：**当前工作目录**下的 `wist-center.toml`（与 gateway 同口径）。
@@ -532,6 +647,7 @@ impl CenterConfig {
         let artifacts = raw.artifacts;
         let package_sources = normalize_package_sources(raw.packages.sources)?;
         let wparse_release = normalize_wparse_release(raw.wparse_release)?;
+        let credentials = normalize_credentials(raw.credentials, config_dir)?;
         let admin_token = normalize_optional(serve.admin_token);
         // 对象存储：endpoint/bucket/凭据四项齐全才启用（否则用本地文件）。
         let object_storage = match (
@@ -628,6 +744,7 @@ impl CenterConfig {
                     .unwrap_or_else(|| "0.0.0.0:3101".to_string()),
             },
             wparse_release,
+            credentials,
             log,
         })
     }
@@ -652,6 +769,7 @@ impl CenterConfig {
             self.credential_ttl_seconds,
         )?;
         require_positive_seconds("security.link_ttl_seconds", self.link_ttl_seconds)?;
+        self.credentials.validate()?;
         // 服务端 TLS：证书与私钥要么都配（起 HTTPS），要么都不配（明文 HTTP）；
         // 配了就要求文件可读（fail-fast，避免启到一半才握手失败）。
         match (&self.server_cert_path, &self.server_key_path) {
@@ -677,6 +795,87 @@ impl CenterConfig {
         }
         Ok(())
     }
+}
+
+impl CredentialsConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        require_non_empty("credentials.listen_addr", self.listen())?;
+        require_non_empty("credentials.audience", &self.audience)?;
+        if self.allowed_issuers.is_empty() {
+            return Err(config_validation(
+                "credentials.allowed_issuers must contain at least one issuer (empty means nothing can be pushed)",
+            ));
+        }
+        // `admin_roles` 必须落在 `known_roles` 里：否则 cred 发出来的角色会被裁剪掉，
+        // 结果是「配了管理角色但永远进不去」，排障成本很高。
+        for role in &self.admin_roles {
+            if !self.known_roles.iter().any(|known| known == role) {
+                return Err(config_validation(format!(
+                    "credentials.admin_roles contains {role:?}, which is not in credentials.known_roles"
+                )));
+            }
+        }
+        let mut required = vec![
+            ("credentials.server_cert_path", &self.server_cert_path),
+            ("credentials.server_key_path", &self.server_key_path),
+            ("credentials.client_ca_path", &self.client_ca_path),
+        ];
+        if self.require_signature {
+            required.push((
+                "credentials.issuer_public_key_path",
+                &self.issuer_public_key_path,
+            ));
+        }
+        for (label, path) in required {
+            let Some(path) = path else {
+                return Err(config_validation(format!(
+                    "{label} is required when credentials.enabled = true"
+                )));
+            };
+            if !path.exists() {
+                return Err(config_validation(format!(
+                    "{label} not found: {}",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `[credentials]` → 内部结构。路径按配置目录解析；未配置的项回落默认值。
+fn normalize_credentials(
+    raw: RawCredentialsConfig,
+    config_dir: &Path,
+) -> Result<CredentialsConfig, ConfigError> {
+    let defaults = CredentialsConfig::default();
+    let path = |value: Option<String>| {
+        normalize_optional(value).map(|value| absolutize_path(config_dir, Path::new(&value)))
+    };
+    Ok(CredentialsConfig {
+        enabled: raw.enabled.unwrap_or(defaults.enabled),
+        listen_addr: normalize_optional(raw.listen_addr),
+        store_path: raw
+            .store_path
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| absolutize_path(config_dir, Path::new(&value)))
+            .unwrap_or_else(|| absolutize_path(config_dir, &defaults.store_path)),
+        audience: raw
+            .audience
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(defaults.audience),
+        allowed_issuers: raw.allowed_issuers.unwrap_or(defaults.allowed_issuers),
+        known_roles: raw.known_roles.unwrap_or(defaults.known_roles),
+        admin_roles: raw.admin_roles.unwrap_or(defaults.admin_roles),
+        server_cert_path: path(raw.server_cert_path),
+        server_key_path: path(raw.server_key_path),
+        client_ca_path: path(raw.client_ca_path),
+        require_signature: raw.require_signature.unwrap_or(defaults.require_signature),
+        issuer_public_key_path: path(raw.issuer_public_key_path),
+    })
 }
 
 /// 默认控制中心 CA 证书路径（信任根，分发给网关作 control_center.trust_bundle）：
@@ -729,6 +928,13 @@ fn expand_raw_env(raw: &mut RawCenterConfig, env: &EnvDict) -> Result<(), Config
         &mut raw.artifacts.dir,
         &mut raw.artifacts.gateway_image,
         &mut raw.artifacts.gateway_project_repo,
+        &mut raw.credentials.listen_addr,
+        &mut raw.credentials.store_path,
+        &mut raw.credentials.audience,
+        &mut raw.credentials.server_cert_path,
+        &mut raw.credentials.server_key_path,
+        &mut raw.credentials.client_ca_path,
+        &mut raw.credentials.issuer_public_key_path,
         &mut raw.artifacts.object_storage_endpoint,
         &mut raw.artifacts.object_storage_bucket,
         &mut raw.artifacts.object_storage_access_key,
@@ -2132,5 +2338,202 @@ hmac_secret = "hmac"
         let config = CenterConfig::load_from_path(&path).expect("config loads");
         assert!(!config.wparse_proxy.enabled);
         assert_eq!(config.wparse_proxy.listen_addr, "0.0.0.0:3101");
+    }
+
+    // ── 程序访问凭据（credentials）────────────────────────────────────────
+
+    #[test]
+    fn credentials_are_disabled_and_defaulted_when_absent() {
+        let _guard = env_guard();
+        let path = write_temp_config(
+            r#"
+[server]
+listen_addr = "127.0.0.1:3999"
+public_url = "https://center.example.com"
+admin_token = "tok"
+
+[security]
+hmac_secret = "hmac"
+"#,
+        );
+        let config = CenterConfig::load_from_path(&path).expect("config loads");
+        assert!(!config.credentials.enabled);
+        assert_eq!(config.credentials.audience, "wist-center");
+        assert_eq!(config.credentials.known_roles, ["admin", "read"]);
+        assert_eq!(config.credentials.admin_roles, ["admin"]);
+        assert_eq!(config.credentials.allowed_issuers, ["wist-cred"]);
+        // 相对路径按配置目录解析。
+        assert_eq!(
+            config.credentials.store_path,
+            path.parent().unwrap().join("state/credentials.json")
+        );
+        // `grants_admin`：admin 角色进管理面，read 角色只能读。
+        assert!(config.credentials.grants_admin(&["admin".to_string()]));
+        assert!(!config.credentials.grants_admin(&["read".to_string()]));
+        assert!(
+            config
+                .credentials
+                .grants_admin(&["read".to_string(), "admin".to_string()])
+        );
+    }
+
+    #[test]
+    fn empty_admin_roles_means_no_role_gate() {
+        let config = CredentialsConfig {
+            admin_roles: Vec::new(),
+            ..CredentialsConfig::default()
+        };
+        assert!(config.grants_admin(&["read".to_string()]));
+        assert!(config.grants_admin(&[]));
+    }
+
+    #[test]
+    fn credentials_enabled_requires_tls_material() {
+        let _guard = env_guard();
+        let path = write_temp_config(
+            r#"
+[server]
+listen_addr = "127.0.0.1:3999"
+public_url = "https://center.example.com"
+admin_token = "tok"
+
+[security]
+hmac_secret = "hmac"
+
+[credentials]
+enabled = true
+listen_addr = "127.0.0.1:3103"
+"#,
+        );
+        let err = CenterConfig::load_from_path(&path).unwrap_err();
+        assert!(
+            format!("{err}").contains("credentials.server_cert_path"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn credentials_admin_roles_must_be_known() {
+        let _guard = env_guard();
+        let dir = env::temp_dir().join(format!("wist-center-cred-roles-{}", unique_suffix()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        for name in ["server.crt", "server.key", "client-ca.pem"] {
+            fs::write(dir.join(name), "x").expect("write material");
+        }
+        let path = dir.join(CONFIG_FILE);
+        fs::write(
+            &path,
+            r#"
+[server]
+listen_addr = "127.0.0.1:3999"
+public_url = "https://center.example.com"
+admin_token = "tok"
+
+[security]
+hmac_secret = "hmac"
+
+[credentials]
+enabled = true
+listen_addr = "127.0.0.1:3103"
+known_roles = ["read"]
+admin_roles = ["admin"]
+server_cert_path = "server.crt"
+server_key_path = "server.key"
+client_ca_path = "client-ca.pem"
+"#,
+        )
+        .expect("write config");
+        let err = CenterConfig::load_from_path(&path).unwrap_err();
+        assert!(
+            format!("{err}").contains("not in credentials.known_roles"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn credentials_accept_existing_material() {
+        let _guard = env_guard();
+        let dir = env::temp_dir().join(format!("wist-center-cred-ok-{}", unique_suffix()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        for name in ["server.crt", "server.key", "client-ca.pem"] {
+            fs::write(dir.join(name), "x").expect("write material");
+        }
+        fs::write(dir.join("issuer-signing.pub"), "ab".repeat(32)).expect("write pubkey");
+        let path = dir.join(CONFIG_FILE);
+        fs::write(
+            &path,
+            r#"
+[server]
+listen_addr = "127.0.0.1:3999"
+public_url = "https://center.example.com"
+admin_token = "tok"
+
+[security]
+hmac_secret = "hmac"
+
+[credentials]
+enabled = true
+listen_addr = "127.0.0.1:3103"
+audience = "wist-center"
+server_cert_path = "server.crt"
+server_key_path = "server.key"
+client_ca_path = "client-ca.pem"
+require_signature = true
+issuer_public_key_path = "issuer-signing.pub"
+"#,
+        )
+        .expect("write config");
+        let config = CenterConfig::load_from_path(&path).expect("config loads");
+        assert!(config.credentials.enabled);
+        assert!(config.credentials.require_signature);
+        assert_eq!(config.credentials.listen(), "127.0.0.1:3103");
+        assert_eq!(
+            config.credentials.server_cert_path,
+            Some(dir.join("server.crt"))
+        );
+        assert_eq!(
+            config.credentials.client_ca_path,
+            Some(dir.join("client-ca.pem"))
+        );
+        assert_eq!(
+            config.credentials.issuer_public_key_path,
+            Some(dir.join("issuer-signing.pub"))
+        );
+    }
+
+    #[test]
+    fn credentials_require_a_public_key_when_signature_is_required() {
+        let _guard = env_guard();
+        let dir = env::temp_dir().join(format!("wist-center-cred-pub-{}", unique_suffix()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        for name in ["server.crt", "server.key", "client-ca.pem"] {
+            fs::write(dir.join(name), "x").expect("write material");
+        }
+        let path = dir.join(CONFIG_FILE);
+        fs::write(
+            &path,
+            r#"
+[server]
+listen_addr = "127.0.0.1:3999"
+public_url = "https://center.example.com"
+admin_token = "tok"
+
+[security]
+hmac_secret = "hmac"
+
+[credentials]
+enabled = true
+listen_addr = "127.0.0.1:3103"
+server_cert_path = "server.crt"
+server_key_path = "server.key"
+client_ca_path = "client-ca.pem"
+"#,
+        )
+        .expect("write config");
+        let err = CenterConfig::load_from_path(&path).unwrap_err();
+        assert!(
+            format!("{err}").contains("credentials.issuer_public_key_path"),
+            "unexpected error: {err}"
+        );
     }
 }

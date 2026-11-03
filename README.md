@@ -139,6 +139,41 @@ In the file:
   never clobbers the site's public URL, and re-rendering the declaration never clobbers the value
   (the value is not in there).
 
+### Program credentials (`wist-cred` verifier)
+
+`wist-center` can act as a verifier (the “X” side) of [`wist-cred`](https://github.com/dayu-sec/wist-cred).
+When `[credentials].enabled = true` the process starts a **separate internal mTLS listener**
+(default `0.0.0.0:3103`, container port `3103`) that accepts credential digests pushed by cred and
+answers `/healthz` for the heartbeat. The admin plane then accepts `Authorization: Bearer <token>`
+from a credential **before** falling back to the legacy `server.admin_token` (break-glass only —
+matches are logged at `warn`).
+
+```toml
+[credentials]
+enabled = true
+listen_addr = "0.0.0.0:3103"
+store_path = "state/credentials.json"   # sha256 digests only; not in PostgreSQL
+audience = "wist-center"                # must equal the cred authentication-system name
+allowed_issuers = ["wist-cred"]         # client certificate identity signed by CA-I
+known_roles = ["admin", "read"]
+admin_roles = ["admin"]                 # empty = no role gate
+server_cert_path = "/wist-center/ca/cred/server.crt"   # signed by cred's CA-S
+server_key_path = "/wist-center/ca/cred/server.key"
+client_ca_path = "/wist-center/ca/cred/client-ca.pem"   # CA-I public certificate
+```
+
+The TLS material and the issuer signing public key are produced by cred’s one-shot onboarding
+command (private keys are generated on this host; only a CSR is sent to cred). They are **not** the same server certificate used by the
+gateway plane: cred only trusts certificates signed by its own CA-S. The digest store is verifier
+state, not business data — it survives restarts and is deliberately kept out of PostgreSQL.
+
+Roles: a credential with `admin` reaches `/api/v1/admin/**`; `read` authenticates but gets
+`403 admin_role_required`. Unusable credentials get distinct `401` codes so clients can react:
+`admin_credential_expired` (renew it), `admin_credential_revoked`, `admin_credential_unknown`;
+any other invalid token still gets `invalid_admin_bearer_token` (the break-glass token is tried
+first in every case). With both `[credentials]` and `server.admin_token`
+absent, the admin plane keeps the development behaviour of accepting unauthenticated requests.
+
 ### Package sources (auto-detect the latest)
 
 The install-package entry does **not** ask for a version after the first import. It takes the most
@@ -289,7 +324,11 @@ All require the admin Bearer token:
 | `GET` | `/api/v1/admin/gateways/:gateway_id/config` |
 | `POST` | `/api/v1/admin/gateways/bind` |
 | `POST` | `/api/v1/admin/policies/global` |
-| `POST` | `/api/v1/gateway/agents/dispatch` |
+| `POST` / `GET` | `/api/v1/admin/commands` |
+| `POST` | `/api/v1/admin/commands/:command_id/dispatch` |
+| `POST` | `/api/v1/admin/commands/:command_id/cancel` |
+| `GET` | `/api/v1/admin/commands/:command_id` |
+| `GET` | `/api/v1/admin/commands/:command_id/targets/:target_command_id` |
 | `GET` | `/api/v1/admin/package-sources` |
 | `GET` | `/api/v1/admin/package-sources/latest` (`?component=…&base_version=…&source=…`) |
 | `POST` / `GET` | `/api/v1/admin/releases/:component`（POST 只入队；`Prefer: respond-async` → 202 job） |
@@ -317,8 +356,12 @@ All require the admin Bearer token:
 > same rows — filtering happens in the store, before `limit`, so a busy queue can't push the
 > tasks you asked for out of the window.
 
-> `POST /api/v1/gateway/agents/dispatch` sits under the `/gateway/` prefix but is an admin-side
-> command (dispatching an agent-fleet command), so it takes the admin token.
+> `POST /api/v1/gateway/agents/dispatch` is retired: it used to sit under the `/gateway/` prefix
+> while requiring the admin token, which was the wrong face. It now returns `410 Gone` with
+> `Location: /api/v1/admin/commands`. The new entry point is `POST /api/v1/admin/commands`
+> and requires an `Idempotency-Key` header. The current implementation enables two kinds
+> (`gateway.diagnose`, `gateway.restart-process`); other kinds return `command_kind_not_allowed`.
+> Contract: `wist-design/doc/design/center/center-open-api.md` §6.
 
 ### Unauthenticated
 

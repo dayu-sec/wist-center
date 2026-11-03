@@ -173,6 +173,12 @@ pub async fn report_command_result(
         return response;
     }
 
+    // 指令（Command）资源要回填逐目标结果：先把原始值留一份（下面会被 move 进 `CommandResult`）。
+    let command_result_error = input.error.clone();
+    let command_result_body = input
+        .body
+        .clone()
+        .map(crate::wparse_proxy::bounded_result_body);
     let result = CommandResult {
         status_code: input.status_code,
         body: crate::wparse_proxy::bounded_result_body(input.body.unwrap_or_default()),
@@ -185,6 +191,16 @@ pub async fn report_command_result(
     let snapshot = result.clone();
     match proxy.complete_command(&command_id, result).await {
         Ok(true) => {
+            // 指令资源（`/api/v1/admin/commands`）的回填：任务完成是**幂等**的，
+            // 即便下面某一步回填失败，也不能把「网关确实做完了」这件事退回去。
+            super::commands::reconcile_result(
+                &state,
+                &command_id,
+                input.status_code,
+                command_result_error,
+                command_result_body,
+            )
+            .await;
             // 规则 / 配置发布：命令是计划批准时由中心入队的，这里把结果回填到那份计划的条目。
             // 只认 `wparse-release` 计划，不影响网关自己执行的三种动作。
             let outcome = if snapshot.error.is_some() {

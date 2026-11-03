@@ -5,6 +5,68 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.28.0-alpha] - 2026-11-03
+
+### 新增（程序访问凭据：接入 `wist-cred-peer`）
+
+- 管理面鉴权换成两级：先按 `wist-cred` 推来的摘要表验 `Authorization: Bearer <token>`，
+  再回落到原有的 `admin_token_hash`（break-glass，命中即 `warn`）。两条都没配时保持 dev 直通。
+- 新配置段 `[credentials]`：`enabled` / `listen_addr` / `store_path` / `audience` /
+  `allowed_issuers` / `known_roles` / `admin_roles` / `server_cert_path` /
+  `server_key_path` / `client_ca_path` / `require_signature` /
+  `issuer_public_key_path`。默认关闭，关闭时行为与旧版一致。
+- **授权记录验签**：开启 `require_signature`（默认 `true`）后，cred 推送的每条记录必须带
+  Ed25519 签名；中心**收到时**和**从磁盘加载时**各验一次。改角色 / 延长有效期 / 清撤销标记
+  的记录会被丢弃，启动日志打印 `rejected on load` 条数。
+- `issuer_public_key_path` 支持**一行一把**（轮换期同时信任新旧两把）；灰度窗口
+  （`require_signature = false`）下公钥文件缺失或为空**不阻断启动**，只告警。
+- 启用后多起一个**内网 mTLS listener**（默认 `0.0.0.0:3103`），只挂
+  `POST /api/v1/internal/credentials`、`POST /api/v1/internal/credentials/{id}/revoke` 与 `/healthz`；
+  客户端证书由 CA-I 验链，应用层只认握手后的身份。
+- 角色口径：`known_roles = ["admin", "read"]`，`admin_roles = ["admin"]`。
+  `read` 能通过认证但不能进管理面（`403 admin_role_required`）。
+- 管理面 401 现在**区分原因**：`admin_credential_expired`（该续期了）/ `admin_credential_revoked` /
+  `admin_credential_unknown`；其他无效 token 仍是 `invalid_admin_bearer_token`。
+  过期 / 撤销不计入暴力尝试，客户端轮询不会把自己锁死。
+- 摘要表落本地 `state/credentials.json`（只存 sha256），不进 PG；重启不需要 cred 重推。
+
+### 新增（指令资源：create / dispatch / cancel / 查询）
+
+- 新入口 `POST /api/v1/admin/commands`，把「一次下发」建成可对账的资源：
+  `commands`（语义层）+ `target_commands`（逐目标投递层），两层 id 分开——
+  `command_id` 给调用方，`target_command_id` 就是 `gateway_commands.command_id`。
+- `Idempotency-Key` 必填：同 key 同 body 返回原指令（`200`），异 body 冲突（`409`）。
+- `POST /commands/{id}/dispatch` 展开目标入队（复用现有 `gateway_commands` 队列与租约，不新建队列）；
+  `POST /commands/{id}/cancel`（**只接受 `validated`**：队列没有撤回 API，不做假取消）；
+  `GET /commands` / `{id}` / `{id}/targets/{target_command_id}`。
+- 本期开放 `gateway.diagnose` 与 `gateway.restart-process`：后者必须先 `create`（`dispatch_now=false`）、
+  再显式 `dispatch`；其余 kind 回 `command_kind_not_allowed`，未知 kind 回 `command_kind_unknown`。
+  单指令目标上限 50，超出请走 `rollout-plans`。
+- 网关回执（`POST /api/v1/gateway/commands/{id}/result`）现在会回填 `target_commands`，
+  并重算聚合状态（`succeeded` / `partial` / `failed` / `queued` / `leased`）。
+
+### 变更（旧入口退役）
+
+- `POST /api/v1/gateway/agents/dispatch` 返回 `410 Gone` + `Location: /api/v1/admin/commands`。
+  它原本是「前缀归网关面、凭据属管理面」的错位路由。
+
+### 升级注意
+
+- **凭据服务需要新的证书材料**：`[credentials]` 的服务器证书必须由 cred 的 **CA-S** 签
+  （与网关面 `control-center-server.*` 不是同一张），客户端信任锚是 **CA-I** 的公钥证书，
+  另需 **`issuer-signing.pub`**（cred 的 Ed25519 公钥）用于验授权记录。
+  材料由 cred 的一次性接入命令落到 `identity/center/cred/`；未启用 `[credentials]` 时无需准备。
+- 之前已接入过的现场要**重新生成接入命令再跑一次**，补下 `issuer-signing.pub`；
+  旧的无签名记录会在开启 `require_signature` 后被丢弃，需在 cred 页面「重推」。
+- `wist-auth` 升到 **0.2**（与 `wist-cred-peer` 同一版本线）；`wist-cred-peer` 新增依赖 0.1。
+- 新库无需人工迁移：`docker/initdb/01_schema.sql` 新增 `commands` / `target_commands`
+  （`IF NOT EXISTS`，`PgStore::connect` 每次启动执行）；FileStore 快照新增两个字段（`serde(default)`，
+  旧文件可直接读）。
+- **dispatch 需要 PostgreSQL**（命令队列只在 PG 上）；FileStore / 未配 `database_url` 时
+  create 与查询可用，dispatch 返回 `503 command_store_unavailable`。
+- 无 wire 变化：本期只用网关/ gwlinkd 已有的 `diagnose` / `restart-gateway` / `restart-gwlinkd`，
+  网关侧无需配合发版。
+
 ## [0.27.1-alpha] - 2026-11-01
 
 ### 修复（灰度发布：多网关的结果回填串台，阶段卡死）

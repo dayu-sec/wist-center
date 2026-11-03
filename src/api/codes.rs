@@ -18,6 +18,11 @@ macro_rules! codes {
 }
 
 codes! {
+    // 凭据不可用的三类原因分开报：续期 / 告警 / 排障都需要区分。
+    ADMIN_CREDENTIAL_EXPIRED => "admin_credential_expired",
+    ADMIN_CREDENTIAL_REVOKED => "admin_credential_revoked",
+    ADMIN_CREDENTIAL_UNKNOWN => "admin_credential_unknown",
+    ADMIN_ROLE_REQUIRED => "admin_role_required",
     AGENT_STATUS_UPDATE_FAILED => "agent_status_update_failed",
     ARTIFACT_COMPONENT_MISMATCH => "artifact_component_mismatch",
     ARTIFACT_FETCH_FAILED => "artifact_fetch_failed",
@@ -34,8 +39,16 @@ codes! {
     CERTIFICATE_NOT_REGISTERED => "certificate_not_registered",
     CERTIFICATE_REQUIRED => "certificate_required",
     CLIENT_CERTIFICATE_PERSIST_FAILED => "client_certificate_persist_failed",
+    COMMAND_ENDPOINT_MOVED => "command_endpoint_moved",
+    COMMAND_IDEMPOTENCY_CONFLICT => "command_idempotency_conflict",
+    COMMAND_KIND_NOT_ALLOWED => "command_kind_not_allowed",
+    COMMAND_KIND_UNKNOWN => "command_kind_unknown",
     COMMAND_NOT_FOUND => "command_not_found",
+    COMMAND_PAYLOAD_INVALID => "command_payload_invalid",
+    COMMAND_STATE_CONFLICT => "command_state_conflict",
     COMMAND_STORE_UNAVAILABLE => "command_store_unavailable",
+    COMMAND_TARGET_LIMIT_EXCEEDED => "command_target_limit_exceeded",
+    COMMAND_TARGET_NOT_FOUND => "command_target_not_found",
     COS_PATH_REQUIRED => "cos_path_required",
     COS_RESOLVE_FAILED => "cos_resolve_failed",
     CREDENTIAL_ID_GENERATION_FAILED => "credential_id_generation_failed",
@@ -77,6 +90,7 @@ codes! {
     INVALID_PHASE_PLAN => "invalid_phase_plan",
     INVALID_QUERY => "invalid_query",
     INVALID_REQUEST_BODY => "invalid_request_body",
+    IDEMPOTENCY_KEY_REQUIRED => "idempotency_key_required",
     INVALID_SPEC => "invalid_spec",
     INVALID_TIMEOUT => "invalid_timeout",
     INVALID_VERSION => "invalid_version",

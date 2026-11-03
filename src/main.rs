@@ -91,6 +91,23 @@ async fn run_main() -> Result<(), Box<dyn Error + Send + Sync>> {
     );
     let gateway_ca_pem = gateway_ca.ca_certificate_pem().to_string();
 
+    // 程序访问凭据（`[credentials]`）：启用时起**独立的内网 mTLS listener**，
+    // 接收 wist-cred 推来的摘要；同时把验证器交给管理面做 Bearer 鉴权。
+    let credential_service = wist_center::credentials::build(&config)
+        .map_err(|err| -> Box<dyn Error + Send + Sync> { err.into() })?;
+    let credentials = credential_service
+        .as_ref()
+        .map(|service| wist_center::credentials::CredentialVerifier::new(service.peer.clone()));
+    if let Some(service) = credential_service {
+        let wist_center::credentials::CredentialService { peer, listen, tls } = service;
+        log::info!("wist-center credentials API listening on https://{listen} (mTLS, CA-I)");
+        tokio::spawn(async move {
+            if let Err(err) = wist_cred_peer::serve_router(peer.router(), listen, tls).await {
+                log::error!("credentials listener stopped: {err}");
+            }
+        });
+    }
+
     // 规则发布兼容入口（WarpStation 设备面）。只有 PG 才能保证命令队列的原子性；
     // FileStore / 未配 database_url 时自动降级为「未启用」。
     let proxy = match (&config.database_url, config.wparse_proxy.enabled) {
@@ -120,6 +137,7 @@ async fn run_main() -> Result<(), Box<dyn Error + Send + Sync>> {
             store.clone(),
             gateway_ca.clone(),
             proxy.clone(),
+            credentials.clone(),
         );
         match server_tls.clone() {
             Some((cert_path, key_path)) => {
@@ -154,9 +172,21 @@ async fn run_main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let app = if admin_addr.is_some() {
         // 拆了面：网关 listener 只挂 `/api/v1/gateway/**` + `/api/v1/version`。
-        wist_center::api::gateway_router(config, store, gateway_ca, proxy.clone())
+        wist_center::api::gateway_router(
+            config,
+            store,
+            gateway_ca,
+            proxy.clone(),
+            credentials.clone(),
+        )
     } else {
-        wist_center::api::router(config, store, gateway_ca, proxy.clone())
+        wist_center::api::router(
+            config,
+            store,
+            gateway_ca,
+            proxy.clone(),
+            credentials.clone(),
+        )
     };
 
     // 独立 listener：服务器证书 + **不校客户端证书**（WarpStation 持 Bearer proxy token，

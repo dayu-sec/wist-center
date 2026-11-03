@@ -13,9 +13,9 @@ use axum::{
 use wist_control::types::DateTime;
 use wist_control::{
     AdminDispatchGlobalPolicy, AdminGatewayListReturned, AdminGatewayStatusListReturned,
-    AdminGatewayStatusReturned, AgentFleetDispatchReceipt, AgentRuntimeStatus,
-    DispatchAgentFleetCommand, GatewayCustomerBinding, GatewayInitialConfig, GatewayInstance,
-    GatewayInstanceLifecycleState, GatewayListView, GatewayRuntimeStatus, GlobalPolicyDispatch,
+    AdminGatewayStatusReturned, AgentRuntimeStatus, GatewayCustomerBinding, GatewayInitialConfig,
+    GatewayInstance, GatewayInstanceLifecycleState, GatewayListView, GatewayRuntimeStatus,
+    GlobalPolicyDispatch,
 };
 
 use crate::infra::{GatewayCustomerBindingRecord, StoreReason, StoredGateway};
@@ -2823,30 +2823,8 @@ pub async fn admin_dispatch_global_policy(
     .into_response()
 }
 
-/// 下发 Agent 舰队指令（DispatchAgentFleetCommandFlow）：记录一次舰队指令下发回执。
-pub async fn admin_dispatch_agent_fleet_command(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    client: PeerConnectInfo,
-    ApiJson(input): ApiJson<DispatchAgentFleetCommand>,
-) -> Response {
-    let client_key = rate_limit::client_key(client);
-    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
-        return response;
-    }
-    Json(AgentFleetDispatchReceipt {
-        dispatch_id: format!(
-            "fleet-{}",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ),
-        command_kind: input.command_kind,
-        target_count: input.agent_ids.len() as i64,
-        status: "accepted".to_string(),
-        created_at: DateTime::now(),
-    })
-    .into_response()
-}
-
+/// 下发 Agent 舰队指令（已迁移到 `/api/v1/admin/commands`，见 `api::commands`）。
+/// 旧路由 `/api/v1/gateway/agents/dispatch` 返回 410 + Location。
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2946,6 +2924,7 @@ mod tests {
                 },
                 wparse_release: Default::default(),
                 log: Default::default(),
+                credentials: Default::default(),
             },
             store,
             artifact_store,
@@ -2955,6 +2934,7 @@ mod tests {
                 super::super::rate_limit::RateLimitState::default(),
             )),
             jobs,
+            credentials: None,
         }
     }
 
@@ -5525,6 +5505,7 @@ mod tests {
                 },
                 wparse_release: Default::default(),
                 log: Default::default(),
+                credentials: Default::default(),
             },
             store,
             artifact_store,
@@ -5534,6 +5515,7 @@ mod tests {
                 super::super::rate_limit::RateLimitState::default(),
             )),
             jobs,
+            credentials: None,
         };
         let app = super::super::router_for(state);
 
@@ -5746,6 +5728,7 @@ mod tests {
                 },
                 wparse_release: Default::default(),
                 log: Default::default(),
+                credentials: Default::default(),
             },
             store,
             artifact_store,
@@ -5755,6 +5738,7 @@ mod tests {
                 super::super::rate_limit::RateLimitState::default(),
             )),
             jobs,
+            credentials: None,
         }
     }
 
@@ -6074,6 +6058,7 @@ mod tests {
                 },
                 wparse_release: Default::default(),
                 log: Default::default(),
+                credentials: Default::default(),
             },
             store,
             artifact_store,
@@ -6083,6 +6068,7 @@ mod tests {
                 super::super::rate_limit::RateLimitState::default(),
             )),
             jobs,
+            credentials: None,
         };
         let app = super::super::router_for(state);
         let response = app
