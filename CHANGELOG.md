@@ -5,6 +5,22 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.29.0-alpha] - 2026-11-03
+
+### 变更（不兼容，只影响 VictoriaMetrics 序列）
+
+- **agent 自身指标改用规范名与规范单位**：`agent_cpu_percent` → `agent_cpu_ratio`（0–1 单核比例）、
+  `agent_admin_latency_ms` → `agent_admin_latency_seconds`；序列 label 由 `agent_id` 改为 `agent`。
+  名字与单位取自 `wist-metrics::names`，与 `wist-agentd` / `wist-gateway` 同一套词。
+- 管理面响应字段**不变**（仍是 `cpuPercent` / `adminLatencyMs`），换算在读取时做一次 —— 页面无感。
+
+### 升级注意
+
+- **旧序列从本版起停止更新**：按 `agent_cpu_percent` / `agent_admin_latency_ms` / `agent_id` 标签
+  自建的看板或告警需要改成新名与新标签；历史曲线在切换点断档（不回填）。
+- `agent_up` / `agent_info` / `agent_health` 名字不弯，但**标签跟随改成 `agent`** —— 直接查 VM 的
+  看板需要同步。
+
 ## [0.28.0-alpha] - 2026-11-03
 
 ### 新增（程序访问凭据：接入 `wist-cred-peer`）
