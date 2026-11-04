@@ -534,6 +534,39 @@ struct RawCredentialsConfig {
     client_ca_path: Option<String>,
     require_signature: Option<bool>,
     issuer_public_key_path: Option<String>,
+    /// 接入文件（由 `wist-cred` 接入脚本产出）：身份 + 验证策略从它来。
+    /// 相对路径按**该文件所在目录**解；文件里的值覆盖本段里的同名字段。
+    file: Option<String>,
+}
+
+/// `[credentials] file = "…"` 指向的接入文件。
+///
+/// 只承载**与程序无关**的两块：我是谁（`[identity]`）、我认什么（`[verify]`）。
+/// 监听地址 / 存储 / 管理角色这些是 center 自己的事，不在这份文件里。
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawCredentialsFile {
+    identity: RawCredentialsIdentity,
+    verify: RawCredentialsVerify,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawCredentialsIdentity {
+    cert: Option<String>,
+    key: Option<String>,
+    client_ca: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawCredentialsVerify {
+    audience: Option<String>,
+    allowed_issuers: Option<Vec<String>>,
+    require_signature: Option<bool>,
+    issuer_public_key_file: Option<String>,
+    /// 这个系统能验的角色；映射到 `known_roles`（`admin_roles` 仍由 center 自己定）。
+    roles: Option<Vec<String>>,
 }
 
 /// 默认配置文件路径：**当前工作目录**下的 `wist-center.toml`（与 gateway 同口径）。
@@ -848,9 +881,10 @@ impl CredentialsConfig {
 
 /// `[credentials]` → 内部结构。路径按配置目录解析；未配置的项回落默认值。
 fn normalize_credentials(
-    raw: RawCredentialsConfig,
+    mut raw: RawCredentialsConfig,
     config_dir: &Path,
 ) -> Result<CredentialsConfig, ConfigError> {
+    apply_credentials_file(&mut raw, config_dir)?;
     let defaults = CredentialsConfig::default();
     let path = |value: Option<String>| {
         normalize_optional(value).map(|value| absolutize_path(config_dir, Path::new(&value)))
@@ -876,6 +910,67 @@ fn normalize_credentials(
         require_signature: raw.require_signature.unwrap_or(defaults.require_signature),
         issuer_public_key_path: path(raw.issuer_public_key_path),
     })
+}
+
+/// 把 `[credentials] file` 指向的接入文件合并进 raw（**文件优先**）。
+///
+/// 文件是机器写的（`wist-cred` 接入脚本产出），它的身份/验证值才是真的；
+/// 主配置里再写一遍同名字段只会骗自己，所以这里让文件盖掉它们。
+/// 相对路径按**该文件所在目录**解 —— 整个目录一起挂进容器就能用。
+fn apply_credentials_file(
+    raw: &mut RawCredentialsConfig,
+    config_dir: &Path,
+) -> Result<(), ConfigError> {
+    // 没开凭据面就不碰文件：关了就该什么也不依赖（否则一个不用的功能会让栈起不来）。
+    if raw.enabled != Some(true) {
+        return Ok(());
+    }
+    let Some(value) = normalize_optional(raw.file.take()) else {
+        return Ok(());
+    };
+    let path = absolutize_path(config_dir, Path::new(&value));
+    let text = std::fs::read_to_string(&path)
+        .map_err(|err| config_parse(format!("read credentials.file {}: {err}", path.display())))?;
+    let parsed: RawCredentialsFile = toml::from_str(&text)
+        .map_err(|err| config_parse(format!("parse credentials.file {}: {err}", path.display())))?;
+    let base = path.parent().filter(|dir| !dir.as_os_str().is_empty());
+    let resolve = |value: Option<String>| -> Option<String> {
+        normalize_optional(value).map(|value| {
+            let joined = match base {
+                Some(dir) => absolutize_path(dir, Path::new(&value)),
+                None => PathBuf::from(&value),
+            };
+            joined.to_string_lossy().into_owned()
+        })
+    };
+
+    if let Some(cert) = resolve(parsed.identity.cert) {
+        raw.server_cert_path = Some(cert);
+    }
+    if let Some(key) = resolve(parsed.identity.key) {
+        raw.server_key_path = Some(key);
+    }
+    if let Some(client_ca) = resolve(parsed.identity.client_ca) {
+        raw.client_ca_path = Some(client_ca);
+    }
+
+    if let Some(audience) = normalize_optional(parsed.verify.audience) {
+        raw.audience = Some(audience);
+    }
+    if let Some(issuers) = parsed.verify.allowed_issuers {
+        raw.allowed_issuers = Some(issuers);
+    }
+    if let Some(flag) = parsed.verify.require_signature {
+        raw.require_signature = Some(flag);
+    }
+    if let Some(public_key) = resolve(parsed.verify.issuer_public_key_file) {
+        raw.issuer_public_key_path = Some(public_key);
+    }
+    if let Some(roles) = parsed.verify.roles {
+        // `admin_roles` 不跟：谁能进管理面是 center 自己的决定。
+        raw.known_roles = Some(roles);
+    }
+    Ok(())
 }
 
 /// 默认控制中心 CA 证书路径（信任根，分发给网关作 control_center.trust_bundle）：
@@ -2385,6 +2480,182 @@ hmac_secret = "hmac"
         };
         assert!(config.grants_admin(&["read".to_string()]));
         assert!(config.grants_admin(&[]));
+    }
+
+    #[test]
+    fn credentials_file_fills_identity_and_verify() {
+        // 接入脚本产出的 cred.toml：身份 + 验证策略从文件来，相对路径按文件目录解。
+        let _guard = env_guard();
+        let dir = env::temp_dir().join(format!("wist-center-cred-file-{}", unique_suffix()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        for name in [
+            "server.crt",
+            "server.key",
+            "client-ca.pem",
+            "issuer-signing.pub",
+        ] {
+            fs::write(dir.join(name), "x").expect("write material");
+        }
+        fs::write(
+            dir.join("cred.toml"),
+            r#"
+[identity]
+cert = "server.crt"
+key = "server.key"
+client_ca = "client-ca.pem"
+
+[verify]
+audience = "wist-center"
+allowed_issuers = ["wist-cred"]
+require_signature = true
+issuer_public_key_file = "issuer-signing.pub"
+roles = ["admin", "read"]
+"#,
+        )
+        .expect("write cred.toml");
+
+        let path = dir.join(CONFIG_FILE);
+        fs::write(
+            &path,
+            r#"
+[server]
+listen_addr = "127.0.0.1:3999"
+public_url = "https://center.example.com"
+admin_token = "tok"
+
+[security]
+hmac_secret = "hmac"
+
+[credentials]
+enabled = true
+listen_addr = "127.0.0.1:3103"
+file = "./cred.toml"
+"#,
+        )
+        .expect("write config");
+
+        let config = CenterConfig::load_from_path(&path).expect("config loads");
+        assert_eq!(
+            config.credentials.server_cert_path.as_deref(),
+            Some(dir.join("server.crt").as_path())
+        );
+        assert_eq!(
+            config.credentials.client_ca_path.as_deref(),
+            Some(dir.join("client-ca.pem").as_path())
+        );
+        assert_eq!(
+            config.credentials.issuer_public_key_path.as_deref(),
+            Some(dir.join("issuer-signing.pub").as_path())
+        );
+        assert_eq!(config.credentials.audience, "wist-center");
+        assert_eq!(config.credentials.allowed_issuers, ["wist-cred"]);
+        assert!(config.credentials.require_signature);
+        assert_eq!(config.credentials.known_roles, ["admin", "read"]);
+        // 管理角色不跟文件走。
+        assert_eq!(config.credentials.admin_roles, ["admin"]);
+    }
+
+    #[test]
+    fn credentials_file_wins_over_inline_values() {
+        // 文件是机器写的（接入脚本），主配置里再写一遍只会骗自己。
+        let _guard = env_guard();
+        let dir = env::temp_dir().join(format!("wist-center-cred-wins-{}", unique_suffix()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        for name in [
+            "server.crt",
+            "server.key",
+            "client-ca.pem",
+            "issuer-signing.pub",
+        ] {
+            fs::write(dir.join(name), "x").expect("write material");
+        }
+        fs::write(
+            dir.join("cred.toml"),
+            r#"
+[identity]
+cert = "server.crt"
+key = "server.key"
+client_ca = "client-ca.pem"
+
+[verify]
+audience = "from-file"
+require_signature = true
+issuer_public_key_file = "issuer-signing.pub"
+"#,
+        )
+        .expect("write cred.toml");
+
+        let path = dir.join(CONFIG_FILE);
+        fs::write(
+            &path,
+            r#"
+[server]
+listen_addr = "127.0.0.1:3999"
+public_url = "https://center.example.com"
+admin_token = "tok"
+
+[security]
+hmac_secret = "hmac"
+
+[credentials]
+enabled = true
+listen_addr = "127.0.0.1:3103"
+audience = "from-config"
+file = "cred.toml"
+"#,
+        )
+        .expect("write config");
+
+        let config = CenterConfig::load_from_path(&path).expect("config loads");
+        assert_eq!(config.credentials.audience, "from-file");
+    }
+
+    #[test]
+    fn credentials_file_is_ignored_when_the_listener_is_disabled() {
+        // 关了凭据面就不该依赖那个文件 —— 否则一个不用的功能会让栈起不来。
+        let _guard = env_guard();
+        let path = write_temp_config(
+            r#"
+[server]
+listen_addr = "127.0.0.1:3999"
+public_url = "https://center.example.com"
+admin_token = "tok"
+
+[security]
+hmac_secret = "hmac"
+
+[credentials]
+file = "nope/cred.toml"
+"#,
+        );
+        let config = CenterConfig::load_from_path(&path).expect("disabled section is inert");
+        assert!(!config.credentials.enabled);
+    }
+
+    #[test]
+    fn missing_credentials_file_is_a_parse_error() {
+        let _guard = env_guard();
+        let path = write_temp_config(
+            r#"
+[server]
+listen_addr = "127.0.0.1:3999"
+public_url = "https://center.example.com"
+admin_token = "tok"
+
+[security]
+hmac_secret = "hmac"
+
+[credentials]
+enabled = true
+listen_addr = "127.0.0.1:3103"
+file = "nope/cred.toml"
+"#,
+        );
+        let err = CenterConfig::load_from_path(&path).unwrap_err();
+        assert!(
+            format!("{err}").contains("credentials.file"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

@@ -5,6 +5,34 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.30.0-alpha] - 2026-11-04
+
+### 新增：`[credentials] file` —— 身份与验证策略从接入文件来
+
+`wist-cred` 的接入脚本现在产出一份与程序无关的 `cred.toml`（`[identity]` + `[verify]`）。
+center 直接读它，不必在模板里再重复一遍六个字段：
+
+```toml
+[credentials]
+enabled = true
+listen_addr = "0.0.0.0:3103"
+store_path = "state/credentials.json"
+file = "/wist-center/ca/cred/cred.toml"   # 相对路径按该文件所在目录解
+admin_roles = ["admin"]
+```
+
+- `[identity]`：`cert` / `key` / `client_ca` → `server_cert_path` / `server_key_path` / `client_ca_path`；
+- `[verify]`：`audience` / `allowed_issuers` / `require_signature` / `issuer_public_key_file` / `roles`（→ `known_roles`）；
+- **文件里的值覆盖主配置同名字段**（文件是机器写的，才是真的）；`admin_roles` 不跟文件走；
+- `enabled` 不是 `true` 时**完全不读这个文件** —— 关了的功能不该让栈起不来；
+- 文件缺失 / 解析失败 → 启动即失败，并点名 `credentials.file` 与具体路径。
+
+### 测试
+
+`credentials_file_fills_identity_and_verify`（相对路径按文件目录解）、
+`credentials_file_wins_over_inline_values`、`missing_credentials_file_is_a_parse_error`、
+`credentials_file_is_ignored_when_the_listener_is_disabled`；总计 347 passed。
+
 ## [0.29.0-alpha] - 2026-11-03
 
 ### 变更（不兼容，只影响 VictoriaMetrics 序列）
