@@ -6306,6 +6306,7 @@ mod tests {
             !body.lines().any(|line| line.trim_start().starts_with("//")),
             "生成的脚本里不能有 `//` 注释：\n{body}"
         );
+        assert_braced_vars_before_non_ascii("install-all", &body);
 
         // 券无效 → 401。
         let response = app
@@ -6533,6 +6534,7 @@ mod tests {
             !body.lines().any(|line| line.trim_start().starts_with("//")),
             "生成的脚本里不能有 `//` 注释：\n{body}"
         );
+        assert_braced_vars_before_non_ascii("install-linkd", &body);
 
         // 券无效 → 401。
         let response = app
@@ -6566,6 +6568,38 @@ mod tests {
             output.status.success(),
             "bash -n 失败（{name}）：{}\n---\n{script}",
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// 变量紧邻非 ASCII（中文 / 全角标点）必须写 `${VAR}`。
+    ///
+    /// UTF-8 locale 下 bash / macOS sh 会把紧跟 `$VAR` 的多字节字符当成变量名的一部分：
+    /// `$TOOL_DIR（` 实际查的是变量 `TOOL_DIR（`，脚本带 `set -u` 就 `unbound variable`
+    /// （0.30.1 的 install-all 就在这挂过）。`bash -n` 抓不到 —— 语法合法，只在运行时炸。
+    fn assert_braced_vars_before_non_ascii(name: &str, script: &str) {
+        let bytes = script.as_bytes();
+        let mut offenders = Vec::new();
+        for (index, byte) in bytes.iter().enumerate() {
+            if *byte != b'$' || bytes.get(index + 1) == Some(&b'{') {
+                continue;
+            }
+            let mut end = index + 1;
+            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                end += 1;
+            }
+            if end > index + 1 && bytes.get(end).is_some_and(|next| !next.is_ascii()) {
+                // 带上紧邻的多字节字符，失败信息直接指着现场那一段。
+                let tail = script[end..]
+                    .chars()
+                    .next()
+                    .map(|ch| ch.to_string())
+                    .unwrap_or_default();
+                offenders.push(format!("{}{tail}", &script[index..end]));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "{name} 里变量紧邻非 ASCII 却没加 brace：{offenders:?}\n---\n{script}"
         );
     }
 
@@ -6656,6 +6690,7 @@ mod tests {
         // 与首次安装同一套逻辑：先按现场值渲染配置，再装二进制 / 系统服务。
         assert!(script.contains("gops sys localize"));
         assert_bash_syntax("upgrade-gwlinkd", script);
+        assert_braced_vars_before_non_ascii("upgrade-gwlinkd", script);
         // 页面只给一行命令：短命签名 + 不出现 admin token。
         let command = view["command"].as_str().expect("command");
         assert!(command.starts_with("curl -fsSLk '"), "{command}");

@@ -42,7 +42,9 @@ mkdir -p "$TOOL_DIR" 2>/dev/null || $SUDO install -d -m 0755 "$TOOL_DIR"
 TOOL_SUDO=""
 if [ ! -w "$TOOL_DIR" ]; then
   TOOL_SUDO="$SUDO"
-  [ "$(id -u)" = "0" ] || log "提示：本次用 sudo 写入 $TOOL_DIR（服务以 root 运行，运行期就地升级没问题）"
+  # 变量紧邻全角括号必须写 `${TOOL_DIR}`：UTF-8 locale 下 bash 会把 `（` 吃进变量名，
+  # `set -u` 直接报 `TOOL_DIR?: unbound variable`（安装第一步就挂）。
+  [ "$(id -u)" = "0" ] || log "提示：本次用 sudo 写入 ${TOOL_DIR}（服务以 root 运行，运行期就地升级没问题）"
 fi
 mkdir -p "$CA_DIR"
 export PATH="$TOOL_DIR:$LEGACY_BIN_DIR:$HOME/.local/bin:$PATH"
@@ -177,7 +179,7 @@ log "gops: $(gops --version 2>/dev/null || echo ok) · gx: $(gx --version 2>/dev
 # 旧装法的副本（$HOME/bin）会按 PATH 顺序抢先：不是错，但两份会逐渐版本不一致 —— 提醒一句。
 for tool in gops gx; do
   found="$(type -P "$tool" || true)"
-  [ "$found" = "$TOOL_DIR/$tool" ] || log "提示：$tool 解析到 ${found:-<无>}（不是 $TOOL_DIR/$tool）；旧副本建议移走"
+  [ "$found" = "$TOOL_DIR/$tool" ] || log "提示：$tool 解析到 ${found:-<无>}（不是 $TOOL_DIR/${tool}）；旧副本建议移走"
 done
 
 # b) 取部署工程：**直接 clone** 运维工程仓库（不再用 `gops prj new` 现生成）。
