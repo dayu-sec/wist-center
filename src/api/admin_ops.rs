@@ -6286,8 +6286,9 @@ mod tests {
             "service install --system",
             "GWLINKD_GATEWAY_ID",
             "GWLINKD_IDENTITY_DIR",
-            // 执行器写**绝对路径**：gwlinkd 服务 PATH 不含 $HOME/bin，相对名会在 spawn 时 ENOENT。
-            "set_value \"$VALUES_FILE\" GWLINKD_UPGRADER_PROGRAM \"$INSTALL_DIR/gops\"",
+            // 执行器写**绝对路径**（宿主工具默认落 /usr/local/bin）：gwlinkd 服务 PATH 含系统目录，
+            // 相对名会在 spawn 时 ENOENT。
+            "set_value \"$VALUES_FILE\" GWLINKD_UPGRADER_PROGRAM \"$TOOL_DIR/gops\"",
             "configs/gwlinkd/gwlinkd.toml",
             "identity/gwlinkd/gwlinkd-pub.toml",
             "--pub-config",

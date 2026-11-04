@@ -5,6 +5,29 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.30.1-alpha] - 2026-11-04
+
+### 变更
+
+- **网关安装脚本把宿主工具装到 `/usr/local/bin`**（`WIST_TOOL_DIR` 可覆盖）：`gops` / `gx` 原先落
+  `$HOME/bin`，只有 gwlinkd 渲染服务定义时补的 PATH 能看见它 —— root 安装（无 `--run-as`）那条补偿
+  不生效，升级执行器派生 `gx run localize` 时 ENOENT、整次升级回滚。系统作用域固定以 root 运行，
+  所以直接落系统目录（`tool-copy` 的就地 rename 需要目录可写）；`$HOME/bin` 仍留在 PATH 上兼容
+  老现场，解析到旧副本时打印提示；执行器值（`GWLINKD_UPGRADER_PROGRAM`）跟着 `$TOOL_DIR/gops` 走。
+- **不再向 gwlinkd 传 `--run-as`**（gwlinkd 0.20 已删除该参数）：系统服务固定以 root 运行。
+  ⚠ 顺序：先升 center + 重跑安装脚本，或保证现场 gwlinkd 仍是 0.19.x —— 旧脚本 + 0.20 会报
+  「未知参数：--run-as」。
+
+## [Unreleased]
+
+### 变更
+
+- 新增 `agent_host_info{agent,gateway_id,hostname,host_ip}`（值恒为 1）：`hostname` 来自注册表；
+  `host_ip` 取 `ip_addresses` 里**非回环 IPv4、按接口名排序的第一条**。两个都没有就不发这条序列。
+  VM 侧不用先 join 网关就能回答「这台机器叫什么、是哪个地址」。
+- **不改 `agent_info` 的 label 集合**：把 IP 塞进版本/metadata 序列会让 IP 变更多出一条
+  `agent_info`，`count(agent_info)` 之类的存活/版本查询会被旧序列抬大。
+
 ## [0.30.0-alpha] - 2026-11-04
 
 ### 新增：`[credentials] file` —— 身份与验证策略从接入文件来

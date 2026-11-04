@@ -1031,7 +1031,8 @@ CA_BUNDLE="$CA_DIR/ca-bundle.pem"
 
 log() { printf '\033[1;36m==> %s\033[0m\n' "$*"; }
 mkdir -p "$CA_DIR"
-export PATH="$HOME/bin:$HOME/.local/bin:$PATH"
+# 宿主工具默认落 /usr/local/bin（与 install-all 同口径）；$HOME/bin 留着兼容老现场。
+export PATH="/usr/local/bin:$HOME/bin:$HOME/.local/bin:$PATH"
 
 # 中心 CA（自签）：写盘 + 组「系统根 + 中心CA」bundle（与 install-all 同口径）。
 cat > "$CA_CENTER" <<'WIST_CENTER_CA_EOF'
@@ -1057,9 +1058,9 @@ if ! command -v tar >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1; the
   echo '缺少 tar 与 python3（至少一个用于解包）' >&2; exit 1
 fi
 # 捕获**可执行文件**的绝对路径：`type -P` 只查 PATH，不会把 shell 函数/别名当成程序。
-# gwlinkd 是系统服务，PATH 不含 $HOME/bin，配置里写相对名 `gops` 会在 spawn 时 ENOENT（os error 2）。
+# gwlinkd 是系统服务，PATH 不含 $HOME/bin；配置里写相对名 `gops` 会在 spawn 时 ENOENT（os error 2）。
 GOPS_BIN="$(type -P gops || true)"
-[ -n "$GOPS_BIN" ] || { echo '缺少 gops（网关由 gops 部署；请确认 PATH 含 $HOME/bin）' >&2; exit 1; }
+[ -n "$GOPS_BIN" ] || { echo '缺少 gops（网关由 gops 部署；请确认 PATH 含 /usr/local/bin 或 $HOME/bin）' >&2; exit 1; }
 
 # 平台探测 → target-triple（与中心制品的平台对齐）。
 case "$(uname -s)/$(uname -m)" in
@@ -1187,10 +1188,8 @@ fi
 [ -f "$GWLINKD_TOML" ] || { echo "未找到渲染后的 $GWLINKD_TOML —— 该网关栈版本可能还不支持 gwlinkd（请先升级 wist-gateway-stack 再重跑）。" >&2; exit 1; }
 [ -f "$GWLINKD_PUB" ] || { echo "未找到现场态配置 $GWLINKD_PUB —— localize 没跑成？" >&2; exit 1; }
 
-# 装成**系统级服务、非 root 运行**（--run-as）：开机自启 / 崩溃拉起，进程属主 = 部署用户。
-RUN_AS_OPT=''
-if [ "$(id -u)" != "0" ]; then RUN_AS_OPT="--run-as $DEPLOY_USER"; fi
-$SUDO "$GWLINKD_BIN" service install --system $RUN_AS_OPT --bin "$GWLINKD_BIN" --config "$GWLINKD_TOML" --pub-config "$GWLINKD_PUB" --force
+# 装成**系统级服务**：开机自启 / 崩溃拉起（system 作用域固定以 root 运行，无 --run-as）。
+$SUDO "$GWLINKD_BIN" service install --system --bin "$GWLINKD_BIN" --config "$GWLINKD_TOML" --pub-config "$GWLINKD_PUB" --force
 $SUDO "$GWLINKD_BIN" service status --system || true
 # 自检（只提示，不阻断）：安装 / 升级完立刻把「信任锚 / 中心可达 / 环回面」的问题摆出来。
 # 信任锚是**现场值**（identity/gwlinkd/.env），站点搬过目录时可能还指着旧路径 —— 这里能直接看到 FAIL。

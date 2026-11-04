@@ -12,15 +12,40 @@ GATEWAY_ID='__GATEWAY_ID__'
 # GATEWAY_PRJ_TPL_REPO，可在 ops-prj 的 sys_value.yml 覆盖）。
 PROJECT_REPO='__PRJ_REPO__'
 PROJECT_NAME='__PROJECT_NAME__'
-INSTALL_DIR="${HOME}/bin"
+# 宿主工具目录：gops / gx 必须落在**服务能看到的 PATH** 里 —— gwlinkd 是系统服务
+# （systemd / launchd 默认 PATH 只有系统目录），它派生 `gops`，`gops` 再派生 `gx run localize`。
+# 系统作用域固定以 root 运行，所以默认落 `/usr/local/bin`（root 可写、本就在服务 PATH 里，
+# 且 `tool-copy` 升级是**就地 rename**，目录必须可写）。用 `--user` 作用域时用 `WIST_TOOL_DIR`
+# 指到当前用户可写的目录。
+LEGACY_BIN_DIR="$HOME/bin"
+if [ -n "${WIST_TOOL_DIR:-}" ]; then TOOL_DIR="$WIST_TOOL_DIR"
+else TOOL_DIR="/usr/local/bin"
+fi
 CA_DIR="$HOME/.wist/ca"
 CA_CENTER="$CA_DIR/control-center.pem"
 CA_BUNDLE="$CA_DIR/ca-bundle.pem"
 
 log() { printf '\033[1;36m==> %s\033[0m\n' "$*"; }
 
-mkdir -p "$INSTALL_DIR" "$CA_DIR"
-export PATH="$INSTALL_DIR:$HOME/.local/bin:$PATH"
+# 系统服务定义要 root 才能写：一次定好前缀，后面统一复用。
+if [ "$(id -u)" = "0" ]; then SUDO=""
+elif command -v sudo >/dev/null 2>&1; then SUDO="sudo"
+else
+  echo "安装 wist-gwlinkd 需要 root 或 sudo（写 /usr/local/lib 与系统服务定义）" >&2
+  exit 1
+fi
+
+# 先按当前身份建（$HOME/bin 归本人，不能 sudo 建出 root 属主）；建不了再借 sudo。
+mkdir -p "$TOOL_DIR" 2>/dev/null || $SUDO install -d -m 0755 "$TOOL_DIR"
+# 目录不可写（典型：/usr/local/bin 而当前不是 root）→ **这次安装**借 sudo。
+# 但这只解决安装：运行期自升级仍要求该目录对运行身份可写，所以上面默认按身份选目录。
+TOOL_SUDO=""
+if [ ! -w "$TOOL_DIR" ]; then
+  TOOL_SUDO="$SUDO"
+  [ "$(id -u)" = "0" ] || log "提示：本次用 sudo 写入 $TOOL_DIR（服务以 root 运行，运行期就地升级没问题）"
+fi
+mkdir -p "$CA_DIR"
+export PATH="$TOOL_DIR:$LEGACY_BIN_DIR:$HOME/.local/bin:$PATH"
 
 # 中心 CA（自签）：写盘，并组一个「系统根 + 中心CA」的 bundle 给 gops/gx/curl 验证。
 # 注意：SSL_CERT_FILE 会**替换**系统根，所以要把系统 bundle 一起拼进去，否则 GitHub 等会验不过。
@@ -109,7 +134,7 @@ sha256_of() {
 # 下载 +（可选）校验 + 解包 + 安装一个组件。
 #   install_component <name> <url> [sha256] [目标目录] [安装前缀: 空|sudo]
 install_component() {
-  name="$1"; url="$2"; want_sha="${3:-}"; dest="${4:-$INSTALL_DIR}"; use_sudo="${5:-}"
+  name="$1"; url="$2"; want_sha="${3:-}"; dest="${4:-$TOOL_DIR}"; use_sudo="${5:-}"
   d="$(mktemp -d)"
   log "下载 ${name}：$url"
   curl -fsSL "${CURL_TLS[@]}" "$url" -o "$d/pkg"
@@ -144,10 +169,16 @@ install_component() {
   rm -rf "$d"
 }
 
-# a) 安装 gops / gx（带摘要校验）
-install_component gops "$(gops_url)" "$(gops_sha || true)"
-install_component gx "$(gx_url)" "$(gx_sha || true)"
+# a) 安装 gops / gx（带摘要校验）→ 落 TOOL_DIR（服务 PATH 内）
+install_component gops "$(gops_url)" "$(gops_sha || true)" "$TOOL_DIR" "$TOOL_SUDO"
+install_component gx "$(gx_url)" "$(gx_sha || true)" "$TOOL_DIR" "$TOOL_SUDO"
+hash -r 2>/dev/null || true
 log "gops: $(gops --version 2>/dev/null || echo ok) · gx: $(gx --version 2>/dev/null || echo ok)"
+# 旧装法的副本（$HOME/bin）会按 PATH 顺序抢先：不是错，但两份会逐渐版本不一致 —— 提醒一句。
+for tool in gops gx; do
+  found="$(type -P "$tool" || true)"
+  [ "$found" = "$TOOL_DIR/$tool" ] || log "提示：$tool 解析到 ${found:-<无>}（不是 $TOOL_DIR/$tool）；旧副本建议移走"
+done
 
 # b) 取部署工程：**直接 clone** 运维工程仓库（不再用 `gops prj new` 现生成）。
 #    工程自带 ops-prj.yml 与 values/wist-gateway-stack/sys_value.yml（现场值模板）。
@@ -225,9 +256,9 @@ set_value "$VALUES_FILE" GWLINKD_STATE_DIR "$STACK_DIR/configs/gwlinkd/state"
 set_value "$VALUES_FILE" GATEWAY_SELF_ENDPOINT "$GATEWAY_SELF_ENDPOINT"
 set_value "$VALUES_FILE" GATEWAY_SELF_CA "$STACK_DIR/identity/gateway/public/gateway-ca.crt.pem"
 # gwlinkd 驱动升级：gops 工程根（含 ops-prj.yml，**绝对路径**）——gops 从 cwd 解析工程。
-# 执行器也写**绝对路径**：gwlinkd 是系统服务，PATH 只有 /usr/local/bin:/usr/bin:/bin…，
-# 不含安装脚本用的 $HOME/bin；写相对名 `gops` 会在 spawn 时 ENOENT（os error 2）。
-set_value "$VALUES_FILE" GWLINKD_UPGRADER_PROGRAM "$INSTALL_DIR/gops"
+# 执行器也写**绝对路径**（TOOL_DIR 内）：gwlinkd 是系统服务，PATH 不含 $HOME/bin；
+# 写相对名 `gops` 会在 spawn 时 ENOENT（os error 2）。
+set_value "$VALUES_FILE" GWLINKD_UPGRADER_PROGRAM "$TOOL_DIR/gops"
 set_value "$VALUES_FILE" GWLINKD_UPGRADE_PROJECT_DIR "$PROJECT_ROOT"
 
 # d) 变量解析 + 本地化（把域名等现场值烘进 .env 与渲染配置）
@@ -257,12 +288,6 @@ if [ -z "$GWLINKD_URL" ]; then
 else
   log "安装 wist-gwlinkd（宿主侧接入器）"
   DEPLOY_USER="$(id -un)"
-  if [ "$(id -u)" = "0" ]; then SUDO=""
-  elif command -v sudo >/dev/null 2>&1; then SUDO="sudo"
-  else
-    echo "安装 wist-gwlinkd 需要 root 或 sudo（写 /usr/local/lib、/usr/local/bin 与系统服务定义）" >&2
-    exit 1
-  fi
 
   GWLINKD_BIN="/usr/local/bin/wist-gwlinkd"
   # 真实二进制放**运行用户可写**的目录：gwlinkd 的自更新要在进程内就地覆盖它。
@@ -297,10 +322,8 @@ else
     exit 1
   fi
 
-  # 装成**系统级服务、非 root 运行**（--run-as）：开机自启 / 崩溃拉起，进程属主 = 部署用户。
-  RUN_AS_OPT=""
-  if [ "$(id -u)" != "0" ]; then RUN_AS_OPT="--run-as $DEPLOY_USER"; fi
-  $SUDO "$GWLINKD_BIN" service install --system $RUN_AS_OPT --bin "$GWLINKD_BIN" --config "$GWLINKD_TOML" --pub-config "$GWLINKD_PUB" --force
+  # 装成**系统级服务**：开机自启 / 崩溃拉起（system 作用域固定以 root 运行）。
+  $SUDO "$GWLINKD_BIN" service install --system --bin "$GWLINKD_BIN" --config "$GWLINKD_TOML" --pub-config "$GWLINKD_PUB" --force
   $SUDO "$GWLINKD_BIN" service status --system || true
   # 自检（只提示，不阻断）：安装 / 升级完立刻把「信任锚 / 中心可达 / 环回面」的问题摆出来。
   # 信任锚是**现场值**（identity/gwlinkd/.env），站点搬过目录时可能还指着旧路径 —— 这里能直接看到 FAIL。
