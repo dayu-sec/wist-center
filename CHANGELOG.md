@@ -28,6 +28,16 @@
   读不到就**不返回**该字段（页面显示 `—`），绝不编造。`version`（二进制版本）形状不变，
   与网关侧 `wist-gateway` 同口径。
 
+## [0.32.1-alpha] - 2026-11-04
+
+### 修复
+
+- **macOS 上跑网关安装脚本必挂在 `gops prj import`**（`failed to verify TLS certificate: UnknownIssuer`）：
+  旧脚本把中心产物 URL 直接交给 gops，而 gops 的下载器是 rustls + rustls-platform-verifier ——
+  macOS 上只认钥匙串、**不读 `SSL_CERT_FILE`**（Linux 走 rustls-native-certs 才读），脚本导出的
+  「系统根 + 中心CA」bundle 对它无效，自签中心就验不过。
+  改为**包由 curl（带 `--cacert`）下到本地，gops 只吃本地文件**：两端平台行为一致，也不再依赖运行环境的信任库状态。
+
 ## [0.32.0-alpha] - 2026-11-04
 
 ### 变更
