@@ -18,6 +18,16 @@
   ⚠ 顺序：先升 center + 重跑安装脚本，或保证现场 gwlinkd 仍是 0.19.x —— 旧脚本 + 0.20 会报
   「未知参数：--run-as」。
 
+## [0.31.0-alpha] - 2026-11-04
+
+### 新增
+
+- **`GET /api/v1/version` 增加可省的 `stack_version`**（部署这套中心的 center-stack 版本）：
+  取值优先环境变量 `WIST_CENTER_STACK_VERSION`，其次文件 `WIST_CENTER_STACK_VERSION_FILE`
+  （默认 `/config/stack-version.txt`，由 center-stack 把 `version.txt` 只读挂进容器）；
+  读不到就**不返回**该字段（页面显示 `—`），绝不编造。`version`（二进制版本）形状不变，
+  与网关侧 `wist-gateway` 同口径。
+
 ## [Unreleased]
 
 ### 变更
