@@ -28,7 +28,7 @@
   读不到就**不返回**该字段（页面显示 `—`），绝不编造。`version`（二进制版本）形状不变，
   与网关侧 `wist-gateway` 同口径。
 
-## [Unreleased]
+## [0.32.0-alpha] - 2026-11-04
 
 ### 变更
 
@@ -37,6 +37,14 @@
   VM 侧不用先 join 网关就能回答「这台机器叫什么、是哪个地址」。
 - **不改 `agent_info` 的 label 集合**：把 IP 塞进版本/metadata 序列会让 IP 变更多出一条
   `agent_info`，`count(agent_info)` 之类的存活/版本查询会被旧序列抬大。
+
+### 修复
+
+- **非 root 主机跑 `install-all` / `install-linkd` 第一步就挂**：脚本第 45 行的日志文案写成
+  `$TOOL_DIR（`，UTF-8 locale 下 bash 把全角括号吃进变量名（变成查 `TOOL_DIR（`），`set -u`
+  直接 `bash: TOOL_DIR?: unbound variable`（只有走「工具目录不可写 → 借 sudo」那一支才触发，
+  所以 root 安装看不出来）。变量紧邻中文/全角标点一律写 `${VAR}`；
+  另加渲染脚本门禁 `assert_braced_vars_before_non_ascii` —— `bash -n` 抓不到这类错，只有运行时炸。
 
 ## [0.30.0-alpha] - 2026-11-04
 
