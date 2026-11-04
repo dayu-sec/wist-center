@@ -6274,6 +6274,11 @@ mod tests {
             // 仓库地址来自配置 `[artifacts] gateway_project_repo`（部署栈里由 vars 渲染）。
             "https://git.example.test/gateway-tx.git",
             "gops prj import",
+            // 包由 curl（带中心 CA）下到本地，gops 只吃本地文件：它自带的下载器在 macOS 上
+            // 不认 SSL_CERT_FILE（rustls-platform-verifier 只认钥匙串），直喂 URL 会 UnknownIssuer。
+            "STACK_PKG_URL='http",
+            "curl -fsSL \"${CURL_TLS[@]}\" \"$STACK_PKG_URL\" -o \"$STACK_PKG\"",
+            "gops prj import --path \"$STACK_PKG\"",
             "gops sys localize",
             "gops run download",
             "gops run start",
@@ -6307,6 +6312,12 @@ mod tests {
             "生成的脚本里不能有 `//` 注释：\n{body}"
         );
         assert_braced_vars_before_non_ascii("install-all", &body);
+        // 自签中心不能让 gops 自己去下：它不认 SSL_CERT_FILE，必须 curl 下到本地再 import。
+        assert!(
+            !body.contains("gops prj import --path '"),
+            "不能把中心 URL 直接交给 gops 下载：\n{body}"
+        );
+        assert_bash_syntax("install-all", &body);
 
         // 券无效 → 401。
         let response = app

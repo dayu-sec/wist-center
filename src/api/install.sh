@@ -203,9 +203,18 @@ fi
 cd "$PROJECT_ROOT"
 
 # c) 导入最新 gateway-stack
-#    中心是自签 CA：gops 走系统/原生信任库（SSL_CERT_FILE=系统根+中心CA）验证，无需 -k、也无需先下本地。
-log "gops prj import --path <gateway-stack>"
-gops prj import --path '__STACK_URL__'
+#    包**先用 curl 下到本地**，再让 gops 只吃本地文件：gops 的下载器是
+#    rustls + rustls-platform-verifier —— macOS 上只认钥匙串、**不读 SSL_CERT_FILE**
+#    （Linux 走 rustls-native-certs 才读），自签中心会 `UnknownIssuer`；
+#    本脚本导出的 bundle 对它无效，所以 TLS 一律交给 curl（`--cacert`）做。
+STACK_PKG_URL='__STACK_URL__'
+STACK_PKG_DIR="$(mktemp -d)"
+STACK_PKG="$STACK_PKG_DIR/$(basename "$STACK_PKG_URL")"
+log "下载 gateway-stack 包：$STACK_PKG_URL"
+curl -fsSL "${CURL_TLS[@]}" "$STACK_PKG_URL" -o "$STACK_PKG"
+log "gops prj import --path <本地 gateway-stack 包>"
+gops prj import --path "$STACK_PKG"
+rm -rf "$STACK_PKG_DIR"
 
 # c.1) 全新安装必须先设定网关对外域名（WEB_DOMAIN：站点证书 SAN + 网关 public_base_url 的 host）。
 #      来源优先级：安装命令里带的 domain → 环境变量 GATEWAY_DOMAIN → 交互输入。
