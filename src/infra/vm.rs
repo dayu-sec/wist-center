@@ -84,7 +84,8 @@ pub async fn push_gateway_status(
     Ok(())
 }
 
-/// 推送 Gateway 上报的 Agent 状态到 VM（每 agent 三行：agent_up / agent_info / agent_health）。
+/// 推送 Gateway 上报的 Agent 状态到 VM（每 agent 三到四行：agent_up / agent_info /
+/// agent_health / 有主机名或 IP 时再一条 agent_host_info）。
 pub async fn push_agent_status(
     client: &Client,
     base_url: &str,
@@ -634,6 +635,9 @@ fn opt_f64(value: Option<i64>) -> Option<f64> {
 ///
 /// 序列 label 用规范键 `agent`（不是报文里的 `agent_id`）；三个规范指标的**名字与单位**取自
 /// `wist_metrics::names`：CPU 写**单核比例**、时延写**秒**。
+///
+/// 主机网络身份单独一条 `agent_host_info{hostname,host_ip}`（有值才发）：不把 IP 塞进 `agent_info`，
+/// 否则 IP 一变就会多出一条 `agent_info`，`count(agent_info)` 之类的版本/存活查询会被旧序列抬大。
 fn render_agent_lines(gateway_id: &str, agent: &StoredAgent) -> String {
     let ts = agent.last_seen_at.to_chrono().timestamp_millis();
     let up = if agent.status == "online" { 1 } else { 0 };
@@ -642,11 +646,17 @@ fn render_agent_lines(gateway_id: &str, agent: &StoredAgent) -> String {
     let version = escape_label(&agent.version);
     let health = escape_label(&agent.health);
     let agent_label = format!("{}=\"{agent_id}\"", label::AGENT);
+
     let mut text = format!(
         "agent_up{{{agent_label},gateway_id=\"{gateway_id}\"}} {up} {ts}\n\
          agent_info{{{agent_label},gateway_id=\"{gateway_id}\",version=\"{version}\"}} 1 {ts}\n\
          agent_health{{{agent_label},gateway_id=\"{gateway_id}\",health=\"{health}\"}} 1 {ts}\n"
     );
+    if let Some(host_labels) = host_info_labels(agent) {
+        text.push_str(&format!(
+            "agent_host_info{{{agent_label},gateway_id=\"{gateway_id}\"{host_labels}}} 1 {ts}\n"
+        ));
+    }
     if let Some(memory) = agent.memory_bytes {
         text.push_str(&format!(
             "{name}{{{agent_label},gateway_id=\"{gateway_id}\"}} {memory} {ts}\n",
@@ -676,6 +686,48 @@ fn escape_label(value: &str) -> String {
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', "\\n")
+}
+
+/// 主机网络身份 label 串（前导逗号），两个值都没有时返回 `None`（不发这条序列）。
+///
+/// 只放**单值、会变、用于展示/定位**的字段：`hostname` 与主 IP。`node_id` 不进
+/// （它是控制面分配的身份，会随 `instance_name` 改名，且默认就等于主机名）。
+fn host_info_labels(agent: &StoredAgent) -> Option<String> {
+    let mut labels = String::new();
+    if let Some(hostname) = agent.hostname.as_deref()
+        && !hostname.is_empty()
+    {
+        labels.push_str(&format!(",hostname=\"{}\"", escape_label(hostname)));
+    }
+    if let Some(host_ip) = primary_host_ip(agent.ip_addresses.as_deref()) {
+        labels.push_str(&format!(",host_ip=\"{}\"", escape_label(host_ip)));
+    }
+    (!labels.is_empty()).then_some(labels)
+}
+
+/// 主 IP：非回环 IPv4，按接口名排序取第一条（与 agentd / 日志链路的 `host_ip` 同一口径）。
+///
+/// 注册表里的 `ip_addresses` 形如 `en0 192.168.1.5/24`；多网卡只能取一个值，否则
+/// `agent_host_info` 会按地址裂出多条序列。取不到就不写该 label。
+fn primary_host_ip(ip_addresses: Option<&[String]>) -> Option<&str> {
+    let mut candidates: Vec<(&str, &str)> = ip_addresses?
+        .iter()
+        .filter_map(|entry| {
+            // 注册表格式是 `<iface> <addr>/<prefix>`；`split_whitespace` 容忍多余空白。
+            let mut tokens = entry.split_whitespace();
+            let iface = tokens.next()?;
+            let spec = tokens.next()?;
+            let addr = spec.split('/').next()?;
+            let parsed: std::net::Ipv4Addr = addr.parse().ok()?;
+            // 注册表里存的是 agentd 已滤过噪声的列表，这里再判一次回环是纵深防御。
+            if parsed.is_loopback() {
+                return None;
+            }
+            Some((iface, addr))
+        })
+        .collect();
+    candidates.sort();
+    candidates.into_iter().next().map(|(_, addr)| addr)
 }
 
 #[cfg(test)]
@@ -857,6 +909,84 @@ mod tests {
     }
 
     #[test]
+    fn primary_host_ip_takes_the_first_non_loopback_ipv4_by_interface() {
+        let addresses = vec![
+            "utun100 100.64.0.9/32".to_string(),
+            "lo0 127.0.0.1/8".to_string(),
+            "en1 10.0.0.7/24".to_string(),
+            "en0 fd00::1/64".to_string(),
+            "en0 192.168.1.5/24".to_string(),
+        ];
+        // 回环与 IPv6 被跳过；剩下的按接口名排序，en0 排第一。
+        assert_eq!(primary_host_ip(Some(&addresses)), Some("192.168.1.5"));
+        // 枚举侧多拼了空格也不丢地址。
+        assert_eq!(
+            primary_host_ip(Some(&["  eth0   10.1.2.3/24  ".to_string()])),
+            Some("10.1.2.3")
+        );
+        assert_eq!(primary_host_ip(Some(&[])), None);
+        assert_eq!(primary_host_ip(None), None);
+    }
+
+    #[test]
+    fn agent_host_info_is_omitted_when_unknown() {
+        let agent = StoredAgent {
+            agent_id: "agent-1".to_string(),
+            gateway_id: "gw-x".to_string(),
+            instance_id: "inst-a".to_string(),
+            version: "v0.3.2".to_string(),
+            status: "online".to_string(),
+            health: "healthy".to_string(),
+            memory_bytes: None,
+            cpu_percent: None,
+            admin_latency_ms: None,
+            last_seen_at: DateTime::from_rfc3339("2026-08-08T12:00:00Z").expect("ts"),
+            node_id: None,
+            hostname: None,
+            ip_addresses: None,
+        };
+        let text = render_agent_lines("gw-x", &agent);
+        assert!(
+            text.contains("agent_info{agent=\"agent-1\",gateway_id=\"gw-x\",version=\"v0.3.2\"}"),
+            "`agent_info` 的 label 集合保持不变：{text}"
+        );
+        assert!(!text.contains("agent_host_info"), "没有 IP 时不发这条序列");
+    }
+
+    #[test]
+    fn agent_host_info_uses_hostname_when_only_ipv6_is_available() {
+        let agent = StoredAgent {
+            agent_id: "agent-1".to_string(),
+            gateway_id: "gw-x".to_string(),
+            instance_id: "inst-a".to_string(),
+            version: "v0.3.2".to_string(),
+            status: "online".to_string(),
+            health: "healthy".to_string(),
+            memory_bytes: None,
+            cpu_percent: None,
+            admin_latency_ms: None,
+            last_seen_at: DateTime::from_rfc3339("2026-08-08T12:00:00Z").expect("ts"),
+            node_id: None,
+            hostname: Some("host-1".to_string()),
+            ip_addresses: Some(vec![
+                "lo0 127.0.0.1/8".to_string(),
+                "en0 fd00::1/64".to_string(),
+            ]),
+        };
+        let text = render_agent_lines("gw-x", &agent);
+        assert!(
+            text.contains(
+                "agent_host_info{agent=\"agent-1\",gateway_id=\"gw-x\",hostname=\"host-1\"}"
+            ),
+            "没有可用 IPv4 时仍用主机名定位机器：{text}"
+        );
+        assert!(
+            !text.contains("host_ip="),
+            "不得编一个 IPv6 / 回环地址：{text}"
+        );
+    }
+
+    #[test]
     fn renders_agent_lines() {
         let agent = StoredAgent {
             agent_id: "agent-1".to_string(),
@@ -880,6 +1010,9 @@ mod tests {
         )));
         assert!(text.contains(&format!(
             "agent_info{{agent=\"agent-1\",gateway_id=\"gw-x\",version=\"v0.3.2\"}} 1 {ts}"
+        )));
+        assert!(text.contains(&format!(
+            "agent_host_info{{agent=\"agent-1\",gateway_id=\"gw-x\",hostname=\"host-1\",host_ip=\"192.168.1.5\"}} 1 {ts}"
         )));
         assert!(text.contains(&format!(
             "agent_health{{agent=\"agent-1\",gateway_id=\"gw-x\",health=\"healthy\"}} 1 {ts}"
