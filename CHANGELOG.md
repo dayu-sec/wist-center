@@ -28,6 +28,17 @@
   读不到就**不返回**该字段（页面显示 `—`），绝不编造。`version`（二进制版本）形状不变，
   与网关侧 `wist-gateway` 同口径。
 
+## [0.33.1-alpha] - 2026-11-05
+
+### 修复
+
+- **安装后的 `ops-prj.yml` 把升级地址记成了本地临时路径**（0.32.1 引入）：当时为了绕开 gops 在
+  macOS 上不认 `SSL_CERT_FILE`，改成「curl 下包 → `gops prj import --path <本地包>`」；但 gops 会把
+  **这个临时路径**写进 `ops-prj.yml` 的 `addr`（形如 `/tmp/tmp.XXXX/wist-gateway-stack-v{version}.tar.gz`），
+  目录随即被删 → 后续 `gops prj upgrade -v X` 去死目录找包。
+  现在导入后自动把 `addr` 改回「中心地址 + `{version}` 模板」：安装仍不依赖 gops 的 TLS，
+  升级也能回源取新版。
+
 ## [0.33.0-alpha] - 2026-11-05
 
 ### 新增
