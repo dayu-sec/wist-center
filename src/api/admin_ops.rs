@@ -6274,21 +6274,17 @@ mod tests {
             // 仓库地址来自配置 `[artifacts] gateway_project_repo`（部署栈里由 vars 渲染）。
             "https://git.example.test/gateway-tx.git",
             "gops prj import",
-            // 包由 curl（带中心 CA）下到本地，gops 只吃本地文件：它自带的下载器在 macOS 上
-            // 不认 SSL_CERT_FILE（rustls-platform-verifier 只认钥匙串），直喂 URL 会 UnknownIssuer。
-            "STACK_PKG_URL='http",
+            // 包**直接回源**（不再先 curl 下到本地）：CA 已落进系统信任库/钥匙串，gops 的 rustls
+            // 两边都能验。走本地临时包会把 addr 记成 /tmp 路径，后续 `prj upgrade -v X` 找不到包。
+            "gops prj import --path 'http",
             // git 不读 SSL_CERT_FILE（Debian/Ubuntu 的 git 链接 libcurl-gnutls），必须显式给 GIT_SSL_CAINFO，
             // 否则脚本里的 git clone 报 `CAfile: none`。
             "export GIT_SSL_CAINFO=\"$CA_BUNDLE\"",
             // 再落系统信任库：脚本退出后手敲的 git/curl/docker 也直接信任这套中心。
             "wist-control-center-",
             "/usr/local/share/ca-certificates/",
-            "curl -fsSL \"${CURL_TLS[@]}\" \"$STACK_PKG_URL\" -o \"$STACK_PKG\"",
-            "gops prj import --path \"$STACK_PKG\"",
-            // 本地 import 会把临时路径记进 ops-prj.yml 的 addr（随后被删）→ 后续 upgrade 去死目录找包。
-            // 导入后必须把 addr 改回「中心地址 + {version} 模板」。
-            "url: \" + templated",
-            "ops-prj.yml 的 addr 已改为：",
+            // macOS：gops 只认钥匙串，这步必须真装（不只是打印提示）。
+            "security add-trusted-cert",
             "gops sys localize",
             "gops run download",
             "gops run start",
@@ -6322,10 +6318,10 @@ mod tests {
             "生成的脚本里不能有 `//` 注释：\n{body}"
         );
         assert_braced_vars_before_non_ascii("install-all", &body);
-        // 自签中心不能让 gops 自己去下：它不认 SSL_CERT_FILE，必须 curl 下到本地再 import。
+        // 不能再回退到「下到本地再 import」：那样 ops-prj.yml 的 addr 会被记成临时路径。
         assert!(
-            !body.contains("gops prj import --path '"),
-            "不能把中心 URL 直接交给 gops 下载：\n{body}"
+            !body.contains("gops prj import --path \"$STACK_PKG\""),
+            "必须直接让 gops 回源取包：\n{body}"
         );
         assert_bash_syntax("install-all", &body);
 
