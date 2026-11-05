@@ -28,6 +28,15 @@
   读不到就**不返回**该字段（页面显示 `—`），绝不编造。`version`（二进制版本）形状不变，
   与网关侧 `wist-gateway` 同口径。
 
+## [0.32.2-alpha] - 2026-11-04
+
+### 修复
+
+- **全新安装挂在 `git clone`**（`server certificate verification failed. CAfile: none`）：脚本导出了
+  `SSL_CERT_FILE`，但 **git 不读它** —— Debian/Ubuntu 的 git 链接的是 libcurl-gnutls，GnuTLS 不认该变量；
+  `curl` 命令行是 OpenSSL 所以前面的制品下载都是好的，一到克隆部署工程就垮。
+  修法：CA bundle 同时导出 `GIT_SSL_CAINFO`（→ `CURLOPT_CAINFO`，对所有 TLS 后端生效）。
+
 ## [0.32.1-alpha] - 2026-11-04
 
 ### 修复
