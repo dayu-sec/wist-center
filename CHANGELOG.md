@@ -28,6 +28,19 @@
   读不到就**不返回**该字段（页面显示 `—`），绝不编造。`version`（二进制版本）形状不变，
   与网关侧 `wist-gateway` 同口径。
 
+## [0.33.0-alpha] - 2026-11-05
+
+### 新增
+
+- **中心 CA 落系统信任库**（`prepare-script` 与 `install-all` 都会做）：全新机器准备完环境后，
+  宿主上的 `git` / `curl` / `docker` / `gops` 直接信任这套中心，不再需要 `SSL_CERT_FILE` /
+  `GIT_SSL_CAINFO` 逐条摆弄（后者正是 0.32.2 修的那个坑）。
+  - Debian/Ubuntu：`/usr/local/share/ca-certificates/` + `update-ca-certificates`；RHEL/CentOS：
+    `/etc/pki/ca-trust/source/anchors/` + `update-ca-trust`；
+  - 文件名带中心主机名（`wist-control-center-<host>.crt`）：一台机器连多套中心互不覆盖，重跑幂等；
+  - macOS：`install-all` 只打印 `security add-trusted-cert` 命令（**不**自动改钥匙串）；
+  - 关闭：`WIST_TRUST_CENTER_CA=0`（`prepare-script`）。
+
 ## [0.32.2-alpha] - 2026-11-04
 
 ### 修复
