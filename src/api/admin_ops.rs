@@ -6277,6 +6277,9 @@ mod tests {
             // 包由 curl（带中心 CA）下到本地，gops 只吃本地文件：它自带的下载器在 macOS 上
             // 不认 SSL_CERT_FILE（rustls-platform-verifier 只认钥匙串），直喂 URL 会 UnknownIssuer。
             "STACK_PKG_URL='http",
+            // git 不读 SSL_CERT_FILE（Debian/Ubuntu 的 git 链接 libcurl-gnutls），必须显式给 GIT_SSL_CAINFO，
+            // 否则脚本里的 git clone 报 `CAfile: none`。
+            "export GIT_SSL_CAINFO=\"$CA_BUNDLE\"",
             "curl -fsSL \"${CURL_TLS[@]}\" \"$STACK_PKG_URL\" -o \"$STACK_PKG\"",
             "gops prj import --path \"$STACK_PKG\"",
             "gops sys localize",

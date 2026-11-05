@@ -63,6 +63,10 @@ if grep -q 'BEGIN CERTIFICATE' "$CA_CENTER" 2>/dev/null; then
   if [ -n "$sys_bundle" ]; then cat "$sys_bundle" "$CA_CENTER" > "$CA_BUNDLE"; else cp "$CA_CENTER" "$CA_BUNDLE"; fi
   export SSL_CERT_FILE="$CA_BUNDLE"
   export CURL_CA_BUNDLE="$CA_BUNDLE"
+  # **git 不读 SSL_CERT_FILE**：Debian/Ubuntu 的 git 链接的是 libcurl-gnutls，GnuTLS 不认该变量
+  # （curl 命令行走 OpenSSL 所以能验）。`GIT_SSL_CAINFO` → CURLOPT_CAINFO，对所有 TLS 后端都生效；
+  # 不设它就是下面 `git clone` 报 `server certificate verification failed. CAfile: none`。
+  export GIT_SSL_CAINFO="$CA_BUNDLE"
   CURL_TLS=(--cacert "$CA_BUNDLE")
   log "已载入中心 CA（TLS 全程校验）：$CA_BUNDLE"
 else
