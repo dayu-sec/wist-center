@@ -5,6 +5,26 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.33.3-alpha] - 2026-11-05
+
+### 修复
+
+- **发布列表的兼容性检查看不到网关侧组件：`wist-gwlinkd` 永远显示「未知」**。
+  `GET /api/v1/admin/releases/:component` 的「当前版本」原来只喂了本机 `wist-center`，
+  而 `wist-gateway-stack` 的 `compat.json` 要求的是 `wist-gwlinkd >= 0.18.4` ——
+  gwlinkd 跑在**网关宿主**上，中心本机根本没有它，于是每个 gateway-stack 包都挂一条
+  「当前节点没有 `wist-gwlinkd` 的版本信息，无法判定兼容性」，而中心其实早就从 status
+  上报里收到了这个版本（`StoredGateway::gwlinkd_version`）。
+
+  现在按**整个纳管面**算：本机 `wist-center` + 全部未归档网关上报的
+  `wist-gateway` / `wist-gwlinkd` **最低版本**。取最低是保守口径 ——
+  「有一台不满足就不算可发」，与计划批准时 `rollout::target_compatibility_errors`
+  的逐台校验同一语义（那里逐台报错，这里只给汇总）。
+
+  从未上报过版本的网关（刚建、还没接入）和已归档的网关不参与比较，
+  不会凭空给每个包挂一条假告警；`list_gateways` 读失败时退回「只知道本机」的旧口径，
+  不让发布列表变 500。
+
 ## [0.30.1-alpha] - 2026-11-04
 
 ### 变更

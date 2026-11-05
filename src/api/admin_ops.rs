@@ -1628,6 +1628,59 @@ pub async fn admin_resolve_cos(
     }
 }
 
+/// 发布列表里「当前版本」的口径：**本机中心 + 全部未归档网关上报的最低版本**。
+///
+/// 为什么不是只报本机：`wist-gateway-stack` 的 `compat.json` 声明
+/// `requires = { wist-center, wist-gwlinkd }`，而 gwlinkd 跑在**网关宿主**上，中心本机根本没有它。
+/// 只按本机算，`wist-gwlinkd` 永远是「未知」，页面就挂着一条永远消不掉的告警 ——
+/// 而中心其实早就从 `status` 上报里收到了这个版本（`StoredGateway::gwlinkd_version`）。
+///
+/// 取**最低**是对「这个版本能不能发」的保守回答：只要有一台不满足就不该全量发 ——
+/// 与 `rollout::target_compatibility_errors` 的逐台校验同一语义（那里逐台报错，这里只给汇总）。
+/// 从没上报过版本的网关（刚建、从未接入）不参与比较，否则会给每个包挂一条假告警。
+async fn fleet_compat_current(state: &ApiState) -> std::collections::BTreeMap<String, String> {
+    let mut current = std::collections::BTreeMap::new();
+    current.insert(
+        "wist-center".to_string(),
+        env!("CARGO_PKG_VERSION").to_string(),
+    );
+    let gateways = match state.store.list_gateways().await {
+        Ok(gateways) => gateways,
+        Err(err) => {
+            // 读不到网关不该让发布列表变 500；退回「只知道本机」的旧口径。
+            log::warn!(
+                "event=ReleaseCompatFleetVersionsUnavailable error={}",
+                err.display_chain()
+            );
+            return current;
+        }
+    };
+    for gateway in gateways
+        .iter()
+        .filter(|gateway| gateway.archived_at.is_none())
+    {
+        for (peer, version) in [
+            ("wist-gateway", gateway.version.as_deref()),
+            ("wist-gwlinkd", gateway.gwlinkd_version.as_deref()),
+        ] {
+            let Some(version) = version.map(str::trim).filter(|value| !value.is_empty()) else {
+                continue;
+            };
+            let lower = match current.get(peer) {
+                None => true,
+                // 认不出/解析不了的版本不参与「最低」比较，否则一个手填的乱码能顶掉真实结论。
+                Some(best) => {
+                    wist_release::compat::satisfies(version, &format!("<={best}")) == Some(true)
+                }
+            };
+            if lower {
+                current.insert(peer.to_string(), version.to_string());
+            }
+        }
+    }
+    current
+}
+
 /// 查询某组件的发布记录：GET /api/v1/admin/releases/:component（新→旧）。
 pub async fn admin_list_releases(
     State(state): State<ApiState>,
@@ -1659,12 +1712,9 @@ pub async fn admin_list_releases(
         }
     };
     let mut packages = crate::infra::group_release_packages(&component, releases);
-    // 列表读投影：按**当前中心版本**给每个包算一份兼容报告。网关侧的最终校验仍在
-    // 包入库 / 计划批准时做（那里才知道每台网关的 version / gwlinkd_version）。
-    let current = std::collections::BTreeMap::from([(
-        "wist-center".to_string(),
-        env!("CARGO_PKG_VERSION").to_string(),
-    )]);
+    // 列表读投影：按**当前纳管面**（本机中心 + 各网关上报的最低版本）给每个包算一份兼容报告。
+    // 网关侧的**最终**校验仍在计划批准时逐台做（那里才知道具体是哪一台不满足）。
+    let current = fleet_compat_current(&state).await;
     let checked_at = chrono::Utc::now().to_rfc3339();
     for package in &mut packages {
         package.compatibility = Some(wist_release::compat::check(
@@ -7132,5 +7182,125 @@ mod tests {
         let (status, _) =
             get_json(&app, "/api/v1/admin/package-sources/latest?component=ghost").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// 发布列表的「当前版本」必须带上**网关上报的** gwlinkd 版本。
+    ///
+    /// 现场症状：`wist-gateway-stack` 的 compat.json 要求 `wist-gwlinkd >= 0.18.4`，
+    /// 而列表只喂了 `wist-center`，于是每个 gateway-stack 包都挂一条
+    /// 「当前节点没有 `wist-gwlinkd` 的版本信息，无法判定兼容性」——
+    /// 明明三台网关都在报 0.20.0。
+    #[tokio::test]
+    async fn release_list_uses_gateway_reported_peer_versions() {
+        let store = gateway_store(1);
+        store
+            .update(|snapshot| {
+                if let Some(gateway) = snapshot.gateways.get_mut("gw-001") {
+                    gateway.version = Some("0.39.0".to_string());
+                    gateway.gwlinkd_version = Some("0.20.0".to_string());
+                }
+            })
+            .expect("seed versions");
+        let manifest: wist_release::compat::CompatManifest =
+            serde_json::from_str(r#"{"requires":{"wist-gwlinkd":">=0.18.4"}}"#).expect("manifest");
+        store
+            .publish_release_with_compat(
+                "wist-gateway-stack",
+                "0.8.39",
+                "https://example/stack.tar.gz",
+                None,
+                None,
+                Some(manifest),
+            )
+            .expect("release");
+
+        let (status, body) = get_json(
+            &super::super::router_for(state_with_store(store)),
+            "/api/v1/admin/releases/wist-gateway-stack",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let compat = &body[0]["compatibility"];
+        assert_eq!(compat["current"]["wist-gwlinkd"], "0.20.0", "{compat}");
+        assert_eq!(compat["current"]["wist-gateway"], "0.39.0", "{compat}");
+        assert_eq!(compat["status"], "ok", "{compat}");
+    }
+
+    /// 多台网关版本不一致时取**最低**：一台不满足就不该算「可以发」。
+    #[tokio::test]
+    async fn release_compat_uses_the_oldest_reported_gateway_version() {
+        let store = gateway_store(2);
+        store
+            .update(|snapshot| {
+                if let Some(gateway) = snapshot.gateways.get_mut("gw-001") {
+                    gateway.version = Some("0.39.0".to_string());
+                    gateway.gwlinkd_version = Some("0.20.0".to_string());
+                }
+                if let Some(gateway) = snapshot.gateways.get_mut("gw-002") {
+                    gateway.version = Some("0.37.0".to_string());
+                    gateway.gwlinkd_version = Some("0.18.0".to_string());
+                }
+            })
+            .expect("seed versions");
+        let manifest: wist_release::compat::CompatManifest =
+            serde_json::from_str(r#"{"requires":{"wist-gwlinkd":">=0.18.4"}}"#).expect("manifest");
+        store
+            .publish_release_with_compat(
+                "wist-gateway-stack",
+                "0.8.39",
+                "https://example/stack.tar.gz",
+                None,
+                None,
+                Some(manifest),
+            )
+            .expect("release");
+
+        let (status, body) = get_json(
+            &super::super::router_for(state_with_store(store)),
+            "/api/v1/admin/releases/wist-gateway-stack",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let compat = &body[0]["compatibility"];
+        assert_eq!(compat["current"]["wist-gwlinkd"], "0.18.0", "{compat}");
+        assert_eq!(compat["status"], "error", "{compat}");
+    }
+
+    /// 从未上报过版本的网关（刚建、没接入）不能参与「最低」比较，
+    /// 否则每个包都会凭空多一条「不满足」。
+    #[tokio::test]
+    async fn release_compat_ignores_gateways_without_reported_versions() {
+        let store = gateway_store(2);
+        store
+            .update(|snapshot| {
+                if let Some(gateway) = snapshot.gateways.get_mut("gw-001") {
+                    gateway.version = Some("0.39.0".to_string());
+                    gateway.gwlinkd_version = Some("0.20.0".to_string());
+                }
+                // gw-002 保持 None：从没接入过
+            })
+            .expect("seed versions");
+        let manifest: wist_release::compat::CompatManifest =
+            serde_json::from_str(r#"{"requires":{"wist-gwlinkd":">=0.18.4"}}"#).expect("manifest");
+        store
+            .publish_release_with_compat(
+                "wist-gateway-stack",
+                "0.8.39",
+                "https://example/stack.tar.gz",
+                None,
+                None,
+                Some(manifest),
+            )
+            .expect("release");
+
+        let (status, body) = get_json(
+            &super::super::router_for(state_with_store(store)),
+            "/api/v1/admin/releases/wist-gateway-stack",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let compat = &body[0]["compatibility"];
+        assert_eq!(compat["current"]["wist-gwlinkd"], "0.20.0", "{compat}");
+        assert_eq!(compat["status"], "ok", "{compat}");
     }
 }
