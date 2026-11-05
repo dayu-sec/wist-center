@@ -28,6 +28,19 @@
   读不到就**不返回**该字段（页面显示 `—`），绝不编造。`version`（二进制版本）形状不变，
   与网关侧 `wist-gateway` 同口径。
 
+## [0.33.2-alpha] - 2026-11-05
+
+### 变更（取代 0.33.1 的绕法）
+
+- **gateway-stack 包改回「gops 直接回源」**：0.32.1 当时为了绕 macOS 上 gops 不认 `SSL_CERT_FILE`，
+  改成「curl 下到临时目录 → `prj import --path <本地包>`」；副作用是 gops 把临时路径记进
+  `ops-prj.yml` 的 `addr`，后续 `prj upgrade -v X` 去死目录找包。现在 CA 已经由本脚本落进
+  **系统信任库**（Linux `update-ca-certificates`）/ **系统钥匙串**（macOS `security add-trusted-cert`，
+  以前只打印提示），gops 的 rustls 两端都能验 → 直接 `gops prj import --path <中心地址>`，
+  `addr` 自然就是可跟版的热地址（`{version}` 模板由 gops 自己写）。
+  - 0.32.1/0.33.1 的下载+导入+改 addr 三段代码全部撤掉；
+  - macOS 的钥匙串安装可关：`WIST_TRUST_CENTER_CA=0`。
+
 ## [0.33.1-alpha] - 2026-11-05
 
 ### 修复
