@@ -6280,6 +6280,9 @@ mod tests {
             // git 不读 SSL_CERT_FILE（Debian/Ubuntu 的 git 链接 libcurl-gnutls），必须显式给 GIT_SSL_CAINFO，
             // 否则脚本里的 git clone 报 `CAfile: none`。
             "export GIT_SSL_CAINFO=\"$CA_BUNDLE\"",
+            // 再落系统信任库：脚本退出后手敲的 git/curl/docker 也直接信任这套中心。
+            "wist-control-center-",
+            "/usr/local/share/ca-certificates/",
             "curl -fsSL \"${CURL_TLS[@]}\" \"$STACK_PKG_URL\" -o \"$STACK_PKG\"",
             "gops prj import --path \"$STACK_PKG\"",
             "gops sys localize",

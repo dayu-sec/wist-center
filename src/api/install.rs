@@ -437,6 +437,52 @@ ensure_prereqs() {
   log "前置就绪：$(docker --version)"
 }
 ensure_prereqs
+
+# 中心 CA（自签）→ **系统信任库**：之后 git / curl / docker / gops 都直接信任这套中心。
+# 为什么不只靠环境变量：`SSL_CERT_FILE` 只对 OpenSSL 生效，Debian/Ubuntu 的 git 链接的是
+# libcurl-gnutls（**GnuTLS 不认它**），`git clone` 会报 `server certificate verification failed.
+# CAfile: none`；系统信任库对所有 TLS 后端都生效。
+# 跳过：`WIST_TRUST_CENTER_CA=0`（例如现场已经手工装过别的 CA）。
+trust_center_ca() {
+  if [ "${WIST_TRUST_CENTER_CA:-1}" = "0" ]; then
+    log "跳过中心 CA（WIST_TRUST_CENTER_CA=0）"
+    return 0
+  fi
+  ca_tmp="$(mktemp)"
+  cat > "$ca_tmp" <<'WIST_CENTER_CA_EOF'
+__CENTER_CA_PEM__
+WIST_CENTER_CA_EOF
+  if ! grep -q 'BEGIN CERTIFICATE' "$ca_tmp" 2>/dev/null; then
+    log "中心未提供 CA（公网 CA 或未配置）→ 跳过系统信任库"
+    rm -f "$ca_tmp"
+    return 0
+  fi
+  # 文件名带中心主机名：同一台机器连多套中心时互不覆盖。
+  ca_name="wist-control-center-__CENTER_HOST__.crt"
+  if [ "$(id -u)" = "0" ]; then ca_sudo=""
+  elif command -v sudo >/dev/null 2>&1; then ca_sudo="sudo"
+  else
+    log "非 root 且无 sudo → 跳过系统信任库（git 仍需 GIT_SSL_CAINFO）"
+    rm -f "$ca_tmp"
+    return 0
+  fi
+  if command -v update-ca-certificates >/dev/null 2>&1; then
+    $ca_sudo install -m 0644 "$ca_tmp" "/usr/local/share/ca-certificates/$ca_name" \
+      && $ca_sudo update-ca-certificates >/dev/null \
+      && log "已信任中心 CA（系统库）：/usr/local/share/ca-certificates/$ca_name" \
+      || log "写系统信任库失败（不阻断；git 仍可用 GIT_SSL_CAINFO）"
+  elif command -v update-ca-trust >/dev/null 2>&1; then
+    $ca_sudo install -m 0644 "$ca_tmp" "/etc/pki/ca-trust/source/anchors/$ca_name" \
+      && $ca_sudo update-ca-trust \
+      && log "已信任中心 CA（系统库）：/etc/pki/ca-trust/source/anchors/$ca_name" \
+      || log "写系统信任库失败（不阻断；git 仍可用 GIT_SSL_CAINFO）"
+  else
+    log "本机无 update-ca-certificates / update-ca-trust → 跳过系统信任库"
+  fi
+  rm -f "$ca_tmp"
+}
+trust_center_ca
+
 log "环境准备完成；接下来运行「安装」命令。"
 "#;
 
@@ -449,7 +495,38 @@ pub fn build_prepare_script_command(public_url: &str) -> String {
     format!("curl -fsSLk '{endpoint}' | bash")
 }
 
-/// 前置准备端点限流桶（公开、无令牌）。
+/// 处理前置环境准备脚本：内嵌中心 CA（→ 系统信任库），并把中心主机名烘进 CA 文件名。
+fn render_prepare_script(ca_pem: Option<&str>, public_url: &str) -> String {
+    PREPARE_SCRIPT_TEMPLATE
+        .replace("__CENTER_CA_PEM__", ca_pem.unwrap_or(""))
+        .replace("__CENTER_HOST__", &ca_file_host(public_url))
+}
+
+/// 系统信任库里 CA 文件名的后缀（中心主机名）：同一台机器连多套中心时不能互相覆盖。
+fn ca_file_host(public_url: &str) -> String {
+    let host = public_url
+        .split("://")
+        .nth(1)
+        .unwrap_or(public_url)
+        .split(['/', ':'])
+        .next()
+        .unwrap_or("");
+    let mut out = String::new();
+    for ch in host.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+            out.push(ch);
+        } else {
+            out.push('-');
+        }
+    }
+    if out.is_empty() {
+        "center".to_string()
+    } else {
+        out
+    }
+}
+
+/// 前置环境准备端点限流桶（公开、无令牌）。
 const GATEWAY_PREPARE_SCRIPT_SCOPE: &str = "gateway-prepare-script";
 
 /// 取前置环境准备脚本：GET /api/v1/gateway/prepare-script（公开，无需令牌，仅限流）。
@@ -465,7 +542,10 @@ pub async fn get_gateway_prepare_script(
     }
     (
         [(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")],
-        PREPARE_SCRIPT_TEMPLATE,
+        render_prepare_script(
+            state.config.ca_cert.as_deref(),
+            state.config.public_url.as_str(),
+        ),
     )
         .into_response()
 }
@@ -1198,3 +1278,48 @@ log '自检：wist-gwlinkd diagnose'
 log "wist-gwlinkd 已安装并常驻（user=${DEPLOY_USER}，config=${GWLINKD_TOML}，pub=${GWLINKD_PUB}）；到网关页「链接上级」完成接入（gateway_id=${GATEWAY_ID}）"
 log '完成。'
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::{ca_file_host, render_prepare_script};
+
+    const PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+
+    #[test]
+    fn prepare_script_installs_center_ca_into_system_store() {
+        let script = render_prepare_script(Some(PEM), "https://center.dev.wist.lab:3100");
+
+        // CA 内嵌进脚本（heredoc），文件名带中心主机名 —— 同一台机器连多套中心不互相覆盖。
+        assert!(script.contains(PEM.trim_end()), "CA 必须内嵌：\n{script}");
+        assert!(script.contains("wist-control-center-center.dev.wist.lab.crt"));
+        assert!(script.contains("/usr/local/share/ca-certificates/"));
+        assert!(script.contains("update-ca-trust"));
+        // 默认装；可用环境变量关掉。
+        assert!(script.contains("WIST_TRUST_CENTER_CA"));
+        // 占位符必须全部替换完，否则脚本会把 `__CENTER_HOST__` 当文件名写下去。
+        assert!(!script.contains("__CENTER_"), "残留占位符：\n{script}");
+    }
+
+    #[test]
+    fn prepare_script_skips_ca_when_center_has_none() {
+        let script = render_prepare_script(None, "https://center.example.test");
+
+        assert!(script.contains("中心未提供 CA"));
+        assert!(
+            !script.contains("BEGIN CERTIFICATE-----MIIB"),
+            "不该有假 CA"
+        );
+    }
+
+    #[test]
+    fn ca_file_host_keeps_hostname_and_sanitizes() {
+        assert_eq!(
+            ca_file_host("https://center.alpha.jingang.cloud:3100"),
+            "center.alpha.jingang.cloud"
+        );
+        assert_eq!(ca_file_host("http://10.0.0.5:3100/base"), "10.0.0.5");
+        assert_eq!(ca_file_host(""), "center");
+        // 畸形/带方括号的 host 不能把路径带进文件名。
+        assert!(!ca_file_host("https://[::1]:3100").contains('/'));
+    }
+}

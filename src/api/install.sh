@@ -69,6 +69,24 @@ if grep -q 'BEGIN CERTIFICATE' "$CA_CENTER" 2>/dev/null; then
   export GIT_SSL_CAINFO="$CA_BUNDLE"
   CURL_TLS=(--cacert "$CA_BUNDLE")
   log "已载入中心 CA（TLS 全程校验）：$CA_BUNDLE"
+  # 再落一遍**系统信任库**（Linux）：脚本退出后，运维手敲的 git/curl/docker 也直接信任这套中心，
+  # 不必再记 SSL_CERT_FILE / GIT_SSL_CAINFO。幂等：同中心主机名同名覆盖，多套中心互不干扰。
+  # 失败不阻断（环境变量已能盖住本脚本自己的所有下载）。
+  ca_host="$(printf '%s' "$CENTER_URL" | sed -E 's#^[A-Za-z]+://##; s#[/:].*$##')"
+  ca_name="wist-control-center-${ca_host}.crt"
+  if command -v update-ca-certificates >/dev/null 2>&1; then
+    $SUDO install -m 0644 "$CA_CENTER" "/usr/local/share/ca-certificates/$ca_name" 2>/dev/null \
+      && $SUDO update-ca-certificates >/dev/null 2>&1 \
+      && log "已信任中心 CA（系统库）：/usr/local/share/ca-certificates/$ca_name" \
+      || log "提示：写系统信任库失败（不阻断；git 仍用 GIT_SSL_CAINFO）"
+  elif command -v update-ca-trust >/dev/null 2>&1; then
+    $SUDO install -m 0644 "$CA_CENTER" "/etc/pki/ca-trust/source/anchors/$ca_name" 2>/dev/null \
+      && $SUDO update-ca-trust >/dev/null 2>&1 \
+      && log "已信任中心 CA（系统库）：/etc/pki/ca-trust/source/anchors/$ca_name" \
+      || log "提示：写系统信任库失败（不阻断；git 仍用 GIT_SSL_CAINFO）"
+  elif [ "$(uname -s)" = "Darwin" ]; then
+    log "提示：macOS 要让系统信任中心 CA：sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain $CA_CENTER"
+  fi
 else
   CURL_TLS=(-k)
   log "中心未提供 CA（明文 / 未配 CA）→ curl 回退 -k"
