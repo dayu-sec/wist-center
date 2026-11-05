@@ -6285,6 +6285,10 @@ mod tests {
             "/usr/local/share/ca-certificates/",
             "curl -fsSL \"${CURL_TLS[@]}\" \"$STACK_PKG_URL\" -o \"$STACK_PKG\"",
             "gops prj import --path \"$STACK_PKG\"",
+            // 本地 import 会把临时路径记进 ops-prj.yml 的 addr（随后被删）→ 后续 upgrade 去死目录找包。
+            // 导入后必须把 addr 改回「中心地址 + {version} 模板」。
+            "url: \" + templated",
+            "ops-prj.yml 的 addr 已改为：",
             "gops sys localize",
             "gops run download",
             "gops run start",

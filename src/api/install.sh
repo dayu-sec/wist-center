@@ -238,6 +238,34 @@ log "gops prj import --path <本地 gateway-stack 包>"
 gops prj import --path "$STACK_PKG"
 rm -rf "$STACK_PKG_DIR"
 
+# c.0) `prj import --path <本地文件>` 会把**这个临时路径**记进 ops-prj.yml 的 `addr`（随后就被删了），
+#      于是后续 `gops prj upgrade -v X` 会去死目录找包。改回**中心地址 + {version} 模板**：
+#      既保住「安装不依赖 gops 的 TLS」，又让升级能回源取新版。
+python3 - "$PROJECT_ROOT/ops-prj.yml" "$STACK_PKG_URL" <<'PY'
+import re
+import sys
+
+path, url = sys.argv[1], sys.argv[2]
+match = re.search(r"(\d+\.\d+\.\d+[^/]*?)\.tar\.gz$", url)
+if not match:
+    print("  提示：无法从包地址推出 {version} 模板，ops-prj.yml 的 addr 保持原样", file=sys.stderr)
+    sys.exit(0)
+# `{version}` 的值不带前导 v（与 gops 生成的 `…-v{version}.tar.gz` 同口径）。
+templated = url.replace(match.group(1), "{version}")
+text = open(path).read()
+patched, count = re.subn(
+    r"(?m)^(\s*)addr:\n\s*(?:path|url):.*$",
+    "\\1addr:\n\\1  url: " + templated,
+    text,
+    count=1,
+)
+if count == 0:
+    print("  提示：ops-prj.yml 里没找到 addr 块，保持原样", file=sys.stderr)
+    sys.exit(0)
+open(path, "w").write(patched)
+print("  ops-prj.yml 的 addr 已改为：" + templated)
+PY
+
 # c.1) 全新安装必须先设定网关对外域名（WEB_DOMAIN：站点证书 SAN + 网关 public_base_url 的 host）。
 #      来源优先级：安装命令里带的 domain → 环境变量 GATEWAY_DOMAIN → 交互输入。
 GATEWAY_DOMAIN="${GATEWAY_DOMAIN:-__DOMAIN__}"
