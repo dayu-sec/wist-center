@@ -1,33 +1,40 @@
-//! 证据库读口（`[evidence]`）：按 `command_id` 取调查报告的元数据与正文。
+//! 证据读口（`[evidence]`）：按 `command_id` 取调查报告的元数据与正文。
 //!
-//! 中心**只读**证据库：写入者是数据面（wparse sink），中心拿到报告是「下发的副作用」。
-//! 因此这里没有上传 / 删除，只有两条 GET：
+//! ## 走 BFF，不直连证据服务
+//!
+//! 证据服务的读监听（`/internal/evidence/*`）**故意只在计算区 compose 网络内**，
+//! 对外面是 `wist-field-api`（BFF）：浏览器 / 其它组件都只跟它说话。中心也一样：
 //!
 //! ```text
-//! GET {endpoint}/internal/evidence/{cmd_id}           → 元数据
-//! GET {endpoint}/internal/evidence/{cmd_id}/content   → 正文
+//! GET {endpoint}/api/evidence/{cmd_id}           → 元数据（Artifact 原样透传）
+//! GET {endpoint}/api/evidence/{cmd_id}/content   → 正文
 //! ```
 //!
-//! 鉴权：`x-evidence-service-token`（证据库配了 `[read] service_token` 时**必须**带），
-//! 身份头 `x-evidence-tenant` / `x-evidence-scopes` / `x-evidence-max-sensitivity`。
-//! token 来自栈的 `${SEC_EVIDENCE_READ_TOKEN}`（`.wist/sec-value.yml`），不落日志。
+//! `{endpoint}` = 计算区对外入口（field 栈的 web，HTTPS）。鉴权是 **wist-cred 操作员令牌**
+//! （`Authorization: Bearer wcr_…`），来自栈的 `.wist/sec-value.yml` → `${SEC_EVIDENCE_READ_TOKEN}`，
+//! 不落日志、不进 URL。
+//!
+//! BFF 的响应是**原样透传**：状态码与正文都不改写，所以这里仍按证据服务的形状解析；
+//! 404 依旧是「不可见 / 不存在」，401/403 是「令牌不对或没权限」——两者页面处置不同。
 
 use std::time::Duration;
 
 use crate::config::EvidenceConfig;
 
-/// 读证据的错误：**分清楚**「没有这份报告」与「证据服务不可用」。
+/// 读证据的错误：**分清楚**「没有这份报告」「令牌不对」与「服务不可用」。
 ///
-/// 页面上这两件事的处置完全不同：前者是「报告同步中」，后者要说「证据服务不可达」。
+/// 页面上这三件事的处置完全不同：等同步 / 换凭据 / 查服务。
 #[derive(Debug)]
 pub enum EvidenceReadError {
-    /// 不可见 / 不存在（证据库对所有不可见统一回 404，不泄露存在性）。
+    /// 不可见 / 不存在（BFF 对不可见统一透传 404，不泄露存在性）。
     NotFound,
+    /// 401 / 403：令牌错、过期或没有该租户/角色。
+    Unauthorized(String),
     /// 未配置 / 连不上 / 5xx —— 说清楚是哪一种。
     Unavailable(String),
 }
 
-/// 证据元数据（证据库 `Artifact` 的一个裁剪投影）。
+/// 证据元数据（证据库 `Artifact` 的一个裁剪投影；BFF 原样透传）。
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct EvidenceArtifact {
     pub artifact_id: String,
@@ -42,7 +49,7 @@ pub struct EvidenceArtifact {
     pub command_id: Option<String>,
 }
 
-/// 证据库读客户端。
+/// BFF 读客户端。
 #[derive(Debug, Clone)]
 pub struct EvidenceClient {
     endpoint: String,
@@ -52,98 +59,109 @@ pub struct EvidenceClient {
 
 impl EvidenceClient {
     pub fn new(config: &EvidenceConfig) -> Result<Self, EvidenceReadError> {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(config.timeout_seconds))
-            .connect_timeout(Duration::from_secs(3))
-            .build()
-            .map_err(|err| {
-                EvidenceReadError::Unavailable(format!("http client init failed: {err}"))
-            })?;
         Ok(Self {
             endpoint: config.endpoint.trim_end_matches('/').to_string(),
             token: config.read_token.clone(),
-            http,
+            http: build_http(config)?,
         })
     }
 
-    /// 元数据。`tenant` 是证据库的对象键第一段（业务客户 id）。
-    pub async fn metadata(
-        &self,
-        command_id: &str,
-        tenant: &str,
-        max_sensitivity: &str,
-    ) -> Result<EvidenceArtifact, EvidenceReadError> {
-        let url = format!("{}/internal/evidence/{}", self.endpoint, encode(command_id));
+    /// 元数据。`verbose` 是给日志的：错误里带上状态码与响应体。
+    pub async fn metadata(&self, command_id: &str) -> Result<EvidenceArtifact, EvidenceReadError> {
+        let url = format!("{}/api/evidence/{}", self.endpoint, encode(command_id));
         let response = self
             .authorized(self.http.get(url))
-            .header("x-evidence-tenant", tenant)
-            .header("x-evidence-scopes", "evidence:read")
-            .header("x-evidence-max-sensitivity", max_sensitivity)
             .send()
             .await
             .map_err(|err| {
                 EvidenceReadError::Unavailable(format!("evidence request failed: {err}"))
             })?;
-        match response.status().as_u16() {
-            200 => response.json::<EvidenceArtifact>().await.map_err(|err| {
-                EvidenceReadError::Unavailable(format!("evidence decode failed: {err}"))
-            }),
-            404 => Err(EvidenceReadError::NotFound),
-            status => {
-                let body = response.text().await.unwrap_or_default();
-                Err(EvidenceReadError::Unavailable(format!(
-                    "evidence returned {status}: {body}"
-                )))
-            }
+        let status = response.status();
+        if status.as_u16() == 404 {
+            return Err(EvidenceReadError::NotFound);
         }
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(classify(status.as_u16(), &body));
+        }
+        response
+            .json::<EvidenceArtifact>()
+            .await
+            .map_err(|err| EvidenceReadError::Unavailable(format!("evidence decode failed: {err}")))
     }
 
-    /// 正文（原样字节）。中心边读边转，不落盘。
-    pub async fn content(
-        &self,
-        command_id: &str,
-        tenant: &str,
-        max_sensitivity: &str,
-    ) -> Result<String, EvidenceReadError> {
+    /// 正文（原样文本）。中心边读边转，不落盘。
+    pub async fn content(&self, command_id: &str) -> Result<String, EvidenceReadError> {
         let url = format!(
-            "{}/internal/evidence/{}/content",
+            "{}/api/evidence/{}/content",
             self.endpoint,
             encode(command_id)
         );
         let response = self
             .authorized(self.http.get(url))
-            .header("x-evidence-tenant", tenant)
-            .header("x-evidence-scopes", "evidence:read")
-            .header("x-evidence-max-sensitivity", max_sensitivity)
             .send()
             .await
             .map_err(|err| {
                 EvidenceReadError::Unavailable(format!("evidence request failed: {err}"))
             })?;
-        match response.status().as_u16() {
-            200 => response.text().await.map_err(|err| {
-                EvidenceReadError::Unavailable(format!("evidence body failed: {err}"))
-            }),
-            404 => Err(EvidenceReadError::NotFound),
-            status => {
-                let body = response.text().await.unwrap_or_default();
-                Err(EvidenceReadError::Unavailable(format!(
-                    "evidence returned {status}: {body}"
-                )))
-            }
+        let status = response.status();
+        if status.as_u16() == 404 {
+            return Err(EvidenceReadError::NotFound);
         }
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(classify(status.as_u16(), &body));
+        }
+        response
+            .text()
+            .await
+            .map_err(|err| EvidenceReadError::Unavailable(format!("evidence body failed: {err}")))
     }
 
     fn authorized(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         request
-            .header("x-evidence-service-token", &self.token)
+            .bearer_auth(&self.token)
             .header("accept", "application/json")
     }
 }
 
+/// 非 2xx 归类：4xx 是「凭据 / 权限」，5xx 是「服务本身」。
+fn classify(status: u16, body: &str) -> EvidenceReadError {
+    if (400..500).contains(&status) {
+        EvidenceReadError::Unauthorized(format!("evidence returned {status}: {body}"))
+    } else {
+        EvidenceReadError::Unavailable(format!("evidence returned {status}: {body}"))
+    }
+}
+
+/// 构造 HTTP 客户端；`ca_file` 用于计算区自签站点（信任锚只加不替换系统根）。
+fn build_http(config: &EvidenceConfig) -> Result<reqwest::Client, EvidenceReadError> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(config.timeout_seconds))
+        .connect_timeout(Duration::from_secs(3));
+    if let Some(path) = config.ca_file.as_ref() {
+        let pem = std::fs::read(path).map_err(|err| {
+            EvidenceReadError::Unavailable(format!(
+                "读取证据服务信任锚失败 {}: {err}",
+                path.display()
+            ))
+        })?;
+        let cert = reqwest::Certificate::from_pem(&pem).map_err(|err| {
+            EvidenceReadError::Unavailable(format!(
+                "解析证据服务信任锚失败 {}: {err}",
+                path.display()
+            ))
+        })?;
+        builder = builder.add_root_certificate(cert);
+    }
+    builder
+        .build()
+        .map_err(|err| EvidenceReadError::Unavailable(format!("http client init failed: {err}")))
+}
+
 /// `command_id` 只允许 `[A-Za-z0-9_.:-]`：它会被拼进 URL 路径。
 ///
-/// 不合法就当成「没有这份证据」——不把非法字符交给 reqwest 去拼路径。
+/// 不合法就替换成 `_`——不把控制字符 / 分隔符交给 reqwest 拼路径。
 fn encode(command_id: &str) -> String {
     command_id
         .chars()
@@ -190,35 +208,43 @@ mod tests {
     fn config(endpoint: String) -> EvidenceConfig {
         EvidenceConfig {
             endpoint,
-            read_token: "read-secret".to_string(),
+            read_token: "wcr_test".to_string(),
             timeout_seconds: 5,
-            tenant: None,
-            max_sensitivity: "identities".to_string(),
+            ca_file: None,
         }
     }
 
     #[tokio::test]
-    async fn metadata_sends_the_service_token_and_tenant_headers() {
+    async fn metadata_goes_through_the_bff_with_a_bearer_token() {
         let body = r#"{"artifact_id":"art_1","kind":"investigation_report","verdict":"warn","size_bytes":42,"sensitivity":"paths","retention_until":"2026-11-16T00:00:00Z","command_id":"cmd_1"}"#;
         let (endpoint, captured) = one_shot("200 OK", body).await;
         let client = EvidenceClient::new(&config(endpoint)).expect("client");
-        let artifact = client
-            .metadata("cmd_1", "cust-a", "paths")
-            .await
-            .expect("metadata");
+        let artifact = client.metadata("cmd_1").await.expect("metadata");
         assert_eq!(artifact.verdict.as_deref(), Some("warn"));
         assert_eq!(artifact.size_bytes, 42);
 
         let request = captured.await.expect("request");
+        // 走 BFF 的对外面，不碰证据服务的 `/internal/*`。
+        assert!(request.starts_with("GET /api/evidence/cmd_1 "), "{request}");
         assert!(
-            request.starts_with("GET /internal/evidence/cmd_1 "),
+            request
+                .to_lowercase()
+                .contains("authorization: bearer wcr_test"),
             "{request}"
         );
+    }
+
+    #[tokio::test]
+    async fn content_goes_through_the_bff() {
+        let (endpoint, captured) = one_shot("200 OK", r#"{"a":1}"#).await;
+        let client = EvidenceClient::new(&config(endpoint)).expect("client");
+        let body = client.content("cmd_1").await.expect("content");
+        assert_eq!(body, r#"{"a":1}"#);
+        let request = captured.await.expect("request");
         assert!(
-            request.contains("x-evidence-service-token: read-secret"),
+            request.starts_with("GET /api/evidence/cmd_1/content "),
             "{request}"
         );
-        assert!(request.contains("x-evidence-tenant: cust-a"), "{request}");
     }
 
     #[tokio::test]
@@ -226,24 +252,33 @@ mod tests {
         let (endpoint, _captured) = one_shot("404 Not Found", "{}").await;
         let client = EvidenceClient::new(&config(endpoint)).expect("client");
         assert!(matches!(
-            client.metadata("cmd_1", "cust-a", "paths").await,
+            client.metadata("cmd_1").await,
             Err(EvidenceReadError::NotFound)
         ));
+    }
+
+    /// 401/403 是「令牌不对或没权限」，不是「报告没有」也不是「服务挂了」。
+    #[tokio::test]
+    async fn a_401_is_reported_as_unauthorized() {
+        let (endpoint, _captured) = one_shot("401 Unauthorized", r#"{"error":"bad token"}"#).await;
+        let client = EvidenceClient::new(&config(endpoint)).expect("client");
+        match client.metadata("cmd_1").await {
+            Err(EvidenceReadError::Unauthorized(message)) => {
+                assert!(message.contains("401"), "{message}")
+            }
+            other => panic!("401 必须归类成 Unauthorized：{other:?}"),
+        }
     }
 
     #[tokio::test]
     async fn a_500_is_an_outage_with_the_body() {
         let (endpoint, _captured) = one_shot("500 Internal Server Error", "boom").await;
         let client = EvidenceClient::new(&config(endpoint)).expect("client");
-        let error = client
-            .content("cmd_1", "cust-a", "paths")
-            .await
-            .expect_err("must fail");
-        match error {
-            EvidenceReadError::Unavailable(message) => {
+        match client.content("cmd_1").await {
+            Err(EvidenceReadError::Unavailable(message)) => {
                 assert!(message.contains("500"), "{message}")
             }
-            EvidenceReadError::NotFound => panic!("5xx 不是“没有这份报告”"),
+            other => panic!("5xx 必须归类成 Unavailable：{other:?}"),
         }
     }
 

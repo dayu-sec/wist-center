@@ -61,6 +61,7 @@ codes! {
     ENROLLMENT_TOKEN_REJECTED => "enrollment_token_rejected",
     ENROLLMENT_TOKEN_UNKNOWN_GATEWAY => "enrollment_token_unknown_gateway",
     EVIDENCE_UNAVAILABLE => "evidence_unavailable",
+    EVIDENCE_UNAUTHORIZED => "evidence_unauthorized",
     GATEWAY_AGENTS_LOAD_FAILED => "gateway_agents_load_failed",
     GATEWAY_ALREADY_EXISTS => "gateway_already_exists",
     GATEWAY_ARCHIVE_FAILED => "gateway_archive_failed",

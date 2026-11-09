@@ -5,6 +5,17 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.35.1-alpha] - 2026-11-10
+
+### 修复
+
+- **证据读口改走 BFF**：证据服务的 `/internal/evidence/*` 按设计只在计算区 compose 网络内，
+  对外面是 `wist-field-api`。中心改调 `GET {endpoint}/api/evidence/{cmd_id}` 与 `…/content`，
+  用 `Authorization: Bearer wcr_…`（wist-cred 操作员令牌）鉴权；租户 / scope / 敏感度交给 BFF。
+- `[evidence]` 配置改为 `endpoint`（计算区对外入口）/ `read_token` / `ca_file?` / `timeout_seconds`；
+  去掉 `tenant` / `max_sensitivity`（BFF 侧口径，中心不再复制）。
+- 401/403 单独归类为 `evidence_unauthorized`：页面会说「换凭据」，不混成「不可达」或「没有报告」。
+
 ## [0.35.0-alpha] - 2026-11-10
 
 ### 新增

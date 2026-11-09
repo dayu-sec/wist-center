@@ -195,14 +195,13 @@ pub struct CenterConfig {
 /// `read_token` 一律写 `${SEC_EVIDENCE_READ_TOKEN}`，真值来自 `.wist/sec-value.yml`。
 #[derive(Clone)]
 pub struct EvidenceConfig {
+    /// 计算区**对外入口**（field 栈的 web，HTTPS）——中心走 BFF，不直连证据服务内部口。
     pub endpoint: String,
+    /// wist-cred 操作员令牌（`wcr_…`）；BFF 用它认人 + 判租户/敏感度。
     pub read_token: String,
     pub timeout_seconds: u64,
-    /// 证据租户（对象键第一段）。缺省由网关的客户绑定推导；未绑定时不能查证据。
-    pub tenant: Option<String>,
-    /// 读身份的最高敏感度档（`metrics` / `paths` / `commandlines` / `identities` /
-    /// `secret_metadata` / `security_posture`）。调查报告通常到 `identities`。
-    pub max_sensitivity: String,
+    /// 计算区自签站点的信任锚（PEM）。缺省 = 系统根。
+    pub ca_file: Option<std::path::PathBuf>,
 }
 
 /// token 不进日志：`CenterConfig` 是 `Debug`，默认派生会把密钥原样打印出来。
@@ -212,8 +211,7 @@ impl std::fmt::Debug for EvidenceConfig {
             .field("endpoint", &self.endpoint)
             .field("read_token", &"***")
             .field("timeout_seconds", &self.timeout_seconds)
-            .field("tenant", &self.tenant)
-            .field("max_sensitivity", &self.max_sensitivity)
+            .field("ca_file", &self.ca_file)
             .finish()
     }
 }
@@ -578,8 +576,8 @@ struct RawEvidenceConfig {
     endpoint: Option<String>,
     read_token: Option<String>,
     timeout_seconds: Option<u64>,
-    tenant: Option<String>,
-    max_sensitivity: Option<String>,
+    /// 自签站点的信任锚（相对路径按配置目录解析）。
+    ca_file: Option<String>,
 }
 
 /// `[credentials] file = "…"` 指向的接入文件。
@@ -733,9 +731,8 @@ impl CenterConfig {
                 endpoint: trim_trailing_slash(endpoint),
                 read_token,
                 timeout_seconds: raw.evidence.timeout_seconds.unwrap_or(10).clamp(1, 60),
-                tenant: normalize_optional(raw.evidence.tenant),
-                max_sensitivity: normalize_optional(raw.evidence.max_sensitivity)
-                    .unwrap_or_else(|| "identities".to_string()),
+                ca_file: normalize_optional(raw.evidence.ca_file)
+                    .map(|path| absolutize_path(config_dir, Path::new(&path))),
             }),
             _ => None,
         };
@@ -1095,7 +1092,7 @@ fn expand_raw_env(raw: &mut RawCenterConfig, env: &EnvDict) -> Result<(), Config
         &mut raw.artifacts.object_storage_secret_key,
         &mut raw.evidence.endpoint,
         &mut raw.evidence.read_token,
-        &mut raw.evidence.tenant,
+        &mut raw.evidence.ca_file,
     ] {
         if let Some(text) = value.as_ref() {
             *value = Some(expand(env, text)?);
@@ -2180,14 +2177,13 @@ listen_addr = ""
     #[test]
     fn evidence_config_debug_masks_the_token() {
         let config = EvidenceConfig {
-            endpoint: "http://evidence:19174".to_string(),
-            read_token: "super-secret".to_string(),
+            endpoint: "https://field.example".to_string(),
+            read_token: "wcr_super_secret".to_string(),
             timeout_seconds: 10,
-            tenant: None,
-            max_sensitivity: "identities".to_string(),
+            ca_file: None,
         };
         let rendered = format!("{config:?}");
-        assert!(!rendered.contains("super-secret"), "{rendered}");
+        assert!(!rendered.contains("wcr_super_secret"), "{rendered}");
         assert!(rendered.contains("***"), "{rendered}");
     }
 
@@ -2197,22 +2193,28 @@ listen_addr = ""
         let _guard = env_guard();
         let both = write_main_config(
             "[server]\nlisten_addr = \"127.0.0.1:3100\"\n\
-             [evidence]\nendpoint = \"http://evidence:19174/\"\nread_token = \"secret\"\n\
-             tenant = \"cust-a\"\n",
+             [evidence]\nendpoint = \"https://field.example/\"\nread_token = \"wcr_x\"\n\
+             ca_file = \"ca/field-web.pem\"\n",
         );
         let config = CenterConfig::load_from_path(&both).expect("load");
         let evidence = config.evidence.expect("evidence configured");
-        assert_eq!(evidence.endpoint, "http://evidence:19174", "尾斜杠要去掉");
-        assert_eq!(evidence.read_token, "secret");
-        assert_eq!(evidence.tenant.as_deref(), Some("cust-a"));
-        assert_eq!(evidence.max_sensitivity, "identities", "缺省到最常用的一档");
+        assert_eq!(evidence.endpoint, "https://field.example", "尾斜杠要去掉");
+        assert_eq!(evidence.read_token, "wcr_x");
         assert_eq!(evidence.timeout_seconds, 10);
+        assert!(
+            evidence
+                .ca_file
+                .as_ref()
+                .is_some_and(|path| path.ends_with("ca/field-web.pem")),
+            "信任锚相对路径要按配置目录解析：{:?}",
+            evidence.ca_file
+        );
         let _ = fs::remove_dir_all(both.parent().unwrap());
 
         // 只配一半 → 视为未接入（状态接口会标 evidence_not_configured）。
         let half = write_main_config(
             "[server]\nlisten_addr = \"127.0.0.1:3100\"\n\
-             [evidence]\nendpoint = \"http://evidence:19174\"\n",
+             [evidence]\nendpoint = \"https://field.example\"\n",
         );
         let config = CenterConfig::load_from_path(&half).expect("load");
         assert!(config.evidence.is_none(), "缺 token 不得当成已接入");

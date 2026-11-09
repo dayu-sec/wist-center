@@ -353,16 +353,12 @@ pub async fn admin_read_investigation_content(
             .into_response();
         }
     }
-    let (client, tenant, max) = match evidence_context(&state, &gateway_id).await {
-        Ok(EvidenceLookup::Ready {
-            client,
-            tenant,
-            max,
-        }) => (client, tenant, max),
+    let client = match evidence_context(&state, &gateway_id).await {
+        Ok(EvidenceLookup::Ready(client)) => client,
         Ok(EvidenceLookup::Unavailable(reason)) => return evidence_unavailable(reason),
         Err(response) => return response,
     };
-    match client.content(&command_id, &tenant, max).await {
+    match client.content(&command_id).await {
         Ok(body) => (
             [
                 (
@@ -379,6 +375,14 @@ pub async fn admin_read_investigation_content(
             "报告还没同步到证据库（可稍后重试）",
         )
         .into_response(),
+        Err(EvidenceReadError::Unauthorized(err)) => {
+            log::warn!(
+                "event=InvestigationContentUnauthorized command_id={} err={}",
+                command_id,
+                err
+            );
+            evidence_unauthorized()
+        }
         Err(EvidenceReadError::Unavailable(err)) => {
             log::warn!(
                 "event=InvestigationContentUnavailable command_id={} err={}",
@@ -393,12 +397,8 @@ pub async fn admin_read_investigation_content(
 // ── 内部 ─────────────────────────────────────────────────────────────────
 
 enum EvidenceLookup {
-    Ready {
-        client: EvidenceClient,
-        tenant: String,
-        max: &'static str,
-    },
-    /// 未配置 / 未绑定租户 —— 页面显示「证据服务不可用」，而不是「没有报告」。
+    Ready(EvidenceClient),
+    /// 未配置 —— 页面显示「证据服务不可用」，而不是「没有报告」。
     Unavailable(&'static str),
 }
 
@@ -410,12 +410,8 @@ async fn look_up_evidence(
     lookup: &EvidenceLookup,
     tasks: &[&wist_control::AgentInvestigationTask],
 ) -> HashMap<String, EvidenceView> {
-    let (client, tenant, max) = match lookup {
-        EvidenceLookup::Ready {
-            client,
-            tenant,
-            max,
-        } => (client, tenant, *max),
+    let client = match lookup {
+        EvidenceLookup::Ready(client) => client,
         EvidenceLookup::Unavailable(reason) => {
             return tasks
                 .iter()
@@ -427,10 +423,9 @@ async fn look_up_evidence(
     let mut set = tokio::task::JoinSet::new();
     for task in tasks {
         let client = client.clone();
-        let tenant = tenant.clone();
         let command_id = task.command_id.clone();
         set.spawn(async move {
-            let result = client.metadata(&command_id, &tenant, max).await;
+            let result = client.metadata(&command_id).await;
             (command_id, result)
         });
     }
@@ -455,6 +450,18 @@ async fn look_up_evidence(
             Ok((command_id, Err(EvidenceReadError::NotFound))) => {
                 views.insert(command_id, EvidenceView::unavailable("not_yet_available"));
             }
+            Ok((command_id, Err(EvidenceReadError::Unauthorized(err)))) => {
+                // 令牌错 / 过期 / 没该租户权限：与「服务挂了」分开，处置是换凭据。
+                log::warn!(
+                    "event=InvestigationEvidenceUnauthorized command_id={} err={}",
+                    command_id,
+                    err
+                );
+                views.insert(
+                    command_id,
+                    EvidenceView::unavailable("evidence_unauthorized"),
+                );
+            }
             Ok((command_id, Err(EvidenceReadError::Unavailable(err)))) => {
                 log::warn!(
                     "event=InvestigationEvidenceUnavailable command_id={} err={}",
@@ -474,7 +481,7 @@ async fn look_up_evidence(
 }
 
 #[allow(clippy::result_large_err)]
-async fn evidence_context(state: &ApiState, gateway_id: &str) -> Result<EvidenceLookup, Response> {
+async fn evidence_context(state: &ApiState, _gateway_id: &str) -> Result<EvidenceLookup, Response> {
     let Some(config) = state.config.evidence.as_ref() else {
         return Ok(EvidenceLookup::Unavailable("evidence_not_configured"));
     };
@@ -482,41 +489,7 @@ async fn evidence_context(state: &ApiState, gateway_id: &str) -> Result<Evidence
         log::warn!("evidence client init failed: {err:?}");
         evidence_unavailable("evidence_unavailable")
     })?;
-    // 租户：配置优先，否则用网关的客户绑定（证据库的对象键第一段就是它）。
-    let tenant = match config.tenant.clone() {
-        Some(tenant) => tenant,
-        None => match state.store.get_customer_binding(gateway_id).await {
-            Ok(Some(binding)) => binding.customer_id,
-            Ok(None) => return Ok(EvidenceLookup::Unavailable("tenant_unbound")),
-            Err(err) => {
-                return Err(ApiError::internal_with(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    codes::AGENT_STATUS_LOAD_FAILED,
-                    "failed to load gateway customer binding",
-                    err.display_chain(),
-                )
-                .into_response());
-            }
-        },
-    };
-    Ok(EvidenceLookup::Ready {
-        client,
-        tenant,
-        max: max_sensitivity(&config.max_sensitivity),
-    })
-}
-
-/// 敏感度档是闭集：写错的配置**降级到最保守**，不放宽。
-fn max_sensitivity(value: &str) -> &'static str {
-    match value.trim() {
-        "metrics" => "metrics",
-        "paths" => "paths",
-        "commandlines" => "commandlines",
-        "identities" => "identities",
-        "secret_metadata" => "secret_metadata",
-        "security_posture" => "security_posture",
-        _ => "identities",
-    }
+    Ok(EvidenceLookup::Ready(client))
 }
 
 fn evidence_unavailable(reason: &'static str) -> Response {
@@ -525,9 +498,18 @@ fn evidence_unavailable(reason: &'static str) -> Response {
         codes::EVIDENCE_UNAVAILABLE,
         match reason {
             "evidence_not_configured" => "证据服务未配置：中心只能显示任务状态，看不到报告正文",
-            "tenant_unbound" => "该网关还没绑定客户，无法按租户读取证据",
             _ => "证据服务不可达（不是“没有报告”：稍后重试）",
         },
+    )
+    .into_response()
+}
+
+/// 令牌错 / 过期 / 没权限：处置是换凭据，不是「等一下」。
+fn evidence_unauthorized() -> Response {
+    ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        codes::EVIDENCE_UNAUTHORIZED,
+        "读取证据的令牌无效或已过期（检查 [evidence].read_token / .wist/sec-value.yml）",
     )
     .into_response()
 }
@@ -1006,6 +988,49 @@ mod tests {
         assert_eq!(body["error"]["code"], "evidence_unavailable");
     }
 
+    /// 令牌错（BFF 401）要和「服务挂了」「没有报告」分开：页面处置是换凭据。
+    #[tokio::test]
+    async fn show_reports_unauthorized_evidence_with_its_own_reason() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buffer = [0_u8; 4096];
+                let _ = socket.read(&mut buffer).await;
+                let body = r#"{"error":{"code":"invalid_access_token","message":"bad token"}}"#;
+                let response = format!(
+                    "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+        });
+
+        let mut state = test_state();
+        state.config.evidence = Some(crate::config::EvidenceConfig {
+            endpoint: format!("http://{addr}"),
+            read_token: "wcr_bad".to_string(),
+            timeout_seconds: 5,
+            ca_file: None,
+        });
+        seed_agent(&state).await;
+
+        let (status, body) = send(&state, "GET", BASE, "").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let task = &body["tasks"][0];
+        assert_eq!(task["evidence"]["available"], false);
+        assert_eq!(
+            task["evidence"]["reason"], "evidence_unauthorized",
+            "401 不能写成「不可达」或「还没有报告」：{:?}",
+            task["evidence"]
+        );
+    }
+
     /// 原文读口只认「中心为这台 Agent 发过的命令」：别的 agent / 别的 kind 都 404。
     #[test]
     fn content_authorization_matches_kind_target_and_agent() {
@@ -1057,18 +1082,6 @@ mod tests {
             Some(0)
         );
         assert_eq!(super::retention_days("not a timestamp"), None);
-    }
-
-    /// 敏感度是闭集：写错就降级到最保守的一档，不放宽。
-    #[test]
-    fn max_sensitivity_falls_back_to_identities() {
-        assert_eq!(super::max_sensitivity("paths"), "paths");
-        assert_eq!(
-            super::max_sensitivity(" security_posture "),
-            "security_posture"
-        );
-        assert_eq!(super::max_sensitivity("top-secret"), "identities");
-        assert_eq!(super::max_sensitivity(""), "identities");
     }
 
     #[test]
