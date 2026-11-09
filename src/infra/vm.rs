@@ -944,6 +944,7 @@ mod tests {
             node_id: None,
             hostname: None,
             ip_addresses: None,
+            data_manifest: None,
         };
         let text = render_agent_lines("gw-x", &agent);
         assert!(
@@ -972,6 +973,7 @@ mod tests {
                 "lo0 127.0.0.1/8".to_string(),
                 "en0 fd00::1/64".to_string(),
             ]),
+            data_manifest: None,
         };
         let text = render_agent_lines("gw-x", &agent);
         assert!(
@@ -1002,6 +1004,7 @@ mod tests {
             node_id: Some("node-1".to_string()),
             hostname: Some("host-1".to_string()),
             ip_addresses: Some(vec!["en0 192.168.1.5/24".to_string()]),
+            data_manifest: None,
         };
         let text = render_agent_lines("gw-x", &agent);
         let ts = agent.last_seen_at.to_chrono().timestamp_millis();

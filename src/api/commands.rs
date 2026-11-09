@@ -46,6 +46,30 @@ const MAX_PAYLOAD_BYTES: usize = 16 * 1024;
 /// 身份尚未拆成多 subject（P0 的后续项）：本期审计主体固定为 `admin`。
 const ADMIN_ACTOR: &str = "admin";
 
+/// `report-agents` 需要 gwlinkd ≥ 0.21.0：它才知道这个 wire kind，并负责环回拉取 + 转报。
+pub(super) const REPORT_AGENTS_MIN_GWLINKD: &str = "0.21.0";
+
+/// gwlinkd 是否支持 `report-agents`。
+///
+/// `Some(true)` = 满足；`Some(false)` = 已知太旧；`None` = 版本未知 / 认不出来。
+/// 调用方对 `None` 的取向：**不拦**（无法判定时不在中心制造假阴性，命令回执仍会说真话）。
+pub(super) fn gwlinkd_supports_report_agents(version: Option<&str>) -> Option<bool> {
+    fn core(value: &str) -> Option<Vec<u64>> {
+        let normalized = wist_release::package::normalize_version(value);
+        let mut parts = wist_release::package::parse_version(&normalized)?;
+        // 补齐到三段：`0.21` 与 `0.21.0` 必须等价（Vec 的逐段比较会把前者当更旧）。
+        while parts.len() < 3 {
+            parts.push(0);
+        }
+        Some(parts)
+    }
+    let version = version?.trim();
+    if version.is_empty() {
+        return None;
+    }
+    Some(core(version)? >= core(REPORT_AGENTS_MIN_GWLINKD)?)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct KindSpec {
     /// 调用方词表里的种类。
@@ -60,6 +84,12 @@ struct KindSpec {
 const KINDS: &[KindSpec] = &[
     KindSpec {
         kind: "gateway.diagnose",
+        target_type: "gateway",
+        requires_explicit_dispatch: false,
+    },
+    // 立即上报 Agent 明细 / 数据清单：R0、无载荷。gwlinkd 环回拉网关机队后 mTLS 转报中心。
+    KindSpec {
+        kind: "gateway.report-agents",
         target_type: "gateway",
         requires_explicit_dispatch: false,
     },
@@ -91,6 +121,8 @@ fn wire_for(kind: &str, payload: &Value) -> Option<(&'static str, Option<String>
     match kind {
         // `diagnose` 的载荷固定为空：gwlinkd 自己决定体检项。
         "gateway.diagnose" => Some(("diagnose", None)),
+        // 立即上报 Agent 明细：载荷固定为空（要报什么由 gwlinkd 环回面决定）。
+        "gateway.report-agents" => Some((crate::wparse_proxy::KIND_REPORT_AGENTS, None)),
         "gateway.restart-process" => {
             let process = payload.get("process").and_then(Value::as_str)?;
             match process {
@@ -877,6 +909,40 @@ async fn dispatch_inner(
     for target_id in selected {
         // 网关目标：target_id 就是 gateway_id。
         let gateway_id = target_id.clone();
+        // 旧 gwlinkd 不认识 `report-agents`，会在**执行时**回 400。在中心先按上报的
+        // `gwlinkd_version` 拦一道：能提前失败，就不让运维面对“已下发但没反应”。
+        if wire_kind == crate::wparse_proxy::KIND_REPORT_AGENTS {
+            let gwlinkd_version = state
+                .store
+                .get_gateway(&gateway_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|gateway| gateway.gwlinkd_version);
+            if gwlinkd_supports_report_agents(gwlinkd_version.as_deref()) == Some(false) {
+                let detail = format!(
+                    "gwlinkd {} 不支持 report-agents（需要 >= {}）",
+                    gwlinkd_version.as_deref().unwrap_or("?"),
+                    REPORT_AGENTS_MIN_GWLINKD
+                );
+                last_error = Some(detail.clone());
+                targets.push(TargetCommandRecord {
+                    target_command_id: new_secret_token("tcmd").unwrap_or_default(),
+                    command_id: command.command_id.clone(),
+                    target_id,
+                    gateway_id,
+                    wire_kind: wire_kind.to_string(),
+                    state: TARGET_STATE_FAILED.to_string(),
+                    attempts: 0,
+                    result_status: None,
+                    result_error: Some(detail),
+                    result_body: None,
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                });
+                continue;
+            }
+        }
         match proxy
             .enqueue_control_with_body(&gateway_id, wire_kind, wire_body.as_deref())
             .await
@@ -945,6 +1011,39 @@ mod tests {
             wire_for("gateway.diagnose", &Value::Null),
             Some(("diagnose", None))
         );
+    }
+
+    #[test]
+    fn report_agents_requires_gwlinkd_0_21() {
+        assert_eq!(gwlinkd_supports_report_agents(None), None, "未上报版本");
+        assert_eq!(gwlinkd_supports_report_agents(Some("")), None);
+        assert_eq!(gwlinkd_supports_report_agents(Some("dev")), None);
+        assert_eq!(gwlinkd_supports_report_agents(Some("0.20.1")), Some(false));
+        assert_eq!(gwlinkd_supports_report_agents(Some("0.21.0")), Some(true));
+        // 两段版本要按等价处理（不能当成比 0.21.0 更旧）。
+        assert_eq!(gwlinkd_supports_report_agents(Some("0.21")), Some(true));
+        // 包内自报 / tag 可能带 `v` 与预发布后缀。
+        assert_eq!(
+            gwlinkd_supports_report_agents(Some("v0.21.0-alpha")),
+            Some(true)
+        );
+        assert_eq!(gwlinkd_supports_report_agents(Some("0.22.0")), Some(true));
+    }
+
+    #[test]
+    fn report_agents_has_no_payload_and_maps_to_the_periodic_kernel() {
+        assert_eq!(
+            wire_for("gateway.report-agents", &json!({})),
+            Some((crate::wparse_proxy::KIND_REPORT_AGENTS, None))
+        );
+        assert_eq!(
+            wire_for("gateway.report-agents", &Value::Null),
+            Some((crate::wparse_proxy::KIND_REPORT_AGENTS, None))
+        );
+        // 词表里有它（R0，不需要二次 dispatch）。
+        let spec = kind_spec("gateway.report-agents").expect("kind is enabled");
+        assert!(!spec.requires_explicit_dispatch);
+        assert_eq!(spec.target_type, "gateway");
     }
 
     #[test]

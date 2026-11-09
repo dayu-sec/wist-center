@@ -65,6 +65,11 @@ pub const KIND_RESTART_GATEWAY: &str = "restart-gateway";
 pub const KIND_RESTART_GWLINKD: &str = "restart-gwlinkd";
 /// 命令类型：绑定业务身份（gwlinkd 落盘 `tenant_id` / `revision`）。
 pub const KIND_BIND_TENANT: &str = "bind-tenant";
+/// 命令类型：**立即上报 Agent 明细 / 数据清单**。
+///
+/// 与 gwlinkd 的 60s 周期上报同一内核：gwlinkd 环回读网关机队，再 mTLS 转报中心。
+/// 周期是兜底，这条命令让中心可以「现在就要一份」（页面刷新 / 刚授权完核对）。
+pub const KIND_REPORT_AGENTS: &str = "report-agents";
 
 /// 入队失败：队列满（429）与存储错误（500）必须区分。
 #[derive(Debug)]

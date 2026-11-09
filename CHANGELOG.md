@@ -5,6 +5,23 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.34.0-alpha] - 2026-11-09
+
+### 新增
+
+- **Agent 数据清单落库与读口**：`agent_status` 新增 `data_manifest`（JSONB），
+  `GET /api/v1/admin/gateways/{id}/agents` 原样带出；中心「Agent 状态」页可展示
+  采集授权与调查数据。
+- **按需刷新 Agent 明细**：新增指令 kind `gateway.report-agents` 与
+  `POST /api/v1/admin/gateways/{id}/agents/refresh`（202 + command_id，同 kind 在飞时复用）。
+  上报的 gwlinkd < 0.21.0 时在**入队前**回 409 `agent_report_unsupported`。
+
+### 兼容性
+
+- `data_manifest` 可空：旧 gwlinkd 不报时保持 `NULL`，且后续旧报文**不会擦掉**上一次可信值。
+- 旧 gwlinkd 不支持 `report-agents`（400 / 409）；周期上报与既有链路不受影响。
+- 新中心可服务旧 gwlinkd / 旧 gateway，核心链路不变。
+
 ## [0.33.3-alpha] - 2026-11-05
 
 ### 修复

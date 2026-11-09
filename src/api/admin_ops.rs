@@ -2652,6 +2652,7 @@ pub async fn admin_list_gateway_agents(
             node_id: agent.node_id,
             hostname: agent.hostname,
             ip_addresses: agent.ip_addresses,
+            data_manifest: agent.data_manifest,
         })
         .collect();
     Json(views).into_response()
@@ -7302,5 +7303,140 @@ mod tests {
         let compat = &body[0]["compatibility"];
         assert_eq!(compat["current"]["wist-gwlinkd"], "0.20.0", "{compat}");
         assert_eq!(compat["status"], "ok", "{compat}");
+    }
+
+    /// 中心读口把数据清单原样带出：页面靠这一份渲染「采集授权 / 调查数据」。
+    #[tokio::test]
+    async fn admin_lists_the_agents_data_manifest() {
+        let state = test_state();
+        let manifest = wist_control::AgentDataManifest {
+            collected_at: DateTime::now(),
+            collection: vec![wist_control::AgentCollectionEntry {
+                family: "HostMetrics".to_string(),
+                work_id: "work-agent-1-HostMetrics".to_string(),
+                status: "active".to_string(),
+                plan_version: 2,
+                acknowledged_version: Some(2),
+                collection_status: Some("ok".to_string()),
+                collection_detail: None,
+                inputs: vec![wist_control::AgentDataSource {
+                    kind: "MetricInterval".to_string(),
+                    target: "15s".to_string(),
+                }],
+            }],
+            investigations: vec![wist_control::AgentInvestigationEntry {
+                command_id: "cmd-disk".to_string(),
+                topic: "disk".to_string(),
+                observed_at: DateTime::now(),
+                overall: "warn".to_string(),
+                verdict: "Warn".to_string(),
+                findings_ok: 3,
+                findings_warn: 1,
+                findings_fail: 0,
+                findings_unknown: 0,
+                judged: true,
+            }],
+        };
+        state
+            .store
+            .upsert_agent_status(
+                "gw-001",
+                &[crate::infra::StoredAgent {
+                    agent_id: "agent-1".to_string(),
+                    gateway_id: "gw-001".to_string(),
+                    instance_id: "inst-1".to_string(),
+                    version: "0.4.0".to_string(),
+                    status: "online".to_string(),
+                    health: "healthy".to_string(),
+                    memory_bytes: None,
+                    cpu_percent: None,
+                    admin_latency_ms: None,
+                    last_seen_at: DateTime::now(),
+                    node_id: None,
+                    hostname: Some("host-1".to_string()),
+                    ip_addresses: Some(vec!["en0 192.168.1.5/24".to_string()]),
+                    data_manifest: Some(manifest),
+                }],
+            )
+            .await
+            .expect("seed agent");
+
+        let (status, body) = get_json(
+            &super::super::router_for(state),
+            "/api/v1/admin/gateways/gw-001/agents",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body[0]["agent_id"], "agent-1");
+        assert_eq!(
+            body[0]["data_manifest"]["collection"][0]["family"],
+            "HostMetrics"
+        );
+        assert_eq!(
+            body[0]["data_manifest"]["collection"][0]["inputs"][0]["target"],
+            "15s"
+        );
+        assert_eq!(
+            body[0]["data_manifest"]["investigations"][0]["topic"],
+            "disk"
+        );
+        assert_eq!(
+            body[0]["data_manifest"]["investigations"][0]["findings_warn"],
+            1
+        );
+    }
+
+    /// 按需刷新路由：存在、要 admin、未知网关 404；未开 proxy 时明确 503（不入队）。
+    #[tokio::test]
+    async fn report_agents_route_is_wired_and_fails_closed() {
+        let app = super::super::router_for(test_state());
+
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/admin/gateways/gw-999/agents/refresh",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["error"]["code"], "gateway_not_found");
+
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/admin/gateways/gw-001/agents/refresh",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"]["code"], "wparse_proxy_unavailable");
+    }
+
+    /// 旧 gwlinkd（< 0.21）：按需刷新在**入队前**就拒，不让页面“已下发但没反应”。
+    #[tokio::test]
+    async fn report_agents_route_rejects_an_old_gwlinkd() {
+        let store = test_store();
+        store
+            .update(|snapshot| {
+                if let Some(gateway) = snapshot.gateways.get_mut("gw-001") {
+                    gateway.gwlinkd_version = Some("0.20.1".to_string());
+                }
+            })
+            .expect("seed gwlinkd version");
+        let app = super::super::router_for(state_with_store(store));
+
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/admin/gateways/gw-001/agents/refresh",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"]["code"], "agent_report_unsupported");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("0.21.0"),
+            "要把需要的最低版本说出来：{body}"
+        );
     }
 }

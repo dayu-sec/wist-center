@@ -82,6 +82,7 @@ pub async fn submit_agent_status(
                     node_id: agent.node_id.clone(),
                     hostname: agent.hostname.clone(),
                     ip_addresses: agent.ip_addresses.clone(),
+                    data_manifest: agent.data_manifest.clone(),
                 })
                 .collect();
             if let Err(err) = state

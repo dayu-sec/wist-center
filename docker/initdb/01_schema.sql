@@ -124,7 +124,10 @@ CREATE TABLE IF NOT EXISTS agent_status (
   -- 旧版 gwlinkd 不报 → 保持 NULL，不写空串。
   node_id TEXT,
   hostname TEXT,
-  ip_addresses TEXT[]
+  ip_addresses TEXT[],
+  -- 数据清单（采集授权 + 调查数据）：网关派生、gwlinkd 转报的整块 JSON。
+  -- 旧版生产者不报 → NULL（不是空对象：中心页据此区分「还没上报」与「确实没有数据」）。
+  data_manifest JSONB
 );
 CREATE INDEX IF NOT EXISTS idx_agent_status_gateway ON agent_status (gateway_id);
 
@@ -133,6 +136,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_status_gateway ON agent_status (gateway_id)
 ALTER TABLE agent_status ADD COLUMN IF NOT EXISTS node_id TEXT;
 ALTER TABLE agent_status ADD COLUMN IF NOT EXISTS hostname TEXT;
 ALTER TABLE agent_status ADD COLUMN IF NOT EXISTS ip_addresses TEXT[];
+ALTER TABLE agent_status ADD COLUMN IF NOT EXISTS data_manifest JSONB;
 
 -- 网关生命周期转变历史（append-only 过程记录）。
 CREATE TABLE IF NOT EXISTS gateway_lifecycle_events (

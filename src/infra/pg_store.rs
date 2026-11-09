@@ -228,6 +228,7 @@ struct AgentRow {
     node_id: Option<String>,
     hostname: Option<String>,
     ip_addresses: Option<Vec<String>>,
+    data_manifest: Option<serde_json::Value>,
 }
 
 impl AgentRow {
@@ -247,6 +248,10 @@ impl AgentRow {
             node_id: self.node_id,
             hostname: self.hostname,
             ip_addresses: self.ip_addresses,
+            // 库里是 JSONB；旧行 / 形状不认识时按「还没上报」处理（不因此把整行读失败）。
+            data_manifest: self
+                .data_manifest
+                .and_then(|value| serde_json::from_value(value).ok()),
         }
     }
 }
@@ -689,12 +694,18 @@ impl Store for PgStore {
     ) -> Result<(), StoreError> {
         for agent in agents {
             let last_seen_at = agent.last_seen_at.to_chrono();
+            let data_manifest = agent
+                .data_manifest
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()
+                .source_err(StoreReason::Json, "serialize agent data manifest")?;
             sqlx::query(
                 "INSERT INTO agent_status \
                     (agent_id, gateway_id, instance_id, version, status, health, \
                      memory_bytes, cpu_percent, admin_latency_ms, last_seen_at, \
-                     node_id, hostname, ip_addresses) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+                     node_id, hostname, ip_addresses, data_manifest) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
                  ON CONFLICT (agent_id) DO UPDATE SET \
                    gateway_id = EXCLUDED.gateway_id, instance_id = EXCLUDED.instance_id, \
                    version = EXCLUDED.version, status = EXCLUDED.status, \
@@ -703,7 +714,9 @@ impl Store for PgStore {
                    admin_latency_ms = EXCLUDED.admin_latency_ms, \
                    last_seen_at = EXCLUDED.last_seen_at, \
                    node_id = EXCLUDED.node_id, hostname = EXCLUDED.hostname, \
-                   ip_addresses = EXCLUDED.ip_addresses",
+                   ip_addresses = EXCLUDED.ip_addresses, \
+                   -- 旧生产者不带清单（NULL）= 保留上一次可信值；与 local_work 同口径。\
+                   data_manifest = COALESCE(EXCLUDED.data_manifest, agent_status.data_manifest)",
             )
             .bind(&agent.agent_id)
             .bind(gateway_id)
@@ -718,6 +731,7 @@ impl Store for PgStore {
             .bind(&agent.node_id)
             .bind(&agent.hostname)
             .bind(agent.ip_addresses.as_deref())
+            .bind(data_manifest)
             .execute(&self.pool)
             .await
             .source_raw_err(StoreReason::Sql, "upsert agent status")?;
@@ -732,7 +746,7 @@ impl Store for PgStore {
         let rows: Vec<AgentRow> = sqlx::query_as(
             "SELECT agent_id, gateway_id, instance_id, version, status, health, \
                     memory_bytes, cpu_percent, admin_latency_ms, last_seen_at, \
-                    node_id, hostname, ip_addresses \
+                    node_id, hostname, ip_addresses, data_manifest \
              FROM agent_status WHERE gateway_id = $1 ORDER BY agent_id",
         )
         .bind(gateway_id)

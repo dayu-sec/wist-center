@@ -23,6 +23,7 @@ codes! {
     ADMIN_CREDENTIAL_REVOKED => "admin_credential_revoked",
     ADMIN_CREDENTIAL_UNKNOWN => "admin_credential_unknown",
     ADMIN_ROLE_REQUIRED => "admin_role_required",
+    AGENT_REPORT_UNSUPPORTED => "agent_report_unsupported",
     AGENT_STATUS_UPDATE_FAILED => "agent_status_update_failed",
     ARTIFACT_COMPONENT_MISMATCH => "artifact_component_mismatch",
     ARTIFACT_FETCH_FAILED => "artifact_fetch_failed",

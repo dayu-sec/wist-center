@@ -90,8 +90,8 @@ use gateway_ops::{
     submit_gateway_status, verify_gateway_credential,
 };
 use wparse_proxy_api::{
-    admin_command_status, admin_latest_diagnose, admin_restart_gateway, admin_run_diagnose,
-    issue_proxy_token, poll_command, report_command_result, revoke_proxy_token,
+    admin_command_status, admin_latest_diagnose, admin_report_agents, admin_restart_gateway,
+    admin_run_diagnose, issue_proxy_token, poll_command, report_command_result, revoke_proxy_token,
 };
 use wparse_release_api::{
     admin_list_wparse_repos, admin_list_wparse_tags, admin_publish_wparse_release,
@@ -480,6 +480,11 @@ pub fn router_for(state: ApiState) -> Router {
         .route(
             "/api/v1/admin/gateways/{gateway_id}/restart",
             post(admin_restart_gateway),
+        )
+        // 管理面：让网关立即上报一次 Agent 明细 / 数据清单（60s 周期之外的按需刷新）。
+        .route(
+            "/api/v1/admin/gateways/{gateway_id}/agents/refresh",
+            post(admin_report_agents),
         )
         .route(
             "/api/v1/admin/gateways/{gateway_id}/commands/{command_id}",

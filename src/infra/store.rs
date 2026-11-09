@@ -603,6 +603,10 @@ pub struct StoredAgent {
     pub hostname: Option<String>,
     /// 形如 `en0 192.168.1.5/24`；`None` / 空表 = 还没报过 / 确实没有地址。
     pub ip_addresses: Option<Vec<String>>,
+    /// 数据清单：采集授权 + 调查数据（网关派生，gwlinkd 转报）。
+    /// `None` = 旧版生产者不报 —— 中心页据此区分「还没上报」与「确实什么数据都没有」。
+    #[serde(default)]
+    pub data_manifest: Option<wist_control::AgentDataManifest>,
 }
 
 /// 单次状态上报落库参数（ReceiveGatewayStatusReport → store）。
@@ -1262,6 +1266,13 @@ impl FileStore {
         self.update(|snapshot| {
             for mut agent in agents.iter().cloned() {
                 agent.gateway_id = gateway_id.to_string();
+                // 旧 / 降级生产者不带清单（`None`）：保留上一次可信值，不把中心页擦成“从未上报”。
+                // 新网关总是 `Some`（哪怕空列表），所以 `None` 只可能来自旧报文。
+                if agent.data_manifest.is_none()
+                    && let Some(previous) = snapshot.agents.get(&agent.agent_id)
+                {
+                    agent.data_manifest = previous.data_manifest.clone();
+                }
                 snapshot.agents.insert(agent.agent_id.clone(), agent);
             }
         })
@@ -3667,5 +3678,170 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].job_id, "job-target");
         let _ = fs::remove_file(path);
+    }
+
+    /// 数据清单跟着 Agent 快照一起落盘 / 读出：中心页读的就是这一份。
+    #[test]
+    fn agent_status_keeps_the_data_manifest() {
+        let path = test_store_path();
+        let store = FileStore::new(&path);
+        let manifest = wist_control::AgentDataManifest {
+            collected_at: DateTime::now(),
+            collection: vec![wist_control::AgentCollectionEntry {
+                family: "HostMetrics".to_string(),
+                work_id: "work-1".to_string(),
+                status: "active".to_string(),
+                plan_version: 2,
+                acknowledged_version: Some(2),
+                collection_status: Some("ok".to_string()),
+                collection_detail: None,
+                inputs: vec![wist_control::AgentDataSource {
+                    kind: "MetricInterval".to_string(),
+                    target: "15s".to_string(),
+                }],
+            }],
+            investigations: Vec::new(),
+        };
+        let agent = StoredAgent {
+            agent_id: "agent-1".to_string(),
+            gateway_id: "gw-1".to_string(),
+            instance_id: "inst-1".to_string(),
+            version: "0.4.0".to_string(),
+            status: "online".to_string(),
+            health: "healthy".to_string(),
+            memory_bytes: None,
+            cpu_percent: None,
+            admin_latency_ms: None,
+            last_seen_at: DateTime::now(),
+            node_id: None,
+            hostname: None,
+            ip_addresses: None,
+            data_manifest: Some(manifest),
+        };
+        store
+            .upsert_agent_status("gw-1", &[agent.clone()])
+            .expect("upsert");
+        let agents = store.list_agents_by_gateway("gw-1").expect("list");
+        assert_eq!(agents.len(), 1);
+        let stored = agents[0].data_manifest.as_ref().expect("manifest");
+        assert_eq!(stored.collection[0].family, "HostMetrics");
+        assert_eq!(stored.collection[0].inputs[0].kind, "MetricInterval");
+
+        // 旧 / 降级生产者不带清单（`None`）：不得把上一次可信值擦掉（与 local_work 同口径）。
+        let mut without_manifest = agent;
+        without_manifest.data_manifest = None;
+        without_manifest.status = "offline".to_string();
+        store
+            .upsert_agent_status("gw-1", &[without_manifest])
+            .expect("upsert without manifest");
+        let agents = store.list_agents_by_gateway("gw-1").expect("list again");
+        assert_eq!(agents[0].status, "offline", "其余字段照常更新");
+        assert!(
+            agents[0].data_manifest.is_some(),
+            "老报文不能把上一次可信的清单擦成 None"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    /// 存量快照（还没有 `data_manifest` 列）必须能反序列化：升中心不能把老库读挂。
+    #[test]
+    fn stored_agent_without_a_manifest_still_decodes() {
+        let old = serde_json::json!({
+            "agent_id": "agent-1",
+            "gateway_id": "gw-1",
+            "instance_id": "inst-1",
+            "version": "0.3.0",
+            "status": "online",
+            "health": "healthy",
+            "memory_bytes": null,
+            "cpu_percent": null,
+            "admin_latency_ms": null,
+            "last_seen_at": "2026-01-01T00:00:00Z",
+            "node_id": null,
+            "hostname": null,
+            "ip_addresses": null
+        });
+        let agent: StoredAgent = serde_json::from_value(old).expect("old snapshot decodes");
+        assert!(agent.data_manifest.is_none());
+    }
+
+    /// 只有显式配了 `WARP_INSIGHT_CENTER_DATABASE_URL` 才跑：
+    /// 验证 `data_manifest` 的 JSONB 往返，以及「旧生产者不带清单不擦值」（`COALESCE`）。
+    #[tokio::test]
+    async fn pg_agent_status_keeps_the_data_manifest() {
+        let Ok(url) = std::env::var("WARP_INSIGHT_CENTER_DATABASE_URL") else {
+            return;
+        };
+        let store = crate::infra::PgStore::connect(&url)
+            .await
+            .expect("connect pg");
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let gateway_id = format!("pg-agents-{nanos}");
+        let manifest = wist_control::AgentDataManifest {
+            collected_at: DateTime::now(),
+            collection: vec![wist_control::AgentCollectionEntry {
+                family: "HostMetrics".to_string(),
+                work_id: "work-1".to_string(),
+                status: "active".to_string(),
+                plan_version: 2,
+                acknowledged_version: Some(2),
+                collection_status: Some("ok".to_string()),
+                collection_detail: None,
+                inputs: vec![wist_control::AgentDataSource {
+                    kind: "MetricInterval".to_string(),
+                    target: "15s".to_string(),
+                }],
+            }],
+            investigations: Vec::new(),
+        };
+        let agent = StoredAgent {
+            agent_id: format!("agent-{nanos}"),
+            gateway_id: gateway_id.clone(),
+            instance_id: "inst-1".to_string(),
+            version: "0.4.0".to_string(),
+            status: "online".to_string(),
+            health: "healthy".to_string(),
+            memory_bytes: None,
+            cpu_percent: None,
+            admin_latency_ms: None,
+            last_seen_at: DateTime::now(),
+            node_id: None,
+            hostname: None,
+            ip_addresses: None,
+            data_manifest: Some(manifest),
+        };
+        store
+            .upsert_agent_status(&gateway_id, &[agent.clone()])
+            .await
+            .expect("upsert");
+        let agents = store
+            .list_agents_by_gateway(&gateway_id)
+            .await
+            .expect("list");
+        assert_eq!(agents.len(), 1);
+        let stored = agents[0].data_manifest.as_ref().expect("manifest");
+        assert_eq!(stored.collection[0].family, "HostMetrics");
+        assert_eq!(stored.collection[0].inputs[0].target, "15s");
+
+        // 旧 / 降级生产者不带清单（NULL）：COALESCE 要保留上一次可信值。
+        let mut without_manifest = agent;
+        without_manifest.data_manifest = None;
+        without_manifest.status = "offline".to_string();
+        store
+            .upsert_agent_status(&gateway_id, &[without_manifest])
+            .await
+            .expect("upsert without manifest");
+        let agents = store
+            .list_agents_by_gateway(&gateway_id)
+            .await
+            .expect("list again");
+        assert_eq!(agents[0].status, "offline");
+        assert!(
+            agents[0].data_manifest.is_some(),
+            "旧报文不能把上一次可信的清单擦成 NULL"
+        );
     }
 }

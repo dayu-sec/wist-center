@@ -338,6 +338,70 @@ pub async fn admin_run_diagnose(
     }
 }
 
+/// 管理面：让某网关**立即上报一次 Agent 明细 / 数据清单**。
+///
+/// 与 60s 周期上报**同一内核**（gwlinkd 环回读网关机队 → mTLS 转报中心）；
+/// 周期是兜底，这条用于页面「立即刷新」或刚授权后核对。返回 202 + `command_id`。
+/// 幂等：该网关已有在飞的同名命令时直接复用，不会重复跑。
+pub async fn admin_report_agents(
+    State(state): State<ApiState>,
+    client: PeerConnectInfo,
+    headers: HeaderMap,
+    Path(gateway_id): Path<String>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = super::admin_auth::require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    if let Some(response) = ensure_gateway_exists(&state, &gateway_id).await {
+        return response;
+    }
+    // 旧 gwlinkd 不认识 `report-agents`，会在执行时回 400；能提前判定就提前拒，
+    // 不让页面看到“已下发刷新”却什么也没发生。
+    if let Ok(Some(gateway)) = state.store.get_gateway(&gateway_id).await
+        && super::commands::gwlinkd_supports_report_agents(gateway.gwlinkd_version.as_deref())
+            == Some(false)
+    {
+        return ApiError::conflict(
+            codes::AGENT_REPORT_UNSUPPORTED,
+            format!(
+                "gwlinkd {} 不支持 report-agents（需要 >= {}）",
+                gateway.gwlinkd_version.as_deref().unwrap_or("?"),
+                super::commands::REPORT_AGENTS_MIN_GWLINKD
+            ),
+        )
+        .into_response();
+    }
+    let Some(proxy) = state.proxy.as_ref() else {
+        return proxy_unavailable();
+    };
+    match proxy
+        .enqueue_control(&gateway_id, crate::wparse_proxy::KIND_REPORT_AGENTS)
+        .await
+    {
+        Ok((command_id, reused)) => {
+            log::info!(
+                "event=AgentReportEnqueued gateway_id={} command_id={} reused={}",
+                gateway_id,
+                command_id,
+                reused
+            );
+            (
+                StatusCode::ACCEPTED,
+                Json(json!({
+                    "gateway_id": gateway_id,
+                    "command_id": command_id,
+                    "kind": crate::wparse_proxy::KIND_REPORT_AGENTS,
+                    "reused": reused,
+                    "state": "pending",
+                })),
+            )
+                .into_response()
+        }
+        Err(err) => crate::wparse_proxy::enqueue_error(err).into_response(),
+    }
+}
+
 /// 管理面：最近一次体检（含报告原文）。
 ///
 /// `report` 是 gwlinkd 回传的 `gops run diagnose --json`（已解析）；
