@@ -94,6 +94,7 @@ mod tests {
         let jobs = crate::infra::release_job_queue(store.clone(), artifact_store.clone());
         super::super::ApiState {
             config: CenterConfig {
+                evidence: None,
                 listen_addr: "127.0.0.1:3100".to_string(),
                 admin_addr: None,
                 store_path: store_path.clone(),

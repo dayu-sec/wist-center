@@ -607,6 +607,10 @@ pub struct StoredAgent {
     /// `None` = 旧版生产者不报 —— 中心页据此区分「还没上报」与「确实什么数据都没有」。
     #[serde(default)]
     pub data_manifest: Option<wist_control::AgentDataManifest>,
+    /// 最近几条调查任务的状态（网关派生、gwlinkd 转报）。
+    /// 空表 = 旧版生产者不报 —— 中心页对旧报文保留上一次可信值（不擦成空）。
+    #[serde(default)]
+    pub investigations: Vec<wist_control::AgentInvestigationTask>,
 }
 
 /// 单次状态上报落库参数（ReceiveGatewayStatusReport → store）。
@@ -1272,6 +1276,12 @@ impl FileStore {
                     && let Some(previous) = snapshot.agents.get(&agent.agent_id)
                 {
                     agent.data_manifest = previous.data_manifest.clone();
+                }
+                // 同上：空表 = 旧报文不报（新网关总会带在飞那条），保留上一次可信值。
+                if agent.investigations.is_empty()
+                    && let Some(previous) = snapshot.agents.get(&agent.agent_id)
+                {
+                    agent.investigations = previous.investigations.clone();
                 }
                 snapshot.agents.insert(agent.agent_id.clone(), agent);
             }
@@ -3703,6 +3713,7 @@ mod tests {
             investigations: Vec::new(),
         };
         let agent = StoredAgent {
+            investigations: Vec::new(),
             agent_id: "agent-1".to_string(),
             gateway_id: "gw-1".to_string(),
             instance_id: "inst-1".to_string(),
@@ -3719,7 +3730,7 @@ mod tests {
             data_manifest: Some(manifest),
         };
         store
-            .upsert_agent_status("gw-1", &[agent.clone()])
+            .upsert_agent_status("gw-1", std::slice::from_ref(&agent))
             .expect("upsert");
         let agents = store.list_agents_by_gateway("gw-1").expect("list");
         assert_eq!(agents.len(), 1);
@@ -3798,6 +3809,7 @@ mod tests {
             investigations: Vec::new(),
         };
         let agent = StoredAgent {
+            investigations: Vec::new(),
             agent_id: format!("agent-{nanos}"),
             gateway_id: gateway_id.clone(),
             instance_id: "inst-1".to_string(),
@@ -3814,7 +3826,7 @@ mod tests {
             data_manifest: Some(manifest),
         };
         store
-            .upsert_agent_status(&gateway_id, &[agent.clone()])
+            .upsert_agent_status(&gateway_id, std::slice::from_ref(&agent))
             .await
             .expect("upsert");
         let agents = store

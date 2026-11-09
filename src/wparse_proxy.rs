@@ -70,6 +70,10 @@ pub const KIND_BIND_TENANT: &str = "bind-tenant";
 /// 与 gwlinkd 的 60s 周期上报同一内核：gwlinkd 环回读网关机队，再 mTLS 转报中心。
 /// 周期是兜底，这条命令让中心可以「现在就要一份」（页面刷新 / 刚授权完核对）。
 pub const KIND_REPORT_AGENTS: &str = "report-agents";
+/// 命令类型：**下发一次 Agent 调查**（gwlinkd 环回 POST 网关 gateway-plane 端点）。
+///
+/// `command_id` 由中心铸并透传，要一路贯通到报告正文与证据库索引；gwlinkd 只搬运。
+pub const KIND_INVESTIGATE_AGENT: &str = "investigate-agent";
 
 /// 入队失败：队列满（429）与存储错误（500）必须区分。
 #[derive(Debug)]

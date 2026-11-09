@@ -20,6 +20,8 @@ use crate::{
 
 mod admin_auth;
 mod admin_ops;
+/// 中心下发调查：发起 / 任务状态 / 报告正文（`gateway.agent-investigate`）。
+mod agent_investigations;
 /// 稳定错误码词表（`{ "error": { "code": … } }` 里 `code` 的唯一来源）。
 pub mod codes;
 mod commands;
@@ -521,6 +523,17 @@ pub fn router_for(state: ApiState) -> Router {
         .route(
             "/api/v1/admin/gateways/{gateway_id}/agents",
             get(admin_list_gateway_agents),
+        )
+        // 管理面：对某台 Agent 下发调查 / 看任务状态（GET）/ 取报告正文（下级路径）。
+        // 中心铸 `command_id` 透传给网关（贯通到报告正文与证据库索引）。
+        .route(
+            "/api/v1/admin/gateways/{gateway_id}/agents/{agent_id}/investigations",
+            get(agent_investigations::admin_show_agent_investigations)
+                .post(agent_investigations::admin_launch_agent_investigation),
+        )
+        .route(
+            "/api/v1/admin/gateways/{gateway_id}/agents/{agent_id}/investigations/{command_id}/content",
+            get(agent_investigations::admin_read_investigation_content),
         )
         // 管理面：某 gateway 生命周期转变历史
         .route(

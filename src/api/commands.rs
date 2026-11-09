@@ -49,11 +49,24 @@ const ADMIN_ACTOR: &str = "admin";
 /// `report-agents` 需要 gwlinkd ≥ 0.21.0：它才知道这个 wire kind，并负责环回拉取 + 转报。
 pub(super) const REPORT_AGENTS_MIN_GWLINKD: &str = "0.21.0";
 
-/// gwlinkd 是否支持 `report-agents`。
+/// `investigate-agent` 需要 gwlinkd ≥ 0.22.0：它才知道这个 wire kind，并负责环回转发。
+pub(super) const INVESTIGATE_MIN_GWLINKD: &str = "0.22.0";
+
+/// 调查题面词表（与网关 / agentd 同一口径：只增不改名）。
+pub(crate) const INVESTIGATE_TOPICS: &[&str] = &[
+    "disk",
+    "load",
+    "accounts",
+    "persistence",
+    "exposure",
+    "telemetry-health",
+];
+
+/// gwlinkd 版本是否 ≥ `min`。
 ///
 /// `Some(true)` = 满足；`Some(false)` = 已知太旧；`None` = 版本未知 / 认不出来。
 /// 调用方对 `None` 的取向：**不拦**（无法判定时不在中心制造假阴性，命令回执仍会说真话）。
-pub(super) fn gwlinkd_supports_report_agents(version: Option<&str>) -> Option<bool> {
+pub(super) fn gwlinkd_at_least(version: Option<&str>, min: &str) -> Option<bool> {
     fn core(value: &str) -> Option<Vec<u64>> {
         let normalized = wist_release::package::normalize_version(value);
         let mut parts = wist_release::package::parse_version(&normalized)?;
@@ -67,7 +80,17 @@ pub(super) fn gwlinkd_supports_report_agents(version: Option<&str>) -> Option<bo
     if version.is_empty() {
         return None;
     }
-    Some(core(version)? >= core(REPORT_AGENTS_MIN_GWLINKD)?)
+    Some(core(version)? >= core(min)?)
+}
+
+/// gwlinkd 是否支持 `report-agents`。
+pub(super) fn gwlinkd_supports_report_agents(version: Option<&str>) -> Option<bool> {
+    gwlinkd_at_least(version, REPORT_AGENTS_MIN_GWLINKD)
+}
+
+/// gwlinkd 是否支持 `investigate-agent`。
+pub(super) fn gwlinkd_supports_investigate(version: Option<&str>) -> Option<bool> {
+    gwlinkd_at_least(version, INVESTIGATE_MIN_GWLINKD)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -95,6 +118,13 @@ const KINDS: &[KindSpec] = &[
     },
     KindSpec {
         kind: "gateway.restart-process",
+        target_type: "gateway",
+        requires_explicit_dispatch: true,
+    },
+    // 一次性调查：`target = gateway`，payload 带 `agent_id` + 题面；`command_id` 由中心铸、
+    // dispatch 时注入 wire body（报告与证据库索引都用它）。
+    KindSpec {
+        kind: "gateway.agent-investigate",
         target_type: "gateway",
         requires_explicit_dispatch: true,
     },
@@ -131,8 +161,50 @@ fn wire_for(kind: &str, payload: &Value) -> Option<(&'static str, Option<String>
                 _ => None,
             }
         }
+        // 调查：题面与参数原样搬运；**不开放 `path`**（目录名本身就是情报，由题目自己挑）。
+        // `command_id` 不在这里注入 —— 幂等重放的 payload 比较不能受它影响，dispatch 阶段再加。
+        "gateway.agent-investigate" => {
+            let agent_id = payload.get("agent_id").and_then(Value::as_str)?;
+            if agent_id.trim().is_empty() {
+                return None;
+            }
+            let topic = payload.get("topic").and_then(Value::as_str)?;
+            if !INVESTIGATE_TOPICS.contains(&topic) {
+                return None;
+            }
+            if payload.get("path").is_some_and(|value| !value.is_null()) {
+                return None;
+            }
+            let mut body = serde_json::Map::new();
+            body.insert("agent_id".to_string(), Value::String(agent_id.to_string()));
+            body.insert("topic".to_string(), Value::String(topic.to_string()));
+            for key in ["top", "min_size", "depth", "max_seconds"] {
+                if let Some(value) = payload.get(key).filter(|value| !value.is_null()) {
+                    body.insert(key.to_string(), value.clone());
+                }
+            }
+            Some((
+                crate::wparse_proxy::KIND_INVESTIGATE_AGENT,
+                Some(Value::Object(body).to_string()),
+            ))
+        }
         _ => None,
     }
+}
+
+/// 把中心铸的 `command_id` 放进 wire body（调查用）。
+///
+/// body 是一段由 [`wire_for`] 生成的 JSON 对象；解析不了就当空对象重建，
+/// 不因此让一条已受理的命令派不出去（真正的校验已在 `wire_for` 里做过）。
+fn inject_command_id(body: &str, command_id: &str) -> String {
+    let mut value: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
+    if let Some(map) = value.as_object_mut() {
+        map.insert(
+            "command_id".to_string(),
+            Value::String(command_id.to_string()),
+        );
+    }
+    value.to_string()
 }
 
 // ── 请求 / 响应 ──────────────────────────────────────────────────────────
@@ -812,6 +884,69 @@ pub(crate) async fn reconcile_result(
 
 // ── 内部 ─────────────────────────────────────────────────────────────────
 
+/// 铸号 → 落库 → 展开目标入队（供资源型端点复用，例如「发起调查」）。
+///
+/// 与 `POST /admin/commands` 的差别：没有调用方的 `Idempotency-Key`（资源端点自己定义幂等语义），
+/// 用一个随机 `request_id` 占位（它只负担唯一约束）。
+#[allow(clippy::result_large_err)]
+pub(crate) async fn create_and_dispatch(
+    state: &ApiState,
+    kind: &str,
+    target_ids: Vec<String>,
+    payload: Value,
+    reason: Option<String>,
+    requested_by: Option<String>,
+) -> Result<CommandRecord, Response> {
+    let Some(spec) = kind_spec(kind) else {
+        return Err(ApiError::bad_request(
+            codes::COMMAND_KIND_UNKNOWN,
+            format!("kind `{kind}` is not accepted"),
+        )
+        .into_response());
+    };
+    if target_ids.is_empty() {
+        return Err(ApiError::bad_request(
+            codes::COMMAND_TARGET_NOT_FOUND,
+            "target.ids must not be empty",
+        )
+        .into_response());
+    }
+    if wire_for(kind, &payload).is_none() {
+        return Err(ApiError::unprocessable(
+            codes::COMMAND_PAYLOAD_INVALID,
+            format!("payload does not match kind `{kind}`"),
+        )
+        .into_response());
+    }
+    let now = DateTime::now();
+    let expires_at = DateTime::from_rfc3339(
+        &(now.clone().to_chrono() + chrono::Duration::seconds(DEFAULT_TTL_SECONDS)).to_rfc3339(),
+    )
+    .unwrap_or_else(|| now.clone());
+    let command = CommandRecord {
+        command_id: new_secret_token("cmd").unwrap_or_default(),
+        request_id: new_secret_token("req").unwrap_or_default(),
+        kind: kind.to_string(),
+        target_type: spec.target_type.to_string(),
+        target_ids,
+        payload,
+        reason,
+        requested_by: requested_by.filter(|value| !value.trim().is_empty()),
+        state: COMMAND_STATE_VALIDATED.to_string(),
+        created_by: ADMIN_ACTOR.to_string(),
+        created_at: now,
+        dispatched_at: None,
+        dispatched_by: None,
+        expires_at: Some(expires_at),
+        cancelled_at: None,
+        last_error: None,
+    };
+    if let Err(err) = state.store.insert_command(&command, &[]).await {
+        return Err(store_error("failed to create command", err));
+    }
+    dispatch_inner(state, &command, None).await
+}
+
 // axum `Response` 作为 Err 载荷是刻意设计：调用方直接 `if let Err(response) = ... { return response; }`。
 #[allow(clippy::result_large_err)]
 async fn load_command(
@@ -902,6 +1037,16 @@ async fn dispatch_inner(
         )
         .into_response()
     })?;
+    // 调查：中心铸的 `command_id` 在**派发时**注入——它要一路贯通到报告正文与证据库索引。
+    // 不放在 create 的 payload 里：幂等重放比较的是 payload，随机 id 会让重试变成冲突。
+    let wire_body = if wire_kind == crate::wparse_proxy::KIND_INVESTIGATE_AGENT {
+        Some(inject_command_id(
+            wire_body.as_deref().unwrap_or("{}"),
+            &command.command_id,
+        ))
+    } else {
+        wire_body
+    };
 
     let now = DateTime::now();
     let mut targets = Vec::with_capacity(selected.len());
@@ -909,9 +1054,14 @@ async fn dispatch_inner(
     for target_id in selected {
         // 网关目标：target_id 就是 gateway_id。
         let gateway_id = target_id.clone();
-        // 旧 gwlinkd 不认识 `report-agents`，会在**执行时**回 400。在中心先按上报的
+        // 旧 gwlinkd 不认识新 wire kind，会在**执行时**回 400。在中心先按上报的
         // `gwlinkd_version` 拦一道：能提前失败，就不让运维面对“已下发但没反应”。
-        if wire_kind == crate::wparse_proxy::KIND_REPORT_AGENTS {
+        let min_version = match wire_kind {
+            crate::wparse_proxy::KIND_REPORT_AGENTS => Some(REPORT_AGENTS_MIN_GWLINKD),
+            crate::wparse_proxy::KIND_INVESTIGATE_AGENT => Some(INVESTIGATE_MIN_GWLINKD),
+            _ => None,
+        };
+        if let Some(min) = min_version {
             let gwlinkd_version = state
                 .store
                 .get_gateway(&gateway_id)
@@ -919,11 +1069,10 @@ async fn dispatch_inner(
                 .ok()
                 .flatten()
                 .and_then(|gateway| gateway.gwlinkd_version);
-            if gwlinkd_supports_report_agents(gwlinkd_version.as_deref()) == Some(false) {
+            if gwlinkd_at_least(gwlinkd_version.as_deref(), min) == Some(false) {
                 let detail = format!(
-                    "gwlinkd {} 不支持 report-agents（需要 >= {}）",
-                    gwlinkd_version.as_deref().unwrap_or("?"),
-                    REPORT_AGENTS_MIN_GWLINKD
+                    "gwlinkd {} 不支持 {wire_kind}（需要 >= {min}）",
+                    gwlinkd_version.as_deref().unwrap_or("?")
                 );
                 last_error = Some(detail.clone());
                 targets.push(TargetCommandRecord {
@@ -1127,6 +1276,7 @@ mod api_tests {
         let jobs = release_job_queue(store.clone(), artifact_store.clone());
         ApiState {
             config: CenterConfig {
+                evidence: None,
                 listen_addr: "127.0.0.1:3100".to_string(),
                 admin_addr: None,
                 store_path: std::env::temp_dir().join("unused.json"),
@@ -1546,5 +1696,79 @@ mod api_tests {
     async fn old_fleet_dispatch_route_is_gone() {
         let (status, _) = send("POST", "/api/v1/gateway/agents/dispatch", None, "{}").await;
         assert_eq!(status, StatusCode::GONE);
+    }
+}
+
+#[cfg(test)]
+mod investigate_tests {
+    use super::*;
+
+    /// 调查的 wire body：题面 + 参数原样搬运，`command_id` 在派发时注入。
+    #[test]
+    fn investigate_wire_body_carries_only_the_narrow_params() {
+        let payload = json!({
+            "agent_id": "agent-1",
+            "topic": "disk",
+            "top": 10,
+            "min_size": 0,
+            "depth": 16,
+            "max_seconds": 120,
+        });
+        let (wire_kind, body) = wire_for("gateway.agent-investigate", &payload).expect("wire");
+        assert_eq!(wire_kind, crate::wparse_proxy::KIND_INVESTIGATE_AGENT);
+        let body: Value = serde_json::from_str(body.as_deref().expect("body")).expect("json");
+        assert_eq!(body["agent_id"], "agent-1");
+        assert_eq!(body["topic"], "disk");
+        assert_eq!(body["top"], 10);
+        assert!(
+            body.get("command_id").is_none(),
+            "幂等比较用的 payload 里不能有随机 id"
+        );
+
+        let injected = inject_command_id(&body.to_string(), "cmd_abc");
+        let injected: Value = serde_json::from_str(&injected).expect("json");
+        assert_eq!(injected["command_id"], "cmd_abc");
+    }
+
+    /// `path` 不开放：带上就不合法（目录名本身就是情报）。
+    #[test]
+    fn investigate_rejects_path_and_unknown_topics() {
+        assert!(
+            wire_for(
+                "gateway.agent-investigate",
+                &json!({"agent_id": "a", "topic": "disk", "path": "/var/log"}),
+            )
+            .is_none(),
+            "path 必须被拒"
+        );
+        assert!(
+            wire_for(
+                "gateway.agent-investigate",
+                &json!({"agent_id": "a", "topic": "memory"}),
+            )
+            .is_none(),
+            "题面闭集之外必须被拒"
+        );
+        assert!(
+            wire_for(
+                "gateway.agent-investigate",
+                &json!({"agent_id": " ", "topic": "disk"})
+            )
+            .is_none(),
+            "agent_id 不能空白"
+        );
+    }
+
+    /// gwlinkd 版本闸：0.22 起才认得 `investigate-agent`；版本未知不拦。
+    #[test]
+    fn investigate_version_gate_starts_at_0_22() {
+        assert_eq!(gwlinkd_supports_investigate(Some("0.21.9")), Some(false));
+        assert_eq!(gwlinkd_supports_investigate(Some("0.22")), Some(true));
+        assert_eq!(
+            gwlinkd_supports_investigate(Some("0.22.0-alpha")),
+            Some(true)
+        );
+        assert_eq!(gwlinkd_supports_investigate(None), None);
+        assert_eq!(gwlinkd_supports_investigate(Some("  ")), None);
     }
 }

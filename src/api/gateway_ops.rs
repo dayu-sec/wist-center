@@ -83,6 +83,7 @@ pub async fn submit_agent_status(
                     hostname: agent.hostname.clone(),
                     ip_addresses: agent.ip_addresses.clone(),
                     data_manifest: agent.data_manifest.clone(),
+                    investigations: agent.investigations.clone(),
                 })
                 .collect();
             if let Err(err) = state
@@ -1394,6 +1395,7 @@ mod tests {
         }
         ApiState {
             config: crate::config::CenterConfig {
+                evidence: None,
                 listen_addr: "127.0.0.1:3100".to_string(),
                 admin_addr: None,
                 store_path: path,
@@ -1465,6 +1467,7 @@ mod tests {
             .expect("enroll");
         ApiState {
             config: crate::config::CenterConfig {
+                evidence: None,
                 listen_addr: "127.0.0.1:3100".to_string(),
                 admin_addr: None,
                 store_path: path,
@@ -1523,6 +1526,7 @@ mod tests {
         store.create_gateway("gw-p", link_token).expect("create");
         ApiState {
             config: crate::config::CenterConfig {
+                evidence: None,
                 listen_addr: "127.0.0.1:3100".to_string(),
                 admin_addr: None,
                 store_path: path.clone(),
@@ -3679,6 +3683,7 @@ mod tests {
             .expect("revoke");
         let state = ApiState {
             config: crate::config::CenterConfig {
+                evidence: None,
                 listen_addr: "127.0.0.1:3100".to_string(),
                 admin_addr: None,
                 store_path: std::env::temp_dir().join(format!("wic-register-revoked-{nanos}.json")),

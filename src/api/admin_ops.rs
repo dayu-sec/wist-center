@@ -2640,6 +2640,7 @@ pub async fn admin_list_gateway_agents(
     let views: Vec<AgentRuntimeStatus> = agents
         .into_iter()
         .map(|agent| AgentRuntimeStatus {
+            investigations: Vec::new(),
             agent_id: agent.agent_id,
             instance_id: agent.instance_id,
             version: agent.version,
@@ -2948,6 +2949,7 @@ mod tests {
         let jobs = crate::infra::release_job_queue(store.clone(), artifact_store.clone());
         ApiState {
             config: CenterConfig {
+                evidence: None,
                 listen_addr: "127.0.0.1:3100".to_string(),
                 admin_addr: None,
                 store_path: std::env::temp_dir().join("unused.json"),
@@ -5529,6 +5531,7 @@ mod tests {
         let jobs = crate::infra::release_job_queue(store.clone(), artifact_store.clone());
         let state = ApiState {
             config: CenterConfig {
+                evidence: None,
                 listen_addr: "127.0.0.1:3100".to_string(),
                 admin_addr: None,
                 store_path: std::env::temp_dir().join(format!("wic-never-{nanos}.json")),
@@ -5752,6 +5755,7 @@ mod tests {
         let jobs = crate::infra::release_job_queue(store.clone(), artifact_store.clone());
         ApiState {
             config: CenterConfig {
+                evidence: None,
                 listen_addr: "127.0.0.1:3100".to_string(),
                 admin_addr: None,
                 store_path: std::env::temp_dir().join("unused.json"),
@@ -6080,6 +6084,7 @@ mod tests {
         let jobs = crate::infra::release_job_queue(store.clone(), artifact_store.clone());
         let state = ApiState {
             config: CenterConfig {
+                evidence: None,
                 listen_addr: "127.0.0.1:3100".to_string(),
                 admin_addr: None,
                 store_path: std::env::temp_dir().join(format!("wic-create-tb-{nanos}.json")),
@@ -7342,6 +7347,7 @@ mod tests {
             .upsert_agent_status(
                 "gw-001",
                 &[crate::infra::StoredAgent {
+                    investigations: Vec::new(),
                     agent_id: "agent-1".to_string(),
                     gateway_id: "gw-001".to_string(),
                     instance_id: "inst-1".to_string(),

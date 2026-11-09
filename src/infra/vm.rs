@@ -931,6 +931,7 @@ mod tests {
     #[test]
     fn agent_host_info_is_omitted_when_unknown() {
         let agent = StoredAgent {
+            investigations: Vec::new(),
             agent_id: "agent-1".to_string(),
             gateway_id: "gw-x".to_string(),
             instance_id: "inst-a".to_string(),
@@ -957,6 +958,7 @@ mod tests {
     #[test]
     fn agent_host_info_uses_hostname_when_only_ipv6_is_available() {
         let agent = StoredAgent {
+            investigations: Vec::new(),
             agent_id: "agent-1".to_string(),
             gateway_id: "gw-x".to_string(),
             instance_id: "inst-a".to_string(),
@@ -991,6 +993,7 @@ mod tests {
     #[test]
     fn renders_agent_lines() {
         let agent = StoredAgent {
+            investigations: Vec::new(),
             agent_id: "agent-1".to_string(),
             gateway_id: "gw-x".to_string(),
             instance_id: "inst-a".to_string(),
@@ -1042,6 +1045,7 @@ mod tests {
 
         // offline → agent_up 0。
         let offline = StoredAgent {
+            investigations: Vec::new(),
             status: "offline".to_string(),
             ..agent
         };

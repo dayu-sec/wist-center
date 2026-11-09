@@ -182,8 +182,40 @@ pub struct CenterConfig {
     pub wparse_release: WparseReleaseConfig,
     /// 程序访问凭据（`[credentials]`）：接收 `wist-cred` 推来的摘要，本地验 token。
     pub credentials: CredentialsConfig,
+    /// 证据库读口（`[evidence]`）：下发调查后中心按 `command_id` 去取报告元数据 / 正文。
+    /// `None` = 未接入：页面只显示任务状态，并说清楚「证据服务未配置」。
+    pub evidence: Option<EvidenceConfig>,
     /// `[log]` 段：本进程运行日志（级别 / 格式 / 落点 / 轮转）。
     pub log: wist_log::LogSection,
+}
+
+/// 证据库读口（`[evidence]`）。
+///
+/// 只给中心一个**读**身份：能按 `cmd_id` 查元数据与正文，不写入、不删除。
+/// `read_token` 一律写 `${SEC_EVIDENCE_READ_TOKEN}`，真值来自 `.wist/sec-value.yml`。
+#[derive(Clone)]
+pub struct EvidenceConfig {
+    pub endpoint: String,
+    pub read_token: String,
+    pub timeout_seconds: u64,
+    /// 证据租户（对象键第一段）。缺省由网关的客户绑定推导；未绑定时不能查证据。
+    pub tenant: Option<String>,
+    /// 读身份的最高敏感度档（`metrics` / `paths` / `commandlines` / `identities` /
+    /// `secret_metadata` / `security_posture`）。调查报告通常到 `identities`。
+    pub max_sensitivity: String,
+}
+
+/// token 不进日志：`CenterConfig` 是 `Debug`，默认派生会把密钥原样打印出来。
+impl std::fmt::Debug for EvidenceConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EvidenceConfig")
+            .field("endpoint", &self.endpoint)
+            .field("read_token", &"***")
+            .field("timeout_seconds", &self.timeout_seconds)
+            .field("tenant", &self.tenant)
+            .field("max_sensitivity", &self.max_sensitivity)
+            .finish()
+    }
 }
 
 /// 程序访问凭据（`[credentials]`）：与 `wist-cred` 的「验证方（X）」契约。
@@ -428,6 +460,7 @@ struct RawCenterConfig {
     wparse_proxy: RawWparseProxyConfig,
     wparse_release: RawWparseReleaseConfig,
     credentials: RawCredentialsConfig,
+    evidence: RawEvidenceConfig,
     log: wist_log::LogSection,
 }
 
@@ -537,6 +570,16 @@ struct RawCredentialsConfig {
     /// 接入文件（由 `wist-cred` 接入脚本产出）：身份 + 验证策略从它来。
     /// 相对路径按**该文件所在目录**解；文件里的值覆盖本段里的同名字段。
     file: Option<String>,
+}
+
+/// `[evidence]`：证据库读口（只读）。
+#[derive(Debug, Default, Deserialize)]
+struct RawEvidenceConfig {
+    endpoint: Option<String>,
+    read_token: Option<String>,
+    timeout_seconds: Option<u64>,
+    tenant: Option<String>,
+    max_sensitivity: Option<String>,
 }
 
 /// `[credentials] file = "…"` 指向的接入文件。
@@ -681,6 +724,21 @@ impl CenterConfig {
         let package_sources = normalize_package_sources(raw.packages.sources)?;
         let wparse_release = normalize_wparse_release(raw.wparse_release)?;
         let credentials = normalize_credentials(raw.credentials, config_dir)?;
+        // 证据库读口：endpoint + read_token 都配了才启用（否则页面退化为「只看任务状态」）。
+        let evidence = match (
+            normalize_optional(raw.evidence.endpoint),
+            normalize_optional(raw.evidence.read_token),
+        ) {
+            (Some(endpoint), Some(read_token)) => Some(EvidenceConfig {
+                endpoint: trim_trailing_slash(endpoint),
+                read_token,
+                timeout_seconds: raw.evidence.timeout_seconds.unwrap_or(10).clamp(1, 60),
+                tenant: normalize_optional(raw.evidence.tenant),
+                max_sensitivity: normalize_optional(raw.evidence.max_sensitivity)
+                    .unwrap_or_else(|| "identities".to_string()),
+            }),
+            _ => None,
+        };
         let admin_token = normalize_optional(serve.admin_token);
         // 对象存储：endpoint/bucket/凭据四项齐全才启用（否则用本地文件）。
         let object_storage = match (
@@ -778,6 +836,7 @@ impl CenterConfig {
             },
             wparse_release,
             credentials,
+            evidence,
             log,
         })
     }
@@ -1034,6 +1093,9 @@ fn expand_raw_env(raw: &mut RawCenterConfig, env: &EnvDict) -> Result<(), Config
         &mut raw.artifacts.object_storage_bucket,
         &mut raw.artifacts.object_storage_access_key,
         &mut raw.artifacts.object_storage_secret_key,
+        &mut raw.evidence.endpoint,
+        &mut raw.evidence.read_token,
+        &mut raw.evidence.tenant,
     ] {
         if let Some(text) = value.as_ref() {
             *value = Some(expand(env, text)?);
@@ -2112,6 +2174,49 @@ listen_addr = ""
         let config = CenterConfig::load_from_path(&path).expect("load");
         assert_eq!(config.public_url, "https://center.example.test");
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// token 不进日志：配置是 `Debug`，派生实现会把密钥原样打印。
+    #[test]
+    fn evidence_config_debug_masks_the_token() {
+        let config = EvidenceConfig {
+            endpoint: "http://evidence:19174".to_string(),
+            read_token: "super-secret".to_string(),
+            timeout_seconds: 10,
+            tenant: None,
+            max_sensitivity: "identities".to_string(),
+        };
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains("super-secret"), "{rendered}");
+        assert!(rendered.contains("***"), "{rendered}");
+    }
+
+    /// `[evidence]`：endpoint 与 read_token 缺一不可（否则等于“看起来接了、其实读不到”）。
+    #[test]
+    fn evidence_read_endpoint_requires_both_endpoint_and_token() {
+        let _guard = env_guard();
+        let both = write_main_config(
+            "[server]\nlisten_addr = \"127.0.0.1:3100\"\n\
+             [evidence]\nendpoint = \"http://evidence:19174/\"\nread_token = \"secret\"\n\
+             tenant = \"cust-a\"\n",
+        );
+        let config = CenterConfig::load_from_path(&both).expect("load");
+        let evidence = config.evidence.expect("evidence configured");
+        assert_eq!(evidence.endpoint, "http://evidence:19174", "尾斜杠要去掉");
+        assert_eq!(evidence.read_token, "secret");
+        assert_eq!(evidence.tenant.as_deref(), Some("cust-a"));
+        assert_eq!(evidence.max_sensitivity, "identities", "缺省到最常用的一档");
+        assert_eq!(evidence.timeout_seconds, 10);
+        let _ = fs::remove_dir_all(both.parent().unwrap());
+
+        // 只配一半 → 视为未接入（状态接口会标 evidence_not_configured）。
+        let half = write_main_config(
+            "[server]\nlisten_addr = \"127.0.0.1:3100\"\n\
+             [evidence]\nendpoint = \"http://evidence:19174\"\n",
+        );
+        let config = CenterConfig::load_from_path(&half).expect("load");
+        assert!(config.evidence.is_none(), "缺 token 不得当成已接入");
+        let _ = fs::remove_dir_all(half.parent().unwrap());
     }
 
     #[test]

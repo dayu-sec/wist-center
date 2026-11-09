@@ -229,6 +229,7 @@ struct AgentRow {
     hostname: Option<String>,
     ip_addresses: Option<Vec<String>>,
     data_manifest: Option<serde_json::Value>,
+    investigations: Option<serde_json::Value>,
 }
 
 impl AgentRow {
@@ -252,6 +253,11 @@ impl AgentRow {
             data_manifest: self
                 .data_manifest
                 .and_then(|value| serde_json::from_value(value).ok()),
+            // 同 data_manifest：形状不认识就当空表，不让一行脏数据搞挂整个列表。
+            investigations: self
+                .investigations
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or_default(),
         }
     }
 }
@@ -320,8 +326,8 @@ const AGENT_STATUS_UPSERT_SQL: &str = r#"
 INSERT INTO agent_status
     (agent_id, gateway_id, instance_id, version, status, health,
      memory_bytes, cpu_percent, admin_latency_ms, last_seen_at,
-     node_id, hostname, ip_addresses, data_manifest)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+     node_id, hostname, ip_addresses, data_manifest, investigations)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 ON CONFLICT (agent_id) DO UPDATE SET
     gateway_id = EXCLUDED.gateway_id,
     instance_id = EXCLUDED.instance_id,
@@ -335,7 +341,9 @@ ON CONFLICT (agent_id) DO UPDATE SET
     node_id = EXCLUDED.node_id,
     hostname = EXCLUDED.hostname,
     ip_addresses = EXCLUDED.ip_addresses,
-    data_manifest = COALESCE(EXCLUDED.data_manifest, agent_status.data_manifest)
+    data_manifest = COALESCE(EXCLUDED.data_manifest, agent_status.data_manifest),
+    investigations = COALESCE(
+        NULLIF(EXCLUDED.investigations, '[]'::jsonb), agent_status.investigations)
 "#;
 
 #[async_trait::async_trait]
@@ -728,6 +736,8 @@ impl Store for PgStore {
                 .map(serde_json::to_value)
                 .transpose()
                 .source_err(StoreReason::Json, "serialize agent data manifest")?;
+            let investigations = serde_json::to_value(&agent.investigations)
+                .source_err(StoreReason::Json, "serialize agent investigations")?;
             // 旧 / 降级生产者不带清单（`NULL`）：保留上一次可信值，不把中心页擦成「从未上报」。
             // 新网关总是 `Some`（哪怕空列表），所以 `NULL` 只可能来自旧报文。
             sqlx::query(AGENT_STATUS_UPSERT_SQL)
@@ -745,6 +755,7 @@ impl Store for PgStore {
                 .bind(&agent.hostname)
                 .bind(agent.ip_addresses.as_deref())
                 .bind(data_manifest)
+                .bind(investigations)
                 .execute(&self.pool)
                 .await
                 .source_raw_err(StoreReason::Sql, "upsert agent status")?;
@@ -759,7 +770,7 @@ impl Store for PgStore {
         let rows: Vec<AgentRow> = sqlx::query_as(
             "SELECT agent_id, gateway_id, instance_id, version, status, health, \
                     memory_bytes, cpu_percent, admin_latency_ms, last_seen_at, \
-                    node_id, hostname, ip_addresses, data_manifest \
+                    node_id, hostname, ip_addresses, data_manifest, investigations \
              FROM agent_status WHERE gateway_id = $1 ORDER BY agent_id",
         )
         .bind(gateway_id)
@@ -1719,8 +1730,12 @@ mod tests {
         );
         assert_eq!(
             sql.matches('$').count(),
-            14,
-            "占位符个数与 14 个 bind 必须一致"
+            15,
+            "占位符个数与 15 个 bind 必须一致"
+        );
+        assert!(
+            sql.contains("investigations = COALESCE("),
+            "investigations 的空表不擦旧值那一段丢了"
         );
     }
 
@@ -1896,6 +1911,7 @@ mod tests {
         .expect("build manifest");
 
         let agent = StoredAgent {
+            investigations: Vec::new(),
             agent_id: agent_id.clone(),
             gateway_id: gateway_id.clone(),
             instance_id: "it-instance".to_string(),
@@ -1931,6 +1947,7 @@ mod tests {
 
         // 旧生产者 / 旧 gwlinkd 不带清单（`None`）：**不能擦掉**上一次可信值。
         let without_manifest = StoredAgent {
+            investigations: Vec::new(),
             data_manifest: None,
             hostname: Some("it-host-renamed".to_string()),
             ..rows[0].clone()

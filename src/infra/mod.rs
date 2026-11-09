@@ -4,6 +4,8 @@ pub mod commands;
 pub use commands::*;
 pub mod cos;
 pub use cos::*;
+pub mod evidence;
+pub use evidence::*;
 pub mod gateway_ca;
 pub use gateway_ca::*;
 pub mod github;

@@ -5,6 +5,30 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.35.0-alpha] - 2026-11-10
+
+### 新增
+
+- **中心下发调查**：`POST /api/v1/admin/gateways/{gateway_id}/agents/{agent_id}/investigations`
+  （kind `gateway.agent-investigate`）。中心铸 `command_id` 并透传到网关，
+  同一串 id 贯通到报告正文与证据库索引。请求体**不接受 `path`**（扫描根由题目自己挑）。
+- **任务状态**：`GET …/investigations` —— 读随 `AgentRuntimeStatus` 上来的 `investigations`
+  （最近 3 条 / 7 天），并逐条现场问证据库「报告到了没」。两个来源分开说：
+  证据服务不可达 ≠ 没有报告；未配置 ≠ 没有报告（`evidence_not_configured`）。
+- **下发回执**：状态接口带 `last_dispatch`（中心命令队列的 `result_status` / `result_error`）。
+  网关拒绝（未授权 / 能力不支持 / 在飞）时**不会有任务上报**，只有它能说清「为什么没反应」。
+- **报告正文**：`GET …/investigations/{command_id}/content` 代理证据库 `/content`
+  （边读边转，不落盘）。只代理中心为这台 Agent 发过的命令。
+- **`[evidence]` 配置**：`endpoint` + `read_token`（写 `${SEC_EVIDENCE_READ_TOKEN}`）+
+  `tenant?` / `max_sensitivity` / `timeout_seconds`。未配置时页面只看任务状态。
+- `agent_status` 新增 `investigations`（JSONB）：空表不擦旧值（同 `data_manifest`）。
+- gwlinkd ≥ 0.22 预检（版本未知不拦）。
+
+### 兼容性
+
+- 依赖 `wist-control 0.21`。
+- 证据库读口需 0.1.16+（`x-evidence-service-token`）；未配 token 的旧部署仍可用。
+
 ## [0.34.1-alpha] - 2026-11-09
 
 ### 修复
