@@ -4226,7 +4226,7 @@ dependencies = [
 
 [[package]]
 name = "wist-center"
-version = "0.34.0"
+version = "0.34.1"
 dependencies = [
  "async-trait",
  "aws-sdk-s3",

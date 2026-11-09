@@ -310,6 +310,27 @@ const GATEWAY_COLUMNS: &str = "gateway_id, instance_id, credential_token_hash, \
                                lifecycle_state, initialized_at, created_at, last_seen_at, \
                                archived_at";
 
+/// Upsert 一台 Agent 的运行状态。
+///
+/// **不要在里面写 `--` SQL 注释**：Rust 的续行符 `\` 会吃掉换行与下一行缩进，
+/// 把下一行代码拼进注释里 —— 整句会以 `ip_addresses = EXCLUDED.ip_addresses,` 结尾，
+/// 报 `syntax error at end of input`（0.34.0 真跌过这一次）。要写注释写在 Rust 这边。
+const AGENT_STATUS_UPSERT_SQL: &str = "INSERT INTO agent_status \
+     (agent_id, gateway_id, instance_id, version, status, health, \
+      memory_bytes, cpu_percent, admin_latency_ms, last_seen_at, \
+      node_id, hostname, ip_addresses, data_manifest) \
+  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+  ON CONFLICT (agent_id) DO UPDATE SET \
+    gateway_id = EXCLUDED.gateway_id, instance_id = EXCLUDED.instance_id, \
+    version = EXCLUDED.version, status = EXCLUDED.status, \
+    health = EXCLUDED.health, memory_bytes = EXCLUDED.memory_bytes, \
+    cpu_percent = EXCLUDED.cpu_percent, \
+    admin_latency_ms = EXCLUDED.admin_latency_ms, \
+    last_seen_at = EXCLUDED.last_seen_at, \
+    node_id = EXCLUDED.node_id, hostname = EXCLUDED.hostname, \
+    ip_addresses = EXCLUDED.ip_addresses, \
+    data_manifest = COALESCE(EXCLUDED.data_manifest, agent_status.data_manifest)";
+
 #[async_trait::async_trait]
 impl Store for PgStore {
     async fn seed(&self, seeds: &[GatewayCredentialSeed]) -> Result<bool, StoreError> {
@@ -700,41 +721,25 @@ impl Store for PgStore {
                 .map(serde_json::to_value)
                 .transpose()
                 .source_err(StoreReason::Json, "serialize agent data manifest")?;
-            sqlx::query(
-                "INSERT INTO agent_status \
-                    (agent_id, gateway_id, instance_id, version, status, health, \
-                     memory_bytes, cpu_percent, admin_latency_ms, last_seen_at, \
-                     node_id, hostname, ip_addresses, data_manifest) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
-                 ON CONFLICT (agent_id) DO UPDATE SET \
-                   gateway_id = EXCLUDED.gateway_id, instance_id = EXCLUDED.instance_id, \
-                   version = EXCLUDED.version, status = EXCLUDED.status, \
-                   health = EXCLUDED.health, memory_bytes = EXCLUDED.memory_bytes, \
-                   cpu_percent = EXCLUDED.cpu_percent, \
-                   admin_latency_ms = EXCLUDED.admin_latency_ms, \
-                   last_seen_at = EXCLUDED.last_seen_at, \
-                   node_id = EXCLUDED.node_id, hostname = EXCLUDED.hostname, \
-                   ip_addresses = EXCLUDED.ip_addresses, \
-                   -- 旧生产者不带清单（NULL）= 保留上一次可信值；与 local_work 同口径。\
-                   data_manifest = COALESCE(EXCLUDED.data_manifest, agent_status.data_manifest)",
-            )
-            .bind(&agent.agent_id)
-            .bind(gateway_id)
-            .bind(&agent.instance_id)
-            .bind(&agent.version)
-            .bind(&agent.status)
-            .bind(&agent.health)
-            .bind(agent.memory_bytes)
-            .bind(agent.cpu_percent)
-            .bind(agent.admin_latency_ms)
-            .bind(last_seen_at)
-            .bind(&agent.node_id)
-            .bind(&agent.hostname)
-            .bind(agent.ip_addresses.as_deref())
-            .bind(data_manifest)
-            .execute(&self.pool)
-            .await
-            .source_raw_err(StoreReason::Sql, "upsert agent status")?;
+            // 旧生产者不带清单（`NULL`）= 保留上一次可信值；与 `local_work` 同口径。
+            sqlx::query(AGENT_STATUS_UPSERT_SQL)
+                .bind(&agent.agent_id)
+                .bind(gateway_id)
+                .bind(&agent.instance_id)
+                .bind(&agent.version)
+                .bind(&agent.status)
+                .bind(&agent.health)
+                .bind(agent.memory_bytes)
+                .bind(agent.cpu_percent)
+                .bind(agent.admin_latency_ms)
+                .bind(last_seen_at)
+                .bind(&agent.node_id)
+                .bind(&agent.hostname)
+                .bind(agent.ip_addresses.as_deref())
+                .bind(data_manifest)
+                .execute(&self.pool)
+                .await
+                .source_raw_err(StoreReason::Sql, "upsert agent status")?;
         }
         Ok(())
     }
@@ -1679,6 +1684,34 @@ impl ReleaseRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 回归：SQL 里的 `--` 注释会被 Rust 续行符 `\` 吃掉下一行代码（见 0.34.0 的
+    /// `agent_status_update_failed`）。这里钉住三件事：没有 `--` 注释、整句闭合、
+    /// 保留值的那一行（COALESCE）还在。
+    #[test]
+    fn agent_status_upsert_sql_is_whole() {
+        let sql = AGENT_STATUS_UPSERT_SQL;
+        assert!(
+            !sql.contains("--"),
+            "SQL 里不要写 `--` 注释：续行符会把它后面的代码拼进注释"
+        );
+        assert!(
+            sql.trim_end().ends_with(')'),
+            "SQL 没闭合 —— 末尾被注释吃掉了？结尾：{:?}",
+            &sql[sql.len().saturating_sub(60)..]
+        );
+        assert!(
+            sql.contains(
+                "data_manifest = COALESCE(EXCLUDED.data_manifest, agent_status.data_manifest)"
+            ),
+            "COALESCE 保留旧值的那一行丢了"
+        );
+        assert_eq!(
+            sql.matches('$').count(),
+            14,
+            "占位符个数与 14 个 bind 必须一致"
+        );
+    }
 
     #[test]
     fn parses_credential_status_with_unknown_fallback() {

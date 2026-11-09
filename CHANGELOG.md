@@ -5,6 +5,21 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.34.1-alpha] - 2026-11-09
+
+### 修复
+
+- **Agent 状态写库 500（`agent_status_update_failed`）——0.34.0 升上去后 agent 状态整条链路写不进去**。
+  `upsert_agent_status` 的 SQL 里混了一行 `--` 注释，而该行以 Rust 续行符 `\` 结尾，
+  续行符吃掉换行后 `data_manifest = COALESCE(...)` 被拼进注释，SQL 以尾逗号结束，
+  数据库报 `syntax error at end of input`。
+
+  影响：agent 的 `last_seen_at` / 内存 / CPU 等全部不再更新（不只是数据清单），
+  页面停在最后一次成功写入的样子；gwlinkd 的 `report-agents` 也会回 502。
+
+  修复：SQL 提到 `AGENT_STATUS_UPSERT_SQL` 常量，注释移到 Rust 侧，并加回归测试
+  钉住「SQL 里不得出现 `--`、语句必须闭合、14 个占位符与 bind 一致」。
+
 ## [0.34.0-alpha] - 2026-11-09
 
 ### 新增
