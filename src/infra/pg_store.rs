@@ -728,7 +728,8 @@ impl Store for PgStore {
                 .map(serde_json::to_value)
                 .transpose()
                 .source_err(StoreReason::Json, "serialize agent data manifest")?;
-            // 旧生产者不带清单（`NULL`）= 保留上一次可信值；与 `local_work` 同口径。
+            // 旧 / 降级生产者不带清单（`NULL`）：保留上一次可信值，不把中心页擦成「从未上报」。
+            // 新网关总是 `Some`（哪怕空列表），所以 `NULL` 只可能来自旧报文。
             sqlx::query(AGENT_STATUS_UPSERT_SQL)
                 .bind(&agent.agent_id)
                 .bind(gateway_id)
