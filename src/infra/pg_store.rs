@@ -312,24 +312,31 @@ const GATEWAY_COLUMNS: &str = "gateway_id, instance_id, credential_token_hash, \
 
 /// Upsert 一台 Agent 的运行状态。
 ///
-/// **不要在里面写 `--` SQL 注释**：Rust 的续行符 `\` 会吃掉换行与下一行缩进，
-/// 把下一行代码拼进注释里 —— 整句会以 `ip_addresses = EXCLUDED.ip_addresses,` 结尾，
-/// 报 `syntax error at end of input`（0.34.0 真跌过这一次）。要写注释写在 Rust 这边。
-const AGENT_STATUS_UPSERT_SQL: &str = "INSERT INTO agent_status \
-     (agent_id, gateway_id, instance_id, version, status, health, \
-      memory_bytes, cpu_percent, admin_latency_ms, last_seen_at, \
-      node_id, hostname, ip_addresses, data_manifest) \
-  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
-  ON CONFLICT (agent_id) DO UPDATE SET \
-    gateway_id = EXCLUDED.gateway_id, instance_id = EXCLUDED.instance_id, \
-    version = EXCLUDED.version, status = EXCLUDED.status, \
-    health = EXCLUDED.health, memory_bytes = EXCLUDED.memory_bytes, \
-    cpu_percent = EXCLUDED.cpu_percent, \
-    admin_latency_ms = EXCLUDED.admin_latency_ms, \
-    last_seen_at = EXCLUDED.last_seen_at, \
-    node_id = EXCLUDED.node_id, hostname = EXCLUDED.hostname, \
-    ip_addresses = EXCLUDED.ip_addresses, \
-    data_manifest = COALESCE(EXCLUDED.data_manifest, agent_status.data_manifest)";
+/// 用 **raw string + 真换行**，不用 `\` 续行符：续行符会吃掉换行和下一行缩进，
+/// 既让行内的 `--` 注释把后续代码整体吃掉（0.34.0 因此整句失效、agent 状态全部写不进去），
+/// 也会让漏写行尾空格时两个 token 默默粘在一起。真换行下两者都不会发生。
+/// 仍然保持**不在 SQL 里写注释**：SQL 的注释一旦被换行语义影响就是隐形故障，要写写在 Rust 这边。
+const AGENT_STATUS_UPSERT_SQL: &str = r#"
+INSERT INTO agent_status
+    (agent_id, gateway_id, instance_id, version, status, health,
+     memory_bytes, cpu_percent, admin_latency_ms, last_seen_at,
+     node_id, hostname, ip_addresses, data_manifest)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+ON CONFLICT (agent_id) DO UPDATE SET
+    gateway_id = EXCLUDED.gateway_id,
+    instance_id = EXCLUDED.instance_id,
+    version = EXCLUDED.version,
+    status = EXCLUDED.status,
+    health = EXCLUDED.health,
+    memory_bytes = EXCLUDED.memory_bytes,
+    cpu_percent = EXCLUDED.cpu_percent,
+    admin_latency_ms = EXCLUDED.admin_latency_ms,
+    last_seen_at = EXCLUDED.last_seen_at,
+    node_id = EXCLUDED.node_id,
+    hostname = EXCLUDED.hostname,
+    ip_addresses = EXCLUDED.ip_addresses,
+    data_manifest = COALESCE(EXCLUDED.data_manifest, agent_status.data_manifest)
+"#;
 
 #[async_trait::async_trait]
 impl Store for PgStore {
@@ -1685,20 +1692,23 @@ impl ReleaseRow {
 mod tests {
     use super::*;
 
-    /// 回归：SQL 里的 `--` 注释会被 Rust 续行符 `\` 吃掉下一行代码（见 0.34.0 的
-    /// `agent_status_update_failed`）。这里钉住三件事：没有 `--` 注释、整句闭合、
-    /// 保留值的那一行（COALESCE）还在。
+    /// 回归：0.34.0 的 upsert SQL 被一行 `--` 注释吞掉尾部，导致整句 `syntax error at
+    /// end of input`。这里钉住 SQL 的**静态形状**（便宜、CI 里默认跑）。
+    ///
+    /// 诚实地记一笔：真正能拦住当初那个 bug 的只有「不得出现 `--`」这一条 ——
+    /// 旧字符串的文本里也带着 `data_manifest = COALESCE(...)`、也以 `)` 结尾，
+    /// 两条看着像检查的断言其实都拦不住。真正跑一句 SQL 的是下面那条 `#[ignore]`
+    /// 的 PG 用例（`pg_store_agent_status_upsert_round_trip`）。
     #[test]
     fn agent_status_upsert_sql_is_whole() {
         let sql = AGENT_STATUS_UPSERT_SQL;
         assert!(
             !sql.contains("--"),
-            "SQL 里不要写 `--` 注释：续行符会把它后面的代码拼进注释"
+            "SQL 里不要写 `--` 注释：一旦有人换回 `\\` 续行符，它会把后面整段吃掉"
         );
         assert!(
             sql.trim_end().ends_with(')'),
-            "SQL 没闭合 —— 末尾被注释吃掉了？结尾：{:?}",
-            &sql[sql.len().saturating_sub(60)..]
+            "SQL 没闭合 —— 末尾被注释吃掉了？完整语句：{sql}"
         );
         assert!(
             sql.contains(
@@ -1847,6 +1857,103 @@ mod tests {
 
         // 清理测试数据。
         sqlx::query("DELETE FROM gateways WHERE gateway_id = $1")
+            .bind(&gateway_id)
+            .execute(&store.pool)
+            .await
+            .expect("cleanup");
+    }
+
+    /// 集成测试：`agent_status` 的 upsert 往返（含 `data_manifest` 的「旧报文不擦值」语义）。
+    ///
+    /// 为什么单独一条：0.34.0 的 upsert SQL 因为一行 `--` 注释被续行符吃掉而整句失效，
+    /// 而 `pg_store_round_trip` 只覆盖 `gateways` —— **当时没有任何用例真正打到这张表**，
+    /// 于是一个 500 一路发到现场。这条用例第一次把那句话真执行一遍。
+    ///
+    /// 运行：`cargo test -p wist-center -- --ignored pg_store_agent_status`
+    #[tokio::test]
+    #[ignore = "需要本地 PostgreSQL（docker compose up -d postgres）"]
+    async fn pg_store_agent_status_upsert_round_trip() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let database_url = std::env::var("WARP_INSIGHT_CENTER_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://demo:demo@127.0.0.1:55432/insight_demo".to_string());
+        let store = PgStore::connect(&database_url).await.expect("connect pg");
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let gateway_id = format!("pg-agent-it-{nanos}");
+        let agent_id = format!("{gateway_id}-a1");
+
+        // 清单走 JSON 反序列化构造：字段多，手写结构体在字段增减时会无谓地编译失败。
+        let manifest: wist_control::AgentDataManifest = serde_json::from_value(serde_json::json!({
+            "collected_at": "2026-01-01T00:00:00Z",
+            "collection": [],
+            "investigations": []
+        }))
+        .expect("build manifest");
+
+        let agent = StoredAgent {
+            agent_id: agent_id.clone(),
+            gateway_id: gateway_id.clone(),
+            instance_id: "it-instance".to_string(),
+            version: "0.23.3".to_string(),
+            status: "online".to_string(),
+            health: "healthy".to_string(),
+            memory_bytes: Some(51 * 1024 * 1024),
+            cpu_percent: Some(12.5),
+            admin_latency_ms: Some(25),
+            last_seen_at: DateTime::now(),
+            node_id: Some("host-it".to_string()),
+            hostname: Some("it-host".to_string()),
+            ip_addresses: Some(vec!["en0 192.168.1.5/24".to_string()]),
+            data_manifest: Some(manifest),
+        };
+        store
+            .upsert_agent_status(&gateway_id, &[agent])
+            .await
+            .expect("upsert agent status（带清单）必须能落库");
+
+        let rows = store
+            .list_agents_by_gateway(&gateway_id)
+            .await
+            .expect("list agents");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].agent_id, agent_id);
+        assert_eq!(rows[0].hostname.as_deref(), Some("it-host"));
+        assert_eq!(rows[0].memory_bytes, Some(51 * 1024 * 1024));
+        assert!(
+            rows[0].data_manifest.is_some(),
+            "清单必须能 jsonb 往返（列 + 绑定占位符）"
+        );
+
+        // 旧生产者 / 旧 gwlinkd 不带清单（`None`）：**不能擦掉**上一次可信值。
+        let without_manifest = StoredAgent {
+            data_manifest: None,
+            hostname: Some("it-host-renamed".to_string()),
+            ..rows[0].clone()
+        };
+        store
+            .upsert_agent_status(&gateway_id, &[without_manifest])
+            .await
+            .expect("upsert agent status（无清单）必须能落库");
+
+        let rows = store
+            .list_agents_by_gateway(&gateway_id)
+            .await
+            .expect("list agents again");
+        assert_eq!(
+            rows[0].hostname.as_deref(),
+            Some("it-host-renamed"),
+            "其它字段照常更新"
+        );
+        assert!(
+            rows[0].data_manifest.is_some(),
+            "旧报文（data_manifest = null）不得擦掉上一次可信清单"
+        );
+
+        sqlx::query("DELETE FROM agent_status WHERE gateway_id = $1")
             .bind(&gateway_id)
             .execute(&store.pool)
             .await
