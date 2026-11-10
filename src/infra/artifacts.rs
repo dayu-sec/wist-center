@@ -157,9 +157,20 @@ pub fn build_artifact_store(config: &CenterConfig) -> Arc<dyn ArtifactStore> {
 mod tests {
     use super::*;
 
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// 临时目录名的**进程内序号**。
+    ///
+    /// 只用 `SystemTime::now().as_nanos()` 不够：macOS 的时钟只有微秒级精度，
+    /// cargo test 默认并行跑，两个测试可能在同一微秒内取到**同一个**值 ——
+    /// 于是一个测试建出来的目录会把另一个测试「一个文件都不该落盘」的断言弄红
+    /// （CI 上就这么错过一次）。加一个递增序号后名字必定唯一。
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
     fn local_store() -> (LocalArtifactStore, PathBuf) {
+        let seq = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "wist-center-artifacts-{}",
+            "wist-center-artifacts-{}-{seq}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
@@ -169,6 +180,14 @@ mod tests {
             LocalArtifactStore::new(dir.clone(), "https://127.0.0.1:3100"),
             dir,
         )
+    }
+
+    /// 临时目录名必须每次不同（否则两个并行测试共用一个目录，结果随调度顺序变）。
+    #[test]
+    fn temp_dirs_are_unique_per_call() {
+        let dirs: Vec<PathBuf> = (0..16).map(|_| local_store().1).collect();
+        let unique: std::collections::HashSet<&PathBuf> = dirs.iter().collect();
+        assert_eq!(unique.len(), dirs.len(), "临时目录名重叠：{dirs:?}");
     }
 
     #[tokio::test]
