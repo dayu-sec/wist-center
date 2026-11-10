@@ -7324,6 +7324,9 @@ mod tests {
                 acknowledged_version: Some(2),
                 collection_status: Some("ok".to_string()),
                 collection_detail: None,
+                collection_prerequisites: None,
+                collection_result: None,
+                collection_reasons: None,
                 inputs: vec![wist_control::AgentDataSource {
                     kind: "MetricInterval".to_string(),
                     target: "15s".to_string(),

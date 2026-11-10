@@ -5,6 +5,19 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.35.3-alpha] - 2026-11-10
+
+### 变更（依赖）
+
+- 跟随 `wist-control 0.22.0` / `wist-contracts 0.11.0`：采集结果的多字段
+  （`collectionPrerequisites` / `collectionResult` / `collectionReasons`）随网关上报纸文
+  原样透传给 `wist-center-web`，中心不做二次解释。
+- 旧字段 `collectionStatus` / `collectionDetail` 依旧透传，供未升级的页面使用。
+
+### 兼容性
+
+- 纯透传 + 依赖升级，接口与存储结构不变。
+
 ## [0.35.2-alpha] - 2026-11-10
 
 ### 修复

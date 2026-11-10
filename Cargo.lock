@@ -4282,9 +4282,9 @@ dependencies = [
 
 [[package]]
 name = "wist-contracts"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3fb0d794d1fc95b7d3bd1cc108ff06ca6877c1600a400f30d2c9fdf9a4700f8"
+checksum = "36b9765a48b2cf4a9991dacd71fee9456186701dc8fccd4538400f4087494c7d"
 dependencies = [
  "jumo-derive",
  "serde",
@@ -4294,9 +4294,9 @@ dependencies = [
 
 [[package]]
 name = "wist-control"
-version = "0.21.0"
+version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b677d2227a222de8a8039852c18a9daf066825ca34546c44556d685ed5a956a9"
+checksum = "261538262d7d696cb710b0e91dac3e2add848faf64316e97815f161643dd1911"
 dependencies = [
  "chrono",
  "jumo-derive",
@@ -4347,9 +4347,9 @@ dependencies = [
 
 [[package]]
 name = "wist-metrics"
-version = "0.9.0"
+version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7ca222265ba41fb67ee9ddda32952232df2e0118225bb3717def4d6d778d995"
+checksum = "d1150239f8fa47aa8624619c9dfa7fce5cf855f00b8b69beff39e9972371364f"
 dependencies = [
  "jumo-derive",
  "serde",
