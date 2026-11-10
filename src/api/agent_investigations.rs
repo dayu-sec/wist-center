@@ -109,7 +109,7 @@ impl EvidenceView {
 struct InvestigationTaskView {
     command_id: String,
     topic: String,
-    /// `queued`（还没被 agentd 取走）/ `claimed`（在扫）/ `acked`（已回执）。
+    /// `queued`（还没被 agentd 取走）/ `claimed`（在扫）/ `acked`（已回执，成功或失败）/\n    /// `expired`（过期未执行）/ `superseded`（被新命令取代）—— 后两者写了 `acked_at`，\n    /// 但**没跑过**，不能当「已完成」。
     state: &'static str,
     requested_at: DateTime,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -515,12 +515,14 @@ fn evidence_unauthorized() -> Response {
 }
 
 fn task_state(task: &wist_control::AgentInvestigationTask) -> &'static str {
-    if task.outcome.is_some() || task.acked_at.is_some() {
-        "acked"
-    } else if task.claimed_at.is_some() {
-        "claimed"
-    } else {
-        "queued"
+    // `expired` / `superseded` 也写了 `acked_at`，但它们**没执行过** —— 并进 `acked`
+    // 会把「命令丢了」显示成「做完了」（与网关队列页同一口径）。
+    match task.outcome.as_deref() {
+        Some("expired") => "expired",
+        Some("superseded") => "superseded",
+        _ if task.outcome.is_some() || task.acked_at.is_some() => "acked",
+        _ if task.claimed_at.is_some() => "claimed",
+        _ => "queued",
     }
 }
 
@@ -1099,6 +1101,15 @@ mod tests {
         task.claimed_at = Some(DateTime::now());
         assert_eq!(super::task_state(&task), "claimed");
         task.outcome = Some("succeeded".to_string());
+        assert_eq!(super::task_state(&task), "acked");
+        // 终态但没执行：不能算「已回执」。
+        task.outcome = Some("expired".to_string());
+        task.acked_at = Some(DateTime::now());
+        assert_eq!(super::task_state(&task), "expired");
+        task.outcome = Some("superseded".to_string());
+        assert_eq!(super::task_state(&task), "superseded");
+        // 失败仍然是「跑过了」：状态是 acked，结论在 outcome 里。
+        task.outcome = Some("failed".to_string());
         assert_eq!(super::task_state(&task), "acked");
     }
 }
