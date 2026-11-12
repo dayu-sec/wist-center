@@ -97,6 +97,8 @@ mod tests {
                 evidence: None,
                 listen_addr: "127.0.0.1:3100".to_string(),
                 admin_addr: None,
+                open_addr: None,
+                open_public_url: None,
                 store_path: store_path.clone(),
                 server_cert_path: None,
                 server_key_path: None,

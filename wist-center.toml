@@ -15,6 +15,11 @@
 
 [server]
 listen_addr = "127.0.0.1:3100"
+# 开放面（第三方调查 API）：独立 listener，只挂 `/api/v1/open/**`。
+# 不配 = 不启用；配了要求 `[credentials].enabled = true`，且不得与网关面 / 管理面同端口。
+# open_addr = "0.0.0.0:3104"
+# 开放面的对外基地址（页面拼 curl 示例用；不配 = 占位符）。
+# open_public_url = "https://center.example.com:3104"
 # 中心对外地址（public_url）**不在这里**：它是站点现场事实，写在**现场态**里，且分「声明 / 值」：
 # 声明 `wist-center-pub.toml` 只写 `${VAR}`（可随版本重渲；落点用 WIST_CENTER_PUB_CONFIG 指定），
 # 真值在同目录 `.env`（永不重渲；落点用 WIST_CENTER_ENV_FILE 指定）。

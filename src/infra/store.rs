@@ -3714,6 +3714,8 @@ mod tests {
                 }],
             }],
             investigations: Vec::new(),
+            investigation_granted: None,
+            investigation_capabilities: None,
         };
         let agent = StoredAgent {
             investigations: Vec::new(),
@@ -3813,6 +3815,8 @@ mod tests {
                 }],
             }],
             investigations: Vec::new(),
+            investigation_granted: None,
+            investigation_capabilities: None,
         };
         let agent = StoredAgent {
             investigations: Vec::new(),

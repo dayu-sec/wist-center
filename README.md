@@ -363,6 +363,37 @@ All require the admin Bearer token:
 > (`gateway.diagnose`, `gateway.restart-process`); other kinds return `command_kind_not_allowed`.
 > Contract: `wist-design/doc/design/center/center-open-api.md` §6.
 
+### Open-facing (third-party)
+
+Mounted on a **separate listener** (`server.open_addr`), never on the gateway or admin face,
+and never on the single-listener (combined) face. Configured via `server.open_addr` /
+`server.open_public_url` (or `WARP_INSIGHT_CENTER_OPEN_ADDR` / `_OPEN_PUBLIC_URL`).
+
+Authenticated by a `wist-cred` Bearer token with `roles = ["investigation:run"]`; object scope
+comes from `resources.agents` / `resources.gateways`. An empty scope set means **no** access.
+
+| Method | Path | Notes |
+| --- | --- | --- |
+| `GET` | `/api/v1/open/capabilities` | The platform's investigation topics (global). |
+| `GET` | `/api/v1/open/investigation-grants?customer_id=&host_ip=` | Resolve a host by customer + IP and return granted topics / capabilities / usable topics. |
+| `POST` | `/api/v1/open/investigations` | Dispatch one investigation. Requires `Idempotency-Key`. Body: `{ customer_id, host_ip, topic, external_ref? }`. Returns `202 { command_id, evidence: { service: "wist-field", cmd_id } }`. |
+| `GET` | `/api/v1/open/investigations/:command_id` | Dispatch receipt (`target`) + agent-reported task state. |
+| `GET` | `/api/v1/open/openapi.json` | Public OpenAPI 3.1 document (no token) for client generation / parameter checks. |
+
+The launch body has **exactly one shape**: `customer_id`, `host_ip` and `topic` are required.
+There is no `target` wrapper, no `agent_id` addressing and no topic-parameter map — the open face
+only serves callers that know a tenant and a host IP. Addressing an agent by id is an internal
+action (`POST /api/v1/admin/gateways/:gw/agents/:agent/investigations`).
+
+Reports are **not** proxied by the center: the agent writes them to `wist-field` (evidence store,
+keyed by `command_id`). A credential without the role gets `403 investigation_role_required`;
+an agent outside `resources` gets `403 investigation_scope_denied`.
+
+The console page **接口可用性** (`/interfaces`) reads `GET /api/v1/admin/open-api`: the center
+self-probes the open listener (loopback) and returns its OpenAPI 3.1 document.
+
+Contract: `wist-design/doc/design/center/open-investigation-api.md`.
+
 ### Unauthenticated
 
 These two check no credential:

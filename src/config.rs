@@ -58,6 +58,8 @@ const DEFAULT_LISTEN: &str = "127.0.0.1:3100";
 const DEFAULT_STORE_PATH: &str = "state/warp-insight-center-store.json";
 const ENV_LISTEN: &str = "WARP_INSIGHT_CENTER_LISTEN";
 const ENV_ADMIN_ADDR: &str = "WARP_INSIGHT_CENTER_ADMIN_ADDR";
+const ENV_OPEN_ADDR: &str = "WARP_INSIGHT_CENTER_OPEN_ADDR";
+const ENV_OPEN_PUBLIC_URL: &str = "WARP_INSIGHT_CENTER_OPEN_PUBLIC_URL";
 const ENV_STORE_PATH: &str = "WARP_INSIGHT_CENTER_STORE_PATH";
 const ENV_GATEWAY_CREDENTIALS: &str = "WARP_INSIGHT_CENTER_GATEWAY_CREDENTIALS";
 const ENV_DATABASE_URL: &str = "WARP_INSIGHT_CENTER_DATABASE_URL";
@@ -99,9 +101,11 @@ const DEFAULT_CREDENTIALS_STORE_PATH: &str = "state/credentials.json";
 /// 允许的签发方（cred 客户端证书的身份）。
 const DEFAULT_CREDENTIALS_ISSUERS: &[&str] = &["wist-cred"];
 /// 本服务认识的角色：`admin` 进管理面，`read` 只读。
-const DEFAULT_CREDENTIALS_KNOWN_ROLES: &[&str] = &["admin", "read"];
+const DEFAULT_CREDENTIALS_KNOWN_ROLES: &[&str] = &["admin", "read", "investigation:run"];
 /// 进管理面所需角色（空 = 不按角色卡）。
 const DEFAULT_CREDENTIALS_ADMIN_ROLES: &[&str] = &["admin"];
+/// 开放面唯一需要的角色（与 `api::open_auth` 同口径）。
+const OPEN_INVESTIGATION_ROLE: &str = "investigation:run";
 /// 一次性接入券（link）的**短 TTL** 默认值：15 分钟（带外交付 + 现场执行的短窗口）。
 const DEFAULT_LINK_TTL_SECONDS: i64 = 15 * 60;
 /// 规则发布 tag 列表缓存默认值（秒）。
@@ -119,6 +123,11 @@ pub struct CenterConfig {
     /// 管理面监听地址（**内网**）：只挂 `/api/v1/admin/**` + `/api/v1/version`，不校客户端证书。
     /// 缺省（`None`）= 不拆监听器（两者共用 `listen_addr`），保留旧行为。
     pub admin_addr: Option<String>,
+    /// 开放面监听地址（**公网**）：第三方调查 API，只挂 `/api/v1/open/**` + `/api/v1/version`。
+    /// `None` = 不启动开放面（默认）；配了要求 `[credentials]` 已启用。
+    pub open_addr: Option<String>,
+    /// 开放面的对外基地址（页面拼 curl 示例 / 文档用）；不配 = 占位符。
+    pub open_public_url: Option<String>,
     pub store_path: PathBuf,
     /// 服务端 TLS 证书/私钥（PEM）。**两者都配** → 起 HTTPS（服务器证书 = CA-S 签）并
     /// 校网关客户端证书（CA-G）；**都未配** → 明文 HTTP（dev / 反代兑底）。来源：
@@ -466,6 +475,8 @@ struct RawCenterConfig {
 struct RawServerConfig {
     listen_addr: Option<String>,
     admin_addr: Option<String>,
+    open_addr: Option<String>,
+    open_public_url: Option<String>,
     public_url: Option<String>,
     protocol_version: Option<String>,
     admin_token: Option<String>,
@@ -774,6 +785,8 @@ impl CenterConfig {
                 .listen_addr
                 .unwrap_or_else(|| DEFAULT_LISTEN.to_string()),
             admin_addr: normalize_optional(serve.admin_addr),
+            open_addr: normalize_optional(serve.open_addr),
+            open_public_url: normalize_optional(serve.open_public_url).map(trim_trailing_slash),
             server_cert_path,
             server_key_path,
             store_path: absolutize_path(
@@ -850,6 +863,46 @@ impl CenterConfig {
                 ));
             }
         };
+        // 开放面：独立 listener（不得与网关面 / 管理面同端口），且必须有身份来源。
+        if let Some(open) = self.open_addr.as_deref() {
+            require_non_empty("server.open_addr", open)?;
+            if open.trim() == self.listen_addr.trim() {
+                return Err(config_validation(
+                    "server.open_addr must differ from server.listen_addr",
+                ));
+            }
+            if self
+                .admin_addr
+                .as_deref()
+                .is_some_and(|admin| admin.trim() == open.trim())
+            {
+                return Err(config_validation(
+                    "server.open_addr must differ from server.admin_addr",
+                ));
+            }
+            // 开放面靠 wist-cred 的 Bearer token 认证；没开验证器 = 服务起了但永远 403。
+            if !self.credentials.enabled {
+                return Err(config_validation(
+                    "server.open_addr requires [credentials].enabled = true",
+                ));
+            }
+            // 角色表里没有这个角色 → cred 会把角色裁掉，所有调用都 403。启动期就拒。
+            if !self
+                .credentials
+                .known_roles
+                .iter()
+                .any(|role| role == OPEN_INVESTIGATION_ROLE)
+            {
+                return Err(config_validation(format!(
+                    "server.open_addr requires `{OPEN_INVESTIGATION_ROLE}` in credentials.known_roles"
+                )));
+            }
+        }
+        if self.open_public_url.is_some() && self.open_addr.is_none() {
+            return Err(config_validation(
+                "server.open_public_url requires server.open_addr",
+            ));
+        }
         require_non_empty("server.public_url", &self.public_url)?;
         require_non_empty("server.protocol_version", &self.protocol_version)?;
         require_non_empty("security.hmac_secret", &self.hmac_secret)?;
@@ -1115,6 +1168,8 @@ fn apply_env_overrides(raw: &mut RawCenterConfig) {
     // 标量：env 有值（非空白）才覆盖；env 置空视为"没给"，保留文件值。
     override_scalar(&mut raw.server.listen_addr, ENV_LISTEN);
     override_scalar(&mut raw.server.admin_addr, ENV_ADMIN_ADDR);
+    override_scalar(&mut raw.server.open_addr, ENV_OPEN_ADDR);
+    override_scalar(&mut raw.server.open_public_url, ENV_OPEN_PUBLIC_URL);
     override_scalar(&mut raw.server.public_url, ENV_PUBLIC_URL);
     override_scalar(&mut raw.server.protocol_version, ENV_PROTOCOL_VERSION);
     override_scalar(&mut raw.artifacts.gateway_image, ENV_GATEWAY_IMAGE);
@@ -2124,6 +2179,43 @@ listen_addr = ""
         assert!(CenterConfig::load_from_path(&empty_listen).is_err());
     }
 
+    /// 开放面：必须独立端口，且必须有身份来源（credentials）——否则服务起了也永远 403。
+    #[test]
+    fn open_addr_must_be_isolated_and_have_a_credential_verifier() {
+        let _guard = env_guard();
+        let same_port = write_temp_config(
+            "[server]\nlisten_addr = \"127.0.0.1:3100\"\nopen_addr = \"127.0.0.1:3100\"\n",
+        );
+        assert!(
+            CenterConfig::load_from_path(&same_port).is_err(),
+            "open_addr 不能与网关面同端口"
+        );
+
+        let no_verifier = write_temp_config(
+            "[server]\nlisten_addr = \"127.0.0.1:3100\"\nopen_addr = \"127.0.0.1:3104\"\n",
+        );
+        let err = CenterConfig::load_from_path(&no_verifier).expect_err("no credentials");
+        assert!(
+            format!("{err}").contains("server.open_addr requires"),
+            "{err}"
+        );
+
+        // 开了验证器但角色表没带 investigation:run：cred 会裁掉角色，调用侧永远 403。
+        let missing_role = write_temp_config(
+            r#"
+[server]
+listen_addr = "127.0.0.1:3100"
+open_addr = "127.0.0.1:3104"
+
+[credentials]
+enabled = true
+known_roles = ["admin"]
+"#,
+        );
+        let err = CenterConfig::load_from_path(&missing_role).expect_err("missing role");
+        assert!(format!("{err}").contains("investigation:run"), "{err}");
+    }
+
     #[test]
     fn rejects_non_positive_link_ttl() {
         let _guard = env_guard();
@@ -2561,7 +2653,10 @@ hmac_secret = "hmac"
         let config = CenterConfig::load_from_path(&path).expect("config loads");
         assert!(!config.credentials.enabled);
         assert_eq!(config.credentials.audience, "wist-center");
-        assert_eq!(config.credentials.known_roles, ["admin", "read"]);
+        assert_eq!(
+            config.credentials.known_roles,
+            ["admin", "read", "investigation:run"]
+        );
         assert_eq!(config.credentials.admin_roles, ["admin"]);
         assert_eq!(config.credentials.allowed_issuers, ["wist-cred"]);
         // 相对路径按配置目录解析。

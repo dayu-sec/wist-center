@@ -30,6 +30,14 @@ pub use error::{ApiError, ProtocolError, ProtocolErrorEnvelope, Severity};
 mod extract;
 mod gateway_ops;
 mod install;
+/// 开放面探活 + OpenAPI 文档（管理面「接口可用性」页的数据源）。
+mod open_api_admin;
+/// 开放面鉴权：wist-cred Bearer token + `investigation:run` 角色 + 对象级授权。
+mod open_auth;
+/// 第三方下发调查：发起 / 任务状态。
+mod open_investigations;
+/// 开放面的发现能力：全局题面 / 按客户+IP 找 Agent / 调查授权。
+mod open_lookup;
 mod rate_limit;
 mod rollout;
 mod version;
@@ -198,14 +206,11 @@ pub fn router(
     proxy: Option<Arc<crate::wparse_proxy::WparseProxy>>,
     credentials: Option<CredentialVerifier>,
 ) -> Router {
-    router_for(state_of(
-        config,
-        store,
-        gateway_ca,
-        proxy,
-        credentials,
-        true,
-    ))
+    // 未拆面的单 listener：网关面 + 管理面；**不**含开放面（见 `ListenerScope::Combined`）。
+    scoped_router(
+        state_of(config, store, gateway_ca, proxy, credentials, true),
+        ListenerScope::Combined,
+    )
 }
 
 /// 构造共享状态（两个监听面各用一份，字段都是 `Arc` / `Clone`）。
@@ -250,6 +255,13 @@ pub enum ListenerScope {
     Gateway,
     /// 内网：`/api/v1/admin/**` + `/api/v1/version`。
     Admin,
+    /// 公网（第三方）：`/api/v1/open/**` + `/api/v1/version`。
+    Open,
+    /// 未拆面的单 listener（旧行为）：网关面 + 管理面，**刻意不含开放面**。
+    ///
+    /// 第三方入口必须独立 listener（独立端口 / 独立白名单 / 独立 TLS 证书），
+    /// 不能因为“没拆面”就跟着主 listener 一起暴露。
+    Combined,
 }
 
 impl ListenerScope {
@@ -269,6 +281,10 @@ impl ListenerScope {
                     || path.starts_with("/api/v1/releases/artifact/")
             }
             ListenerScope::Admin => path == "/api/v1/admin" || path.starts_with("/api/v1/admin/"),
+            ListenerScope::Open => path == "/api/v1/open" || path.starts_with("/api/v1/open/"),
+            ListenerScope::Combined => {
+                ListenerScope::Gateway.allows(path) || ListenerScope::Admin.allows(path)
+            }
         }
     }
 
@@ -276,6 +292,8 @@ impl ListenerScope {
         match self {
             ListenerScope::Gateway => "gateway",
             ListenerScope::Admin => "admin",
+            ListenerScope::Open => "open",
+            ListenerScope::Combined => "combined",
         }
     }
 }
@@ -305,6 +323,23 @@ pub fn admin_router(
     scoped_router(
         state_of(config, store, gateway_ca, proxy, credentials, true),
         ListenerScope::Admin,
+    )
+}
+
+/// 开放面（**第三方**）：只挂 `/api/v1/open/**` + `/api/v1/version`。
+///
+/// 第三方没有网关客户端证书，身份只来自 wis-cred 的 Bearer token；
+/// 因此 main 里用 server-only TLS（不校客户端证书）。
+pub fn open_router(
+    config: CenterConfig,
+    store: Arc<dyn Store>,
+    gateway_ca: Arc<crate::infra::gateway_ca::GatewayCa>,
+    proxy: Option<Arc<crate::wparse_proxy::WparseProxy>>,
+    credentials: Option<CredentialVerifier>,
+) -> Router {
+    scoped_router(
+        state_of(config, store, gateway_ca, proxy, credentials, false),
+        ListenerScope::Open,
     )
 }
 
@@ -635,6 +670,30 @@ pub fn router_for(state: ApiState) -> Router {
             "/api/v1/admin/rollout-plans/{plan_id}/archive",
             post(admin_set_upgrade_plan_archived),
         )
+        // ── 开放面（第三方调查 API）───────────────────────────────────────
+        // 只有独立 listeners（`ListenerScope::Open`）才暴露；单 listener 模式刻意不挂。
+        .route(
+            "/api/v1/open/capabilities",
+            get(open_lookup::open_capabilities),
+        )
+        .route(
+            "/api/v1/open/investigation-grants",
+            get(open_lookup::open_investigation_grants),
+        )
+        .route(
+            "/api/v1/open/investigations",
+            post(open_investigations::open_launch_investigation),
+        )
+        .route(
+            "/api/v1/open/investigations/{command_id}",
+            get(open_investigations::open_show_investigation),
+        )
+        .route(
+            "/api/v1/open/openapi.json",
+            get(open_api_admin::open_openapi_document),
+        )
+        // 管理面：开放面探活 + OpenAPI（控制台「接口可用性」页的数据源）。
+        .route("/api/v1/admin/open-api", get(open_api_admin::admin_open_api))
         // 兜底：未命中的路径 / 方法也回统一错误信封（默认 axum 是空体）。
         .fallback(fallback_not_found)
         .method_not_allowed_fallback(fallback_method_not_allowed)
@@ -654,6 +713,7 @@ mod scope_tests {
             .route("/api/v1/version", get(|| async { "v" }))
             .route("/api/v1/gateway/status", post(|| async { "gw" }))
             .route("/api/v1/admin/gateways", get(|| async { "admin" }))
+            .route("/api/v1/open/capabilities", get(|| async { "open" }))
             .route(
                 "/api/v1/releases/artifact/{component}/{version}/{filename}",
                 get(|| async { "artifact" }),
@@ -749,7 +809,10 @@ mod scope_tests {
 
         let mut unassigned = Vec::new();
         for path in &paths {
-            if !ListenerScope::Gateway.allows(path) && !ListenerScope::Admin.allows(path) {
+            if !ListenerScope::Gateway.allows(path)
+                && !ListenerScope::Admin.allows(path)
+                && !ListenerScope::Open.allows(path)
+            {
                 unassigned.push(path.clone());
             }
             // 方向性：管理面路由绝不能落到公网 listener 上。
@@ -759,11 +822,22 @@ mod scope_tests {
                     "管理面路由 {path} 不能出现在网关面"
                 );
             }
+            // 方向性：开放面路由只属于开放 listener，且**不能**被单 listener 模式带出去。
+            if path.starts_with("/api/v1/open/") {
+                assert!(
+                    !ListenerScope::Gateway.allows(path) && !ListenerScope::Admin.allows(path),
+                    "开放面路由 {path} 不能出现在网关面 / 管理面"
+                );
+                assert!(
+                    !ListenerScope::Combined.allows(path),
+                    "开放面路由 {path} 不能出现在未拆面的单 listener 上"
+                );
+            }
         }
         assert!(
             unassigned.is_empty(),
-            "这些路由两个 listener 都不放行（会被静默 404）：{unassigned:#?}\n\
-             要么把它归到 /api/v1/admin 或 /api/v1/gateway 前缀，\
+            "这些路由三个 listener 都不放行（会被静默 404）：{unassigned:#?}\n\
+             要么把它归到 /api/v1/admin、/api/v1/gateway 或 /api/v1/open 前缀，\
              要么明确加进 ListenerScope 的白名单"
         );
     }
@@ -775,6 +849,7 @@ mod scope_tests {
         for prefix in [
             "/api/v1/gateway/",
             "/api/v1/admin/",
+            "/api/v1/open/",
             "/api/v1/releases/artifact/",
         ] {
             assert!(
@@ -799,6 +874,42 @@ mod scope_tests {
         assert_eq!(
             status(admin, Method::POST, "/api/v1/gateway/status").await,
             StatusCode::NOT_FOUND
+        );
+    }
+
+    /// 开放面只挂 `/api/v1/open/**`：管理面 / 网关面都不能从这个 listener 进来。
+    #[tokio::test]
+    async fn open_face_exposes_only_open_routes() {
+        let open = ListenerScope::Open;
+        assert_eq!(
+            status(open, Method::GET, "/api/v1/open/capabilities").await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(open, Method::GET, "/api/v1/version").await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(open, Method::GET, "/api/v1/admin/gateways").await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            status(open, Method::POST, "/api/v1/gateway/status").await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// 未拆面的单 listener（旧行为）**不**附带开放面：第三方入口必须独立 listener。
+    #[tokio::test]
+    async fn combined_face_does_not_expose_the_open_routes() {
+        let combined = ListenerScope::Combined;
+        assert_eq!(
+            status(combined, Method::GET, "/api/v1/open/capabilities").await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            status(combined, Method::GET, "/api/v1/admin/gateways").await,
+            StatusCode::OK
         );
     }
 

@@ -982,7 +982,7 @@ fn store_error(message: &str, err: wist_error::StoreError) -> Response {
     .into_response()
 }
 
-fn idempotency_key(headers: &HeaderMap) -> Option<String> {
+pub(super) fn idempotency_key(headers: &HeaderMap) -> Option<String> {
     let raw = headers
         .get("Idempotency-Key")
         .and_then(|value| value.to_str().ok())?
@@ -991,6 +991,147 @@ fn idempotency_key(headers: &HeaderMap) -> Option<String> {
         return None;
     }
     Some(raw.to_string())
+}
+
+/// 中心内部入口（开放面）的「幂等创建 + 立即下发」。
+///
+/// 与 `create_command` 的差别：不跑管理面的 target 校验（调用方已经把唯一目标解析好了），
+/// 也不接受 `dispatch_now=false`；`gateway.agent-investigate` 在这里是**内部可信调用**，
+/// 不受「必须先冻结再显式派发」那条管理面规则限制。
+#[allow(clippy::result_large_err)]
+pub(super) async fn create_and_dispatch_idempotent(
+    state: &ApiState,
+    request_id: &str,
+    kind: &str,
+    target_ids: Vec<String>,
+    payload: Value,
+    reason: Option<String>,
+    requested_by: Option<String>,
+) -> Result<CommandRecord, Response> {
+    let spec = kind_spec(kind).ok_or_else(|| {
+        ApiError::internal_with(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            codes::COMMAND_KIND_UNKNOWN,
+            format!("center-internal kind `{kind}` is not registered"),
+            kind,
+        )
+        .into_response()
+    })?;
+
+    // 幂等重放：同 key 同 body 返回原指令；异 body 冲突。
+    match state.store.find_command_by_request_id(request_id).await {
+        Ok(Some(existing)) => {
+            let existing =
+                replay_or_conflict(existing, kind, spec.target_type, &target_ids, &payload)?;
+            return redispatch_if_validated(state, existing).await;
+        }
+        Ok(None) => {}
+        Err(err) => {
+            return Err(ApiError::internal_with(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                codes::COMMAND_STORE_UNAVAILABLE,
+                "failed to check idempotency key",
+                err,
+            )
+            .into_response());
+        }
+    }
+
+    let now = DateTime::now();
+    let expires_at = DateTime::from_rfc3339(
+        &(now.clone().to_chrono() + chrono::Duration::seconds(DEFAULT_TTL_SECONDS)).to_rfc3339(),
+    )
+    .unwrap_or_else(|| now.clone());
+    let command = CommandRecord {
+        command_id: new_secret_token("cmd").unwrap_or_default(),
+        request_id: request_id.to_string(),
+        kind: kind.to_string(),
+        target_type: spec.target_type.to_string(),
+        target_ids,
+        payload,
+        reason,
+        requested_by,
+        state: COMMAND_STATE_VALIDATED.to_string(),
+        // 开放面的审计主体是凭据 subject；这里已经由调用方填进 `requested_by`，
+        // `created_by` 只区分「中心内部下发」与「管理面手工下发」。
+        created_by: "open-api".to_string(),
+        created_at: now,
+        dispatched_at: None,
+        dispatched_by: None,
+        expires_at: Some(expires_at),
+        cancelled_at: None,
+        last_error: None,
+    };
+
+    if let Err(err) = state.store.insert_command(&command, &[]).await {
+        // 并发双发（同一 `Idempotency-Key`）可能同时越过上面的重放检查：
+        // 唯一约束会拒掉后到的一条，这里按「重放」再查一次。
+        if let Ok(Some(existing)) = state
+            .store
+            .find_command_by_request_id(&command.request_id)
+            .await
+        {
+            let existing = replay_or_conflict(
+                existing,
+                &command.kind,
+                &command.target_type,
+                &command.target_ids,
+                &command.payload,
+            )?;
+            return redispatch_if_validated(state, existing).await;
+        }
+        return Err(store_error("failed to create command", err));
+    }
+
+    dispatch_inner(state, &command, None).await
+}
+
+/// 重放时：**只有「已冻结但没派发」的命令才补派发**。
+///
+/// 为什么需要：`insert_command` 成功、`dispatch_inner` 失败（队列不可用）时，命令会停在
+/// `validated`。如果重放直接返回它，调用方会拿到 202 却什么也没下发 —— 静默丢失。
+/// 过期 / 已取消 / 已在队列中的命令原样返回，**不因重试复活**。
+#[allow(clippy::result_large_err)]
+async fn redispatch_if_validated(
+    state: &ApiState,
+    command: CommandRecord,
+) -> Result<CommandRecord, Response> {
+    if command.state != COMMAND_STATE_VALIDATED {
+        return Ok(command);
+    }
+    if let Some(expires_at) = &command.expires_at
+        && *expires_at <= DateTime::now()
+    {
+        return Err(ApiError::conflict(
+            codes::COMMAND_STATE_CONFLICT,
+            "command expired; use a new Idempotency-Key",
+        )
+        .into_response());
+    }
+    dispatch_inner(state, &command, None).await
+}
+
+/// 重放判定：同 kind / target / payload 视为同一请求，异则 409。
+#[allow(clippy::result_large_err)]
+fn replay_or_conflict(
+    existing: CommandRecord,
+    kind: &str,
+    target_type: &str,
+    target_ids: &[String],
+    payload: &Value,
+) -> Result<CommandRecord, Response> {
+    let same = existing.kind == kind
+        && existing.target_type == target_type
+        && existing.target_ids == target_ids
+        && &existing.payload == payload;
+    if same {
+        return Ok(existing);
+    }
+    Err(ApiError::conflict(
+        codes::COMMAND_IDEMPOTENCY_CONFLICT,
+        "Idempotency-Key was already used with a different body",
+    )
+    .into_response())
 }
 
 /// 展开目标并入队。调用方已做「状态必须是 validated」的判定。
@@ -1243,7 +1384,12 @@ mod api_tests {
     use tower::ServiceExt;
 
     use crate::config::{CenterConfig, GatewayCredentialSeed, WparseProxyConfig};
-    use crate::infra::{FileStore, LocalArtifactStore, Store, release_job_queue, sha256_hex};
+    use crate::infra::{
+        COMMAND_STATE_VALIDATED, CommandRecord, FileStore, LocalArtifactStore, Store,
+        release_job_queue, sha256_hex,
+    };
+    use serde_json::{Value, json};
+    use wist_control::types::DateTime;
 
     fn test_state() -> ApiState {
         let store = FileStore::new(std::env::temp_dir().join(format!(
@@ -1279,6 +1425,8 @@ mod api_tests {
                 evidence: None,
                 listen_addr: "127.0.0.1:3100".to_string(),
                 admin_addr: None,
+                open_addr: None,
+                open_public_url: None,
                 store_path: std::env::temp_dir().join("unused.json"),
                 server_cert_path: None,
                 server_key_path: None,
@@ -1696,6 +1844,96 @@ mod api_tests {
     async fn old_fleet_dispatch_route_is_gone() {
         let (status, _) = send("POST", "/api/v1/gateway/agents/dispatch", None, "{}").await;
         assert_eq!(status, StatusCode::GONE);
+    }
+
+    fn investigate_payload() -> Value {
+        json!({"agent_id": "agent-1", "topic": "disk"})
+    }
+
+    /// 重放「已冻结但派发失败」的命令时必须**重试派发**，不能把 validated 当成功返回。
+    #[tokio::test]
+    async fn replay_of_an_undispatched_command_retries_dispatch() {
+        let state = test_state();
+        let payload = investigate_payload();
+        let targets = vec!["gw-001".to_string()];
+
+        let first = create_and_dispatch_idempotent(
+            &state,
+            "open:test:case-1",
+            "gateway.agent-investigate",
+            targets.clone(),
+            payload.clone(),
+            None,
+            Some("svc-siem".to_string()),
+        )
+        .await;
+        assert!(first.is_err(), "队列未启用时应报 503");
+
+        let second = create_and_dispatch_idempotent(
+            &state,
+            "open:test:case-1",
+            "gateway.agent-investigate",
+            targets,
+            payload,
+            None,
+            Some("svc-siem".to_string()),
+        )
+        .await;
+        let response = second.expect_err("重放必须重新尝试派发");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // 不能因为重放多建一条命令。
+        let existing = state
+            .store
+            .find_command_by_request_id("open:test:case-1")
+            .await
+            .expect("find")
+            .expect("present");
+        assert_eq!(existing.state, COMMAND_STATE_VALIDATED);
+    }
+
+    /// 过期命令不会因为重试复活：重放回 409，让调用方换一个新的 Idempotency-Key。
+    #[tokio::test]
+    async fn replay_of_an_expired_command_is_a_conflict() {
+        let state = test_state();
+        let past = DateTime::from_rfc3339("2000-01-01T00:00:00Z").expect("time");
+        let payload = investigate_payload();
+        let command = CommandRecord {
+            command_id: "cmd-old".to_string(),
+            request_id: "open:test:old".to_string(),
+            kind: "gateway.agent-investigate".to_string(),
+            target_type: "gateway".to_string(),
+            target_ids: vec!["gw-001".to_string()],
+            payload: payload.clone(),
+            reason: None,
+            requested_by: Some("svc-siem".to_string()),
+            state: COMMAND_STATE_VALIDATED.to_string(),
+            created_by: "open-api".to_string(),
+            created_at: past.clone(),
+            dispatched_at: None,
+            dispatched_by: None,
+            expires_at: Some(past),
+            cancelled_at: None,
+            last_error: None,
+        };
+        state
+            .store
+            .insert_command(&command, &[])
+            .await
+            .expect("insert expired");
+
+        let response = create_and_dispatch_idempotent(
+            &state,
+            "open:test:old",
+            "gateway.agent-investigate",
+            vec!["gw-001".to_string()],
+            payload,
+            None,
+            Some("svc-siem".to_string()),
+        )
+        .await
+        .expect_err("过期命令不得重发");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 }
 

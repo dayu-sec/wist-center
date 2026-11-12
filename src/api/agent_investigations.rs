@@ -514,7 +514,7 @@ fn evidence_unauthorized() -> Response {
     .into_response()
 }
 
-fn task_state(task: &wist_control::AgentInvestigationTask) -> &'static str {
+pub(super) fn task_state(task: &wist_control::AgentInvestigationTask) -> &'static str {
     // `expired` / `superseded` 也写了 `acked_at`，但它们**没执行过** —— 并进 `acked`
     // 会把「命令丢了」显示成「做完了」（与网关队列页同一口径）。
     match task.outcome.as_deref() {
@@ -656,6 +656,8 @@ mod tests {
                 evidence: None,
                 listen_addr: "127.0.0.1:3100".to_string(),
                 admin_addr: None,
+                open_addr: None,
+                open_public_url: None,
                 store_path: path,
                 server_cert_path: None,
                 server_key_path: None,

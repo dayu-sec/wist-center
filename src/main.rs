@@ -170,6 +170,48 @@ async fn run_main() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
     }
 
+    // 开放面 listener（**公网**）：第三方调查 API。
+    // 身份只来自 wis-cred 的 Bearer token（外部系统没有、也不应该拿网关客户端证书），
+    // 所以用 server-only TLS（不校客户端证书），与 wparse-proxy 同一口径。
+    if let Some(open_addr) = config.open_addr.clone() {
+        let open_app = wist_center::api::open_router(
+            config.clone(),
+            store.clone(),
+            gateway_ca.clone(),
+            proxy.clone(),
+            credentials.clone(),
+        );
+        match server_tls.clone() {
+            Some((cert_path, key_path)) => {
+                let tls_config = wist_center::infra::load_server_only_config(&cert_path, &key_path)
+                    .map_err(|err| -> Box<dyn Error + Send + Sync> { err.into() })?;
+                let listener = TcpListener::bind(&open_addr).await?;
+                log::info!("wist-center open API listening on https://{open_addr}");
+                tokio::spawn(async move {
+                    if let Err(err) = serve_tls(listener, open_app, tls_config).await {
+                        log::error!("open listener stopped: {err}");
+                    }
+                });
+            }
+            None => {
+                let listener = TcpListener::bind(&open_addr).await?;
+                log::warn!(
+                    "wist-center open API listening on http://{open_addr} (server TLS is not configured)"
+                );
+                tokio::spawn(async move {
+                    if let Err(err) = axum::serve(
+                        listener,
+                        open_app.into_make_service_with_connect_info::<SocketAddr>(),
+                    )
+                    .await
+                    {
+                        log::error!("open listener stopped: {err}");
+                    }
+                });
+            }
+        }
+    }
+
     let app = if admin_addr.is_some() {
         // 拆了面：网关 listener 只挂 `/api/v1/gateway/**` + `/api/v1/version`。
         wist_center::api::gateway_router(

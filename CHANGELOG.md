@@ -5,6 +5,33 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.36.0-alpha] - 2026-11-12
+
+### 新增
+
+- **开放面（第三方调查 API）**：独立 listener（`server.open_addr`），只挂 `/api/v1/open/**`。
+  四个业务接口：`GET /capabilities`（题面闭集）、`GET /investigation-grants?customer_id=&host_ip=`
+  （按客户 + IP 转述网关的授权 / 能力）、`POST /investigations`（下发）、
+  `GET /investigations/{command_id}`（任务状态）。身份是 `wist-cred` Bearer token
+  （`roles = ["investigation:run"]`，`resources.agents` / `resources.gateways` 做对象级授权，
+  空集合 = 无权限）。
+- 下发请求体**只有一个形状**：`customer_id` / `host_ip` / `topic` 全部必填，
+  `external_ref` 可选。没有 `target` 包装、没有 `agent_id` 二选一、没有题面参数 map；
+  `additionalProperties: false` 与服务端 `deny_unknown_fields` 对齐。
+- **公开的 OpenAPI**：`GET /api/v1/open/openapi.json`（无需令牌）。
+- **管理面自述**：`GET /api/v1/admin/open-api` 回环探活开放面 listener / 调查路由，
+  并返回同一份 spec；控制台「接口可用性」页据此渲染。
+- `server.open_addr` / `server.open_public_url`（env `WARP_INSIGHT_CENTER_OPEN_ADDR` /
+  `_OPEN_PUBLIC_URL`）：配了 `open_addr` 要求 `[credentials].enabled = true`，
+  且不得与网关面 / 管理面同端口；单 listener（未拆面）模式**不会**暴露开放面。
+- `credentials.known_roles` 默认值加 `investigation:run`。
+- `wist-control` 的 `AgentDataManifest` 新增 `investigation_granted` /
+  `investigation_capabilities`（加性字段，网关填充）。
+
+### 兼容性
+
+- 未配置 `open_addr` 时行为不变；开放面依赖 `[credentials]`（wist-cred 验证方）。
+
 ## [0.35.3-alpha] - 2026-11-10
 
 ### 变更（依赖）
