@@ -323,6 +323,7 @@ All require the admin Bearer token:
 | `POST` / `GET` | `/api/v1/admin/gateways/instances` |
 | `GET` | `/api/v1/admin/gateways/:gateway_id/config` |
 | `POST` | `/api/v1/admin/gateways/bind` |
+| `POST` | `/api/v1/admin/gateways/:gateway_id/wp-ins-id:release`（仅已归档网关；释放实例号） |
 | `POST` | `/api/v1/admin/policies/global` |
 | `POST` / `GET` | `/api/v1/admin/commands` |
 | `POST` | `/api/v1/admin/commands/:command_id/dispatch` |

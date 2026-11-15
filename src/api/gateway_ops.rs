@@ -22,9 +22,10 @@ use wist_control::{
 };
 
 use crate::infra::{
-    EnrollmentTokenIssue, GatewayStatusUpdate, ReleaseRecord, StoreReason, StoredAgent,
-    StoredGateway, StoredGatewayCredentialStatus, VerifiedGatewayIdentity, derive_regist_token,
-    new_secret_token, normalize_platform, platform_family,
+    AllocateWpInsIdOutcome, EnrollmentTokenIssue, GatewayCustomerBindingRecord,
+    GatewayStatusUpdate, ReleaseRecord, StoreReason, StoredAgent, StoredGateway,
+    StoredGatewayCredentialStatus, VerifiedGatewayIdentity, derive_regist_token, new_secret_token,
+    normalize_platform, platform_family,
 };
 
 #[cfg(test)]
@@ -745,13 +746,7 @@ pub async fn get_gateway_initial_config(
                 .flatten()
                 .map(|token| token.token_id)
                 .unwrap_or_default();
-            let binding = match state.store.get_customer_binding(gateway_id).await {
-                Ok(binding) => binding,
-                Err(err) => {
-                    log::warn!("load customer binding failed: {}", err.display_chain());
-                    None
-                }
-            };
+            let binding = binding_for_gateway_config(&state, gateway_id).await;
             let config = build_initial_config_json(
                 &state,
                 &gateway,
@@ -856,13 +851,7 @@ async fn provision_gateway_initial_config(
         log::warn!("mark gateway initializing failed: {}", err.display_chain());
     }
     rate_limit::clear_auth_failures(state, client_key, GATEWAY_AUTH_SCOPE);
-    let binding = match state.store.get_customer_binding(gateway_id).await {
-        Ok(binding) => binding,
-        Err(err) => {
-            log::warn!("load customer binding failed: {}", err.display_chain());
-            None
-        }
-    };
+    let binding = binding_for_gateway_config(state, gateway_id).await;
     let config = build_initial_config_json(
         state,
         gateway,
@@ -895,18 +884,24 @@ fn build_initial_config_json(
     binding: Option<&crate::infra::GatewayCustomerBindingRecord>,
 ) -> GatewayInitialConfig {
     // 历史脏值（早于 tag-safe 校验写入的绑定）**不下发**：gwlinkd 会拒绝，且中心无从得知。
-    let (tenant_id, binding_revision) = match binding {
-        Some(binding) if super::is_tag_safe(&binding.customer_id) => {
-            (Some(binding.customer_id.clone()), Some(binding.revision))
-        }
+    let (tenant_id, binding_revision, wp_ins_id) = match binding {
+        Some(binding) if super::is_tag_safe(&binding.customer_id) => (
+            Some(binding.customer_id.clone()),
+            Some(binding.revision),
+            // 已释放且尚未分配新车道 → 不下发（否则 gwlinkd 会把旧车道写回 `.env`）。
+            binding
+                .wp_ins_id_released_at
+                .is_none()
+                .then_some(binding.wp_ins_id),
+        ),
         Some(binding) => {
             log::warn!(
                 "event=GatewayInitialConfigIdentitySkipped gateway_id={} reason=unsafe_tenant_id",
                 binding.gateway_id
             );
-            (None, None)
+            (None, None, None)
         }
-        None => (None, None),
+        None => (None, None, None),
     };
     GatewayInitialConfig {
         gateway_id: gateway.gateway_id.clone(),
@@ -917,6 +912,39 @@ fn build_initial_config_json(
         enrollment_token_id: enrollment_token_id.to_string(),
         tenant_id,
         binding_revision,
+        wp_ins_id,
+    }
+}
+
+/// 读绑定；若实例号已被显式释放，先尝试分配一个空闲车道（重新上线 / 重新接入场景）。
+async fn binding_for_gateway_config(
+    state: &ApiState,
+    gateway_id: &str,
+) -> Option<GatewayCustomerBindingRecord> {
+    let binding = match state.store.get_customer_binding(gateway_id).await {
+        Ok(binding) => binding,
+        Err(err) => {
+            log::warn!("load customer binding failed: {}", err.display_chain());
+            return None;
+        }
+    };
+    let released = binding
+        .as_ref()
+        .is_some_and(|binding| binding.wp_ins_id_released_at.is_some());
+    if !released {
+        return binding;
+    }
+    match state.store.allocate_wp_ins_id_if_released(gateway_id).await {
+        Ok(AllocateWpInsIdOutcome::Allocated(allocated)) => Some(allocated),
+        Ok(AllocateWpInsIdOutcome::Exhausted) => {
+            log::warn!("event=GatewayWpInsIdExhausted gateway_id={gateway_id}");
+            binding
+        }
+        Ok(AllocateWpInsIdOutcome::NotReleased) => binding,
+        Err(err) => {
+            log::warn!("allocate wp_ins_id failed: {}", err.display_chain());
+            binding
+        }
     }
 }
 
@@ -976,11 +1004,43 @@ pub async fn submit_gateway_status(
                     err.display_chain(),
                 );
             }
+            // 实例号被显式释放、网关又上线了：先补一个空闲车道（幂等；未释放 → 立即返回）。
+            // 本轮的 `binding_revision` 是网关本地旧值，不能拿去判“已生效”，因此分配过就不记 report。
+            let mut lane_just_allocated = false;
+            match state
+                .store
+                .allocate_wp_ins_id_if_released(&input.gateway_id)
+                .await
+            {
+                Ok(crate::infra::AllocateWpInsIdOutcome::Allocated(binding)) => {
+                    lane_just_allocated = true;
+                    log::info!(
+                        "event=GatewayWpInsIdAllocated gateway_id={} wp_ins_id={} revision={}",
+                        binding.gateway_id,
+                        binding.wp_ins_id,
+                        binding.revision
+                    );
+                }
+                Ok(crate::infra::AllocateWpInsIdOutcome::Exhausted) => {
+                    lane_just_allocated = true;
+                    log::warn!(
+                        "event=GatewayWpInsIdExhausted gateway_id={}",
+                        input.gateway_id
+                    );
+                }
+                Ok(crate::infra::AllocateWpInsIdOutcome::NotReleased) => {}
+                Err(err) => log::warn!(
+                    "allocate wp_ins_id for {} failed: {}",
+                    input.gateway_id,
+                    err.display_chain()
+                ),
+            }
             // 业务身份回执：网关自报的 tenant_id / revision 只作“已生效/漂移”证据，
             // 权威值仍是中心绑定表的 customer_id。非法/超长值不落库（只告警），
             // 写失败也只告警，不影响状态上报。
-            if let (Some(tenant_id), Some(revision)) =
-                (input.tenant_id.as_deref(), input.binding_revision)
+            if !lane_just_allocated
+                && let (Some(tenant_id), Some(revision)) =
+                    (input.tenant_id.as_deref(), input.binding_revision)
             {
                 if super::is_tag_safe(tenant_id) {
                     if let Err(err) = state
@@ -1019,6 +1079,11 @@ pub async fn submit_gateway_status(
                     Some(DesiredBusinessIdentity {
                         tenant_id: binding.customer_id,
                         revision: binding.revision,
+                        // 已释放且无空闲车道可分配：不下发车道（否则旧车道可能已被别人占用）。
+                        wp_ins_id: binding
+                            .wp_ins_id_released_at
+                            .is_none()
+                            .then_some(binding.wp_ins_id),
                     })
                 }),
                 Err(err) => {
@@ -1618,7 +1683,7 @@ mod tests {
         let state = test_state();
         let binding = state
             .store
-            .bind_gateway_customer("gw-001", "tenant-acme", "test")
+            .bind_gateway_customer("gw-001", "tenant-acme", 100, "test")
             .await
             .expect("bind");
         let response = super::super::router_for(state)
@@ -1647,6 +1712,94 @@ mod tests {
             .expect("回执应带期望业务身份");
         assert_eq!(desired.tenant_id, "tenant-acme");
         assert_eq!(desired.revision, binding.revision);
+    }
+
+    /// 已释放车道的网关重新上线：状态回执带出新分配的车道 + 新 revision。
+    #[tokio::test]
+    async fn status_receipt_reallocates_a_released_wp_ins_id() {
+        let state = test_state();
+        state
+            .store
+            .bind_gateway_customer("gw-001", "tenant-acme", 100, "test")
+            .await
+            .expect("bind");
+        state
+            .store
+            .set_gateway_archived("gw-001", Some(DateTime::now()))
+            .await
+            .expect("archive");
+        state
+            .store
+            .release_gateway_wp_ins_id("gw-001", "admin")
+            .await
+            .expect("release");
+        // 另一台网关占住 100。
+        state
+            .store
+            .bind_gateway_customer("gw-002", "tenant-b", 100, "admin")
+            .await
+            .expect("other binding");
+
+        let response = super::super::router_for(state)
+            .oneshot(with_identity(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/gateway/status")
+                    .header("content-type", "application/json")
+                    .body(Body::from(status_payload("gw-001")))
+                    .expect("request"),
+                client_identity("gw-001", TEST_FINGERPRINT),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let returned: GatewayStatusAccepted = serde_json::from_slice(&body).expect("json");
+        let desired = returned
+            .desired_business_identity
+            .expect("回执应带期望业务身份");
+        assert_eq!(desired.tenant_id, "tenant-acme");
+        assert_eq!(desired.wp_ins_id, Some(101), "100 被占用，应重新分配 101");
+        assert_eq!(desired.revision, 2);
+    }
+
+    /// 已释放车道的网关重新拉初始配置：先补空闲车道，配置里才会带 `wp_ins_id`。
+    #[tokio::test]
+    async fn initial_config_binding_reallocates_a_released_lane() {
+        let state = test_state();
+        state
+            .store
+            .bind_gateway_customer("gw-001", "tenant-acme", 100, "test")
+            .await
+            .expect("bind");
+        state
+            .store
+            .set_gateway_archived("gw-001", Some(DateTime::now()))
+            .await
+            .expect("archive");
+        state
+            .store
+            .release_gateway_wp_ins_id("gw-001", "admin")
+            .await
+            .expect("release");
+        // 另一个网关占住 100。
+        state
+            .store
+            .bind_gateway_customer("gw-002", "tenant-b", 100, "admin")
+            .await
+            .expect("other binding");
+
+        let binding = super::binding_for_gateway_config(&state, "gw-001")
+            .await
+            .expect("binding");
+        assert_eq!(binding.wp_ins_id, 101);
+        assert!(binding.wp_ins_id_released_at.is_none());
+        assert_eq!(binding.revision, 2);
     }
 
     #[tokio::test]

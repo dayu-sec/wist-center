@@ -88,10 +88,10 @@ use admin_ops::{
     admin_list_gateway_status, admin_list_jobs, admin_list_package_sources,
     admin_list_release_jobs, admin_list_releases, admin_list_upgrade_plans,
     admin_package_source_latest, admin_publish_release, admin_publish_release_batch,
-    admin_resolve_cos, admin_resolve_github_release, admin_retry_upgrade_plan,
-    admin_rotate_gateway_link_token, admin_set_gateway_archived, admin_set_release_status,
-    admin_set_upgrade_plan_archived, admin_show_gateway_status, admin_view_gateway_list,
-    admin_view_upgrade_plan,
+    admin_release_gateway_wp_ins_id, admin_resolve_cos, admin_resolve_github_release,
+    admin_retry_upgrade_plan, admin_rotate_gateway_link_token, admin_set_gateway_archived,
+    admin_set_release_status, admin_set_upgrade_plan_archived, admin_show_gateway_status,
+    admin_view_gateway_list, admin_view_upgrade_plan,
 };
 use gateway_ops::{
     download_release_artifact, get_gateway_initial_config, get_gateway_upgrade_plan,
@@ -475,6 +475,11 @@ pub fn router_for(state: ApiState) -> Router {
         .route(
             "/api/v1/admin/gateways/bind",
             post(admin_bind_gateway_customer),
+        )
+        // 管理面：显式释放已归档网关的实例号（释放后可被其他网关使用）
+        .route(
+            "/api/v1/admin/gateways/{gateway_id}/wp-ins-id:release",
+            post(admin_release_gateway_wp_ins_id),
         )
         // 管理面：实例初始配置（admin 侧查询）
         .route(

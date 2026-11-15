@@ -5,6 +5,47 @@
 
 > 说明：0.4.0 之前未单独维护本文件；自 0.4.0 起记录。
 
+## [0.37.0-alpha] - 2026-11-15
+
+### 新增
+
+- **绑定客户增加 `wp_ins_id`（wparse 事件号实例段）**：`POST /api/v1/admin/gateways/bind`
+  新增必填 `wp_ins_id`（`100..=1123`，越界 → `400 wp_ins_id_invalid`），与 `customer_id`
+  一起落库（`gateway_customer_bindings` / `gateway_binding_audit` 加列）。
+- **`wp_ins_id` 全中心唯一**：检查与 upsert 在同一事务里完成（PgStore 用
+  `pg_advisory_xact_lock` 串行化，FileStore 用现有的整份快照锁）；被别的网关占用 →
+  `409 wp_ins_id_conflict`（消息带占用者 `gateway_id`）。同网关重绑同一车道幂等。
+  唯一性**包含已归档网关** —— 归档只是标记、可能重新上线，回收车道需要显式释放。
+- **显式释放实例号**：`POST /api/v1/admin/gateways/{gateway_id}/wp-ins-id:release`
+  （仅**已归档且离线**网关；`409 gateway_not_archived` / `409 gateway_online_cannot_release` /
+  `404 gateway_binding_not_found`）。
+  释放记 `wp_ins_id_released_at` / `wp_ins_id_released_by`，该车道不再参与唯一性校验，
+  可被其他网关绑定；重复释放幂等（保留首次时刻 / 操作者）。
+- **重新上线自动补车道**：已释放车道的网关再次上报状态 / 拉取初始配置时，中心自动分配
+  最小空闲车道并 `revision++`，随 `desired_business_identity` 下发；1024 个车道全满时
+  绑定标 `failed`（`no free wp_ins_id`）。
+- 绑定下发（`bind-tenant`）、`link-upstream` 初始配置、状态回执的
+  `desired_business_identity` 都带 `wp_ins_id`；网关离线 / 重启后由回执补偿落地。
+- 管理面实例视图新增 `wp_ins_id`，页面「当前绑定」可直接看到车道。
+
+### 变更
+
+- 版本递增规则：同客户但 `wp_ins_id` 变化也递增 `revision` 并记一条审计 ——
+  数据面必须按新实例号重落 `.env` 并重启 wparse。
+- `POST /api/v1/admin/gateways/bind` 请求体改为 `deny_unknown_fields`：缺字段 / 多字段由
+  提取器拒绝，返回 `422 invalid_request_body`（不是 400）。
+- 依赖 `wist-control 0.24`。
+
+### 兼容性
+
+- `wp_ins_id` 变为**必填**：旧前端 / 脚本不带会被拒（`422 invalid_request_body`）。
+  需与 center-web 0.31 同批升级。
+- 旧绑定（没有该列）迁移为 `100`（wparse / 网关栈的默认实例号），换绑时再改。
+  迁移前已存在的重复 `wp_ins_id` **不会被自动改写**：重新绑定时会被要求换到空闲车道，
+  可用 `SELECT wp_ins_id, array_agg(gateway_id) … HAVING count(*) > 1` 排查。
+- 释放接口是**加性**能力：旧前端不调用就不影响；`GatewayCustomerBinding` 新增
+  `wp_ins_id_released_at` / `wp_ins_id_released_by`（`Option`）。
+
 ## [0.36.0-alpha] - 2026-11-12
 
 ### 新增

@@ -116,6 +116,15 @@ pub struct GatewayCustomerBindingRecord {
     /// 绑定版本：同一客户重复绑定不递增；换绑递增。
     #[serde(default = "default_binding_revision")]
     pub revision: i64,
+    /// wparse 事件号的实例段（`WP_INS_ID`，100..=1123）。
+    /// 旧快照缺这个键 → 缺省 100（与 wparse / 网关栈的默认实例号一致）。
+    #[serde(default = "default_wp_ins_id")]
+    pub wp_ins_id: i64,
+    /// 显式释放实例号的时刻 / 操作者。两者都为空 = 仍占用（唯一性只看这个状态）。
+    #[serde(default)]
+    pub wp_ins_id_released_at: Option<DateTime>,
+    #[serde(default)]
+    pub wp_ins_id_released_by: Option<String>,
     /// 网关已上报生效的 revision。
     #[serde(default)]
     pub applied_revision: Option<i64>,
@@ -132,6 +141,55 @@ fn default_binding_revision() -> i64 {
     1
 }
 
+fn default_wp_ins_id() -> i64 {
+    wist_control::WP_INS_ID_DEFAULT
+}
+
+/// 绑定客户可能返回的业务冲突（与存储故障分开）。
+///
+/// `wp_ins_id` 是**全中心唯一**的车道：被别的网关占住时要给页面一个可操作的
+/// `409`，而不是笼统的 `500 gateway_bind_failed`。
+#[derive(Debug)]
+pub enum BindGatewayCustomerError {
+    /// 存储层故障（写盘 / SQL / 序列化）。
+    Store(StoreError),
+    /// 实例号已被另一台网关占用（`gateway_id` 是占用者）。
+    LaneTaken { gateway_id: String, wp_ins_id: i64 },
+}
+
+impl From<StoreError> for BindGatewayCustomerError {
+    fn from(err: StoreError) -> Self {
+        Self::Store(err)
+    }
+}
+
+/// 显式释放实例号可能返回的业务结果。
+#[derive(Debug)]
+pub enum ReleaseWpInsIdError {
+    Store(StoreError),
+    /// 这台网关还没有客户绑定（没东西可释放）。
+    BindingNotFound,
+    /// 只允许已归档（离线）的网关释放实例号。
+    GatewayNotArchived,
+}
+
+impl From<StoreError> for ReleaseWpInsIdError {
+    fn from(err: StoreError) -> Self {
+        Self::Store(err)
+    }
+}
+
+/// 网关重新上线时对「已释放车道」的处理结果。
+#[derive(Debug)]
+pub enum AllocateWpInsIdOutcome {
+    /// 不是已释放状态，无需处理。
+    NotReleased,
+    /// 已自动分配一个空闲车道（`revision` 已递增，等网关应用）。
+    Allocated(GatewayCustomerBindingRecord),
+    /// 已释放，但 `100..=1123` 全部被占用（绑定标 `failed`）。
+    Exhausted,
+}
+
 /// 换绑审计事件（映射模型 `Control.InsightCenterApp.AdminFacingInterface.GatewayBindingAuditEvent`）：
 /// **谁**（`requested_by`）在**什么时候**把哪台网关绑到**哪个客户**（换绑时带旧值）。
 /// 绑定表只保留最新值，历史在这里。
@@ -142,6 +200,9 @@ pub struct GatewayBindingAuditEvent {
     /// 换绑前的客户；首次绑定为 `None`。
     #[serde(default)]
     pub previous_customer_id: Option<String>,
+    /// 这次绑定使用的实例段（归属或实例号变化时记一条）。
+    #[serde(default = "default_wp_ins_id")]
+    pub wp_ins_id: i64,
     pub revision: i64,
     pub requested_by: String,
     pub at: DateTime,
@@ -858,12 +919,14 @@ pub trait Store: Send + Sync + std::fmt::Debug {
     ) -> Result<u64, StoreError>;
     /// 绑定网关到客户（幂等：同网关重复绑定同一客户不递增 revision；换绑递增）。
     /// `requested_by` 在同一临界区内写进审计（归属变化时）。
+    /// `wp_ins_id` **全中心唯一**：被别的网关占用 → [`BindGatewayCustomerError::LaneTaken`]。
     async fn bind_gateway_customer(
         &self,
         gateway_id: &str,
         customer_id: &str,
+        wp_ins_id: i64,
         requested_by: &str,
-    ) -> Result<GatewayCustomerBindingRecord, StoreError>;
+    ) -> Result<GatewayCustomerBindingRecord, BindGatewayCustomerError>;
     /// 查询全部网关-客户绑定。
     async fn list_customer_bindings(&self)
     -> Result<Vec<GatewayCustomerBindingRecord>, StoreError>;
@@ -891,6 +954,17 @@ pub trait Store: Send + Sync + std::fmt::Debug {
         &self,
         gateway_id: &str,
     ) -> Result<Vec<GatewayBindingAuditEvent>, StoreError>;
+    /// 显式释放已归档网关的实例号（幂等）。释放后该车道不再参与全中心唯一性。
+    async fn release_gateway_wp_ins_id(
+        &self,
+        gateway_id: &str,
+        requested_by: &str,
+    ) -> Result<GatewayCustomerBindingRecord, ReleaseWpInsIdError>;
+    /// 已释放车道的网关重新上线时，自动分配一个空闲车道（幂等：未释放 → `NotReleased`）。
+    async fn allocate_wp_ins_id_if_released(
+        &self,
+        gateway_id: &str,
+    ) -> Result<AllocateWpInsIdOutcome, StoreError>;
     /// 查询某 gateway 下的全部 Agent 状态（按 agent_id 排序）。
     async fn list_agents_by_gateway(
         &self,
@@ -1833,6 +1907,10 @@ impl FileStore {
 
     /// 绑定网关到客户（同步，供测试与 trait 委托）：同网关重复绑定同一客户不递增 revision；换绑递增。
     ///
+    /// **全中心唯一性**在这里实现：`wp_ins_id` 已被另一台网关占用则直接返回
+    /// [`BindGatewayCustomerError::LaneTaken`]，不改任何状态。检查与写入在 `update` 的
+    /// 同一把锁里完成，不存在“先查后写”的竞态。
+    ///
     /// **归属变化时在同一把锁里**追加一条审计（`requested_by` 一并落库）：读旧值、改绑定、写审计
     /// 必须在同一个临界区，否则并发两次换绑会写出错的 `previous_customer_id`。
     /// 同客户重绑不记事件（不改变归属），只重置下发状态 —— 它意味着「重新下发一次」。
@@ -1840,20 +1918,42 @@ impl FileStore {
         &self,
         gateway_id: &str,
         customer_id: &str,
+        wp_ins_id: i64,
         requested_by: &str,
-    ) -> Result<GatewayCustomerBindingRecord, StoreError> {
-        let binding =
-            self.update::<Result<GatewayCustomerBindingRecord, StoreError>>(|snapshot| {
+    ) -> Result<GatewayCustomerBindingRecord, BindGatewayCustomerError> {
+        let binding = self
+            .update::<Result<GatewayCustomerBindingRecord, BindGatewayCustomerError>>(|snapshot| {
+                // 全中心唯一：**排除自己**（同网关重绑幂等），不排除已归档网关
+                // —— 归档只是标记、可能重新上线，释放车道必须显式操作。
+                if let Some(occupant) = snapshot.customer_bindings.iter().find(|binding| {
+                    binding.gateway_id != gateway_id
+                        && binding.wp_ins_id == wp_ins_id
+                        && binding.wp_ins_id_released_at.is_none()
+                }) {
+                    return Err(BindGatewayCustomerError::LaneTaken {
+                        gateway_id: occupant.gateway_id.clone(),
+                        wp_ins_id,
+                    });
+                }
                 let now = DateTime::now();
-                let (binding, previous) = match snapshot
+                let (binding, previous, previous_wp_ins_id, was_released) = match snapshot
                     .customer_bindings
                     .iter_mut()
                     .find(|binding| binding.gateway_id == gateway_id)
                 {
                     Some(existing) => {
                         let previous = existing.customer_id.clone();
-                        if previous != customer_id {
+                        let previous_wp_ins_id = existing.wp_ins_id;
+                        let was_released = existing.wp_ins_id_released_at.is_some();
+                        // 归属 / 实例号变化，或之前已释放：都要递增版本并重新占住车道。
+                        if previous != customer_id
+                            || previous_wp_ins_id != wp_ins_id
+                            || was_released
+                        {
                             existing.customer_id = customer_id.to_string();
+                            existing.wp_ins_id = wp_ins_id;
+                            existing.wp_ins_id_released_at = None;
+                            existing.wp_ins_id_released_by = None;
                             existing.revision = existing.revision.max(1) + 1;
                             existing.applied_revision = None;
                             existing.applied_at = None;
@@ -1863,7 +1963,12 @@ impl FileStore {
                         existing.status = "bound".to_string();
                         existing.last_error = None;
                         existing.bound_at = now.clone();
-                        (existing.clone(), Some(previous))
+                        (
+                            existing.clone(),
+                            Some(previous),
+                            Some(previous_wp_ins_id),
+                            was_released,
+                        )
                     }
                     None => {
                         let binding = GatewayCustomerBindingRecord {
@@ -1872,16 +1977,21 @@ impl FileStore {
                             status: "bound".to_string(),
                             bound_at: now.clone(),
                             revision: 1,
+                            wp_ins_id,
+                            wp_ins_id_released_at: None,
+                            wp_ins_id_released_by: None,
                             applied_revision: None,
                             applied_at: None,
                             reported_tenant_id: None,
                             last_error: None,
                         };
                         snapshot.customer_bindings.push(binding.clone());
-                        (binding, None)
+                        (binding, None, None, false)
                     }
                 };
-                let changed = previous.as_deref() != Some(customer_id);
+                let changed = previous.as_deref() != Some(customer_id)
+                    || previous_wp_ins_id != Some(wp_ins_id)
+                    || was_released;
                 if changed {
                     push_binding_audit(
                         snapshot,
@@ -1889,6 +1999,7 @@ impl FileStore {
                             gateway_id: gateway_id.to_string(),
                             customer_id: binding.customer_id.clone(),
                             previous_customer_id: previous,
+                            wp_ins_id: binding.wp_ins_id,
                             revision: binding.revision,
                             requested_by: bounded(requested_by, 128),
                             at: now,
@@ -1896,8 +2007,94 @@ impl FileStore {
                     );
                 }
                 Ok(binding)
-            })??;
+            })
+            .map_err(BindGatewayCustomerError::Store)??;
         Ok(binding)
+    }
+
+    /// 显式释放已归档网关的实例号（幂等）。
+    ///
+    /// 释放只影响**唯一性池**：`wp_ins_id` 保留作展示 / 历史，`wp_ins_id_released_at` 非空后
+    /// 该车道可被其他网关绑定。网关重新上线时由 [`Self::allocate_wp_ins_id_if_released`] 补一个新车道。
+    pub fn release_gateway_wp_ins_id(
+        &self,
+        gateway_id: &str,
+        requested_by: &str,
+    ) -> Result<GatewayCustomerBindingRecord, ReleaseWpInsIdError> {
+        let binding = self
+            .update::<Result<GatewayCustomerBindingRecord, ReleaseWpInsIdError>>(|snapshot| {
+                let archived = snapshot
+                    .gateways
+                    .get(gateway_id)
+                    .and_then(|gateway| gateway.archived_at.as_ref())
+                    .is_some();
+                if !archived {
+                    return Err(ReleaseWpInsIdError::GatewayNotArchived);
+                }
+                let Some(binding) = snapshot
+                    .customer_bindings
+                    .iter_mut()
+                    .find(|binding| binding.gateway_id == gateway_id)
+                else {
+                    return Err(ReleaseWpInsIdError::BindingNotFound);
+                };
+                // 重复释放保持首次的时刻 / 操作者（幂等，便于审计）。
+                if binding.wp_ins_id_released_at.is_none() {
+                    binding.wp_ins_id_released_at = Some(DateTime::now());
+                    binding.wp_ins_id_released_by = Some(bounded(requested_by, 128));
+                    binding.status = "released".to_string();
+                    binding.last_error = None;
+                }
+                Ok(binding.clone())
+            })
+            .map_err(ReleaseWpInsIdError::Store)??;
+        Ok(binding)
+    }
+
+    /// 已释放车道的网关重新上线：分配最小的空闲车道。
+    pub fn allocate_wp_ins_id_if_released(
+        &self,
+        gateway_id: &str,
+    ) -> Result<AllocateWpInsIdOutcome, StoreError> {
+        self.update(|snapshot| {
+            let released = snapshot.customer_bindings.iter().any(|binding| {
+                binding.gateway_id == gateway_id && binding.wp_ins_id_released_at.is_some()
+            });
+            if !released {
+                return Ok(AllocateWpInsIdOutcome::NotReleased);
+            }
+            let used: Vec<i64> = snapshot
+                .customer_bindings
+                .iter()
+                .filter(|binding| {
+                    binding.gateway_id != gateway_id && binding.wp_ins_id_released_at.is_none()
+                })
+                .map(|binding| binding.wp_ins_id)
+                .collect();
+            let lane = (wist_control::WP_INS_ID_MIN..=wist_control::WP_INS_ID_MAX)
+                .find(|lane| !used.contains(lane));
+            let binding = snapshot
+                .customer_bindings
+                .iter_mut()
+                .find(|binding| binding.gateway_id == gateway_id)
+                .expect("released binding exists");
+            let Some(lane) = lane else {
+                binding.status = "failed".to_string();
+                binding.last_error = Some("no free wp_ins_id (100..=1123 all in use)".to_string());
+                return Ok(AllocateWpInsIdOutcome::Exhausted);
+            };
+            binding.wp_ins_id = lane;
+            binding.wp_ins_id_released_at = None;
+            binding.wp_ins_id_released_by = None;
+            binding.revision = binding.revision.max(1) + 1;
+            binding.applied_revision = None;
+            binding.applied_at = None;
+            binding.reported_tenant_id = None;
+            binding.status = "bound".to_string();
+            binding.last_error = None;
+            binding.bound_at = DateTime::now();
+            Ok(AllocateWpInsIdOutcome::Allocated(binding.clone()))
+        })?
     }
 
     pub fn list_customer_bindings(&self) -> Result<Vec<GatewayCustomerBindingRecord>, StoreError> {
@@ -1945,6 +2142,11 @@ impl FileStore {
                 else {
                     return Ok(None);
                 };
+                // 已释放的绑定不再接受“已生效/漂移”上报：车道已经不属于它，
+                // 否则一条旧心跳会把 `released` 覆盖成 `applied`。
+                if existing.wp_ins_id_released_at.is_some() {
+                    return Ok(None);
+                }
                 existing.reported_tenant_id = Some(reported_tenant_id.to_string());
                 if existing.customer_id != reported_tenant_id {
                     existing.status = "drift".to_string();
@@ -1988,6 +2190,10 @@ impl FileStore {
                 return Ok(false);
             };
             if existing.revision != revision {
+                return Ok(false);
+            }
+            // 已释放的绑定不接受旧命令的失败回写（旧回执不能把 `released` 改成 `failed`）。
+            if existing.wp_ins_id_released_at.is_some() {
                 return Ok(false);
             }
             existing.status = "failed".to_string();
@@ -2473,9 +2679,10 @@ impl Store for FileStore {
         &self,
         gateway_id: &str,
         customer_id: &str,
+        wp_ins_id: i64,
         requested_by: &str,
-    ) -> Result<GatewayCustomerBindingRecord, StoreError> {
-        FileStore::bind_gateway_customer(self, gateway_id, customer_id, requested_by)
+    ) -> Result<GatewayCustomerBindingRecord, BindGatewayCustomerError> {
+        FileStore::bind_gateway_customer(self, gateway_id, customer_id, wp_ins_id, requested_by)
     }
 
     async fn list_customer_bindings(
@@ -2519,6 +2726,21 @@ impl Store for FileStore {
         gateway_id: &str,
     ) -> Result<Vec<GatewayBindingAuditEvent>, StoreError> {
         FileStore::list_binding_audit(self, gateway_id)
+    }
+
+    async fn release_gateway_wp_ins_id(
+        &self,
+        gateway_id: &str,
+        requested_by: &str,
+    ) -> Result<GatewayCustomerBindingRecord, ReleaseWpInsIdError> {
+        FileStore::release_gateway_wp_ins_id(self, gateway_id, requested_by)
+    }
+
+    async fn allocate_wp_ins_id_if_released(
+        &self,
+        gateway_id: &str,
+    ) -> Result<AllocateWpInsIdOutcome, StoreError> {
+        FileStore::allocate_wp_ins_id_if_released(self, gateway_id)
     }
 }
 
@@ -3307,10 +3529,11 @@ mod tests {
         let store = FileStore::new(&path);
 
         let first = store
-            .bind_gateway_customer("gw-1", "tenant-a", "alice")
+            .bind_gateway_customer("gw-1", "tenant-a", 100, "alice")
             .expect("bind");
         assert_eq!(first.revision, 1);
         assert_eq!(first.status, "bound");
+        assert_eq!(first.wp_ins_id, 100);
 
         // 同客户重复绑定：不递增 revision（幂等），但回到「待生效」（重新下发语义）。
         let applied = store
@@ -3319,14 +3542,14 @@ mod tests {
             .expect("binding");
         assert_eq!(applied.status, "applied");
         let same = store
-            .bind_gateway_customer("gw-1", "tenant-a", "bob")
+            .bind_gateway_customer("gw-1", "tenant-a", 100, "bob")
             .expect("rebind");
         assert_eq!(same.revision, 1);
         assert_eq!(same.status, "bound");
 
         // 换绑：递增 revision，并清掉上一轮的生效状态。
         let changed = store
-            .bind_gateway_customer("gw-1", "tenant-b", "bob")
+            .bind_gateway_customer("gw-1", "tenant-b", 100, "bob")
             .expect("rebind");
         assert_eq!(changed.revision, 2);
         assert_eq!(changed.applied_revision, None);
@@ -3402,14 +3625,14 @@ mod tests {
         assert!(store.list_binding_audit("gw-1").expect("empty").is_empty());
 
         let first = store
-            .bind_gateway_customer("gw-1", "tenant-a", "alice")
+            .bind_gateway_customer("gw-1", "tenant-a", 100, "alice")
             .expect("bind");
         assert_eq!(first.revision, 1);
         store
-            .bind_gateway_customer("gw-1", "tenant-a", "bob")
+            .bind_gateway_customer("gw-1", "tenant-a", 100, "bob")
             .expect("repeat");
         let changed = store
-            .bind_gateway_customer("gw-1", "tenant-b", "bob")
+            .bind_gateway_customer("gw-1", "tenant-b", 100, "bob")
             .expect("rebind");
         assert_eq!(changed.revision, 2);
 
@@ -3423,8 +3646,313 @@ mod tests {
         assert_eq!(events[1].previous_customer_id.as_deref(), Some("tenant-a"));
         assert_eq!(events[1].requested_by, "bob");
         assert_eq!(events[1].revision, 2);
+        assert_eq!(events[1].wp_ins_id, 100);
         // 别的网关看不到这条历史。
         assert!(store.list_binding_audit("gw-2").expect("empty").is_empty());
+        let _ = fs::remove_file(path);
+    }
+
+    /// 全中心唯一：同一 `wp_ins_id` 只能属于一台网关（同网关重绑幂等）。
+    #[test]
+    fn wp_ins_id_is_unique_across_the_center() {
+        let path = test_store_path();
+        let store = FileStore::new(&path);
+
+        store
+            .bind_gateway_customer("gw-1", "tenant-a", 100, "alice")
+            .expect("bind");
+        // 同网关重复绑同一车道：幂等放行。
+        let same = store
+            .bind_gateway_customer("gw-1", "tenant-a", 100, "alice")
+            .expect("rebind");
+        assert_eq!(same.revision, 1);
+
+        // 另一台网关抢同一车道 → LaneTaken，且不改任何状态。
+        let err = store
+            .bind_gateway_customer("gw-2", "tenant-b", 100, "bob")
+            .expect_err("conflict");
+        match err {
+            BindGatewayCustomerError::LaneTaken {
+                gateway_id,
+                wp_ins_id,
+            } => {
+                assert_eq!(gateway_id, "gw-1");
+                assert_eq!(wp_ins_id, 100);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(
+            store.get_customer_binding("gw-2").expect("get").is_none(),
+            "冲突不能落下绑定"
+        );
+
+        // 换空闲车道 → 成功。
+        let second = store
+            .bind_gateway_customer("gw-2", "tenant-b", 101, "bob")
+            .expect("free lane");
+        assert_eq!(second.wp_ins_id, 101);
+        let _ = fs::remove_file(path);
+    }
+
+    fn seed_gateway(store: &FileStore, gateway_id: &str) {
+        store
+            .seed(&[GatewayCredentialSeed {
+                gateway_id: gateway_id.to_string(),
+                token: format!("tok-{gateway_id}"),
+                expires_at: None,
+            }])
+            .expect("seed gateway");
+    }
+
+    /// 释放只允许已归档网关；释放后车道不再参与全中心唯一性，且重复释放幂等。
+    #[test]
+    fn release_requires_archive_and_frees_the_lane() {
+        let path = test_store_path();
+        let store = FileStore::new(&path);
+        seed_gateway(&store, "gw-1");
+        store
+            .bind_gateway_customer("gw-1", "tenant-a", 100, "alice")
+            .expect("bind");
+
+        // 未归档 → 拒绝。
+        let err = store
+            .release_gateway_wp_ins_id("gw-1", "bob")
+            .expect_err("not archived");
+        match err {
+            ReleaseWpInsIdError::GatewayNotArchived => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        store
+            .set_gateway_archived("gw-1", Some(DateTime::now()))
+            .expect("archive");
+        let released = store
+            .release_gateway_wp_ins_id("gw-1", "bob")
+            .expect("release");
+        assert!(released.wp_ins_id_released_at.is_some());
+        assert_eq!(released.wp_ins_id_released_by.as_deref(), Some("bob"));
+        assert_eq!(released.status, "released");
+
+        // 释放后的旧心跳 / 旧命令失败不能把 `released` 覆盖成 applied / failed。
+        assert!(
+            store
+                .record_customer_binding_report("gw-1", "tenant-a", 1)
+                .expect("report")
+                .is_none()
+        );
+        assert!(!store.mark_binding_failed("gw-1", 1, "boom").expect("fail"));
+        let still = store
+            .get_customer_binding("gw-1")
+            .expect("get")
+            .expect("binding");
+        assert_eq!(still.status, "released");
+
+        // 幂等：保留首次释放的时刻 / 操作者。
+        let released_at = released.wp_ins_id_released_at.clone();
+        let again = store
+            .release_gateway_wp_ins_id("gw-1", "carol")
+            .expect("release again");
+        assert_eq!(again.wp_ins_id_released_at, released_at);
+        assert_eq!(again.wp_ins_id_released_by.as_deref(), Some("bob"));
+
+        // 释放后的车道可被其他网关使用。
+        let other = store
+            .bind_gateway_customer("gw-2", "tenant-b", 100, "bob")
+            .expect("lane free");
+        assert_eq!(other.wp_ins_id, 100);
+        let _ = fs::remove_file(path);
+    }
+
+    /// 释放后重新绑定：重新占住车道、清释放标记、递增 revision。
+    #[test]
+    fn rebinding_after_release_reclaims_the_lane_and_bumps_revision() {
+        let path = test_store_path();
+        let store = FileStore::new(&path);
+        seed_gateway(&store, "gw-1");
+        store
+            .bind_gateway_customer("gw-1", "tenant-a", 100, "alice")
+            .expect("bind");
+        store
+            .set_gateway_archived("gw-1", Some(DateTime::now()))
+            .expect("archive");
+        store
+            .release_gateway_wp_ins_id("gw-1", "alice")
+            .expect("release");
+
+        let rebound = store
+            .bind_gateway_customer("gw-1", "tenant-a", 100, "alice")
+            .expect("rebind");
+        assert_eq!(rebound.revision, 2);
+        assert!(rebound.wp_ins_id_released_at.is_none());
+        assert!(rebound.wp_ins_id_released_by.is_none());
+        let _ = fs::remove_file(path);
+    }
+
+    /// 已释放车道的网关重新上线：自动分配最小的空闲车道。
+    #[test]
+    fn released_lane_is_reallocated_when_the_gateway_returns() {
+        let path = test_store_path();
+        let store = FileStore::new(&path);
+        seed_gateway(&store, "gw-1");
+        store
+            .bind_gateway_customer("gw-1", "tenant-a", 100, "alice")
+            .expect("bind");
+        store
+            .set_gateway_archived("gw-1", Some(DateTime::now()))
+            .expect("archive");
+        store
+            .release_gateway_wp_ins_id("gw-1", "alice")
+            .expect("release");
+
+        // 另一个网关占住 100。
+        store
+            .bind_gateway_customer("gw-2", "tenant-b", 100, "bob")
+            .expect("take lane");
+
+        match store
+            .allocate_wp_ins_id_if_released("gw-1")
+            .expect("allocate")
+        {
+            AllocateWpInsIdOutcome::Allocated(binding) => {
+                assert_eq!(binding.wp_ins_id, 101);
+                assert_eq!(binding.revision, 2);
+                assert!(binding.wp_ins_id_released_at.is_none());
+                assert_eq!(binding.status, "bound");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // 未释放的网关 → 什么都不做。
+        match store.allocate_wp_ins_id_if_released("gw-2").expect("noop") {
+            AllocateWpInsIdOutcome::NotReleased => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    /// 释放后原车道被占用：重绑原车道 → 冲突；换空闲车道 → 成功。
+    #[test]
+    fn rebinding_after_release_rejects_a_taken_lane() {
+        let path = test_store_path();
+        let store = FileStore::new(&path);
+        seed_gateway(&store, "gw-1");
+        store
+            .bind_gateway_customer("gw-1", "tenant-a", 100, "alice")
+            .expect("bind");
+        store
+            .set_gateway_archived("gw-1", Some(DateTime::now()))
+            .expect("archive");
+        store
+            .release_gateway_wp_ins_id("gw-1", "alice")
+            .expect("release");
+        store
+            .bind_gateway_customer("gw-2", "tenant-b", 100, "bob")
+            .expect("take lane");
+
+        let err = store
+            .bind_gateway_customer("gw-1", "tenant-a", 100, "alice")
+            .expect_err("lane taken");
+        match err {
+            BindGatewayCustomerError::LaneTaken {
+                gateway_id,
+                wp_ins_id,
+            } => {
+                assert_eq!(gateway_id, "gw-2");
+                assert_eq!(wp_ins_id, 100);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let rebound = store
+            .bind_gateway_customer("gw-1", "tenant-a", 101, "alice")
+            .expect("free lane");
+        assert_eq!(rebound.wp_ins_id, 101);
+        assert_eq!(rebound.revision, 2);
+        assert!(rebound.wp_ins_id_released_at.is_none());
+        let _ = fs::remove_file(path);
+    }
+
+    /// 1024 个车道全部被占：已释放网关重新上线时分不到车道，绑定标 failed。
+    #[test]
+    fn allocation_reports_exhaustion_when_all_lanes_are_taken() {
+        let path = test_store_path();
+        let store = FileStore::new(&path);
+        let now = DateTime::now();
+        let binding =
+            |gateway_id: String, lane: i64, released: bool| GatewayCustomerBindingRecord {
+                gateway_id,
+                customer_id: "tenant".to_string(),
+                status: if released { "released" } else { "bound" }.to_string(),
+                bound_at: now.clone(),
+                revision: 1,
+                wp_ins_id: lane,
+                wp_ins_id_released_at: released.then(|| now.clone()),
+                wp_ins_id_released_by: released.then(|| "admin".to_string()),
+                applied_revision: None,
+                applied_at: None,
+                reported_tenant_id: None,
+                last_error: None,
+            };
+        store
+            .update(|snapshot| {
+                for (index, lane) in
+                    (wist_control::WP_INS_ID_MIN..=wist_control::WP_INS_ID_MAX).enumerate()
+                {
+                    snapshot
+                        .customer_bindings
+                        .push(binding(format!("gw-{index}"), lane, false));
+                }
+                // 同一个车道允许有已释放的历史行（唯一性只看未释放）。
+                snapshot
+                    .customer_bindings
+                    .push(binding("gw-released".to_string(), 100, true));
+            })
+            .expect("seed snapshots");
+
+        match store
+            .allocate_wp_ins_id_if_released("gw-released")
+            .expect("allocate")
+        {
+            AllocateWpInsIdOutcome::Exhausted => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+        let binding = store
+            .get_customer_binding("gw-released")
+            .expect("get")
+            .expect("binding");
+        assert_eq!(binding.status, "failed");
+        assert!(
+            binding
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("no free wp_ins_id")),
+            "{binding:?}"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    /// 只换实例号（客户不变）也要递增版本并记一条审计：数据面必须按新实例号重落 `.env`。
+    #[test]
+    fn changing_wp_ins_id_bumps_revision_and_audits() {
+        let path = test_store_path();
+        let store = FileStore::new(&path);
+
+        let first = store
+            .bind_gateway_customer("gw-1", "tenant-a", 100, "alice")
+            .expect("bind");
+        assert_eq!(first.revision, 1);
+
+        let moved = store
+            .bind_gateway_customer("gw-1", "tenant-a", 101, "alice")
+            .expect("lane change");
+        assert_eq!(moved.revision, 2);
+        assert_eq!(moved.wp_ins_id, 101);
+
+        let events = store.list_binding_audit("gw-1").expect("audit");
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0].wp_ins_id, 100);
+        assert_eq!(events[1].wp_ins_id, 101);
+        assert_eq!(events[1].previous_customer_id.as_deref(), Some("tenant-a"));
         let _ = fs::remove_file(path);
     }
 
@@ -3434,10 +3962,10 @@ mod tests {
         let path = test_store_path();
         let store = FileStore::new(&path);
         store
-            .bind_gateway_customer("gw-1", "tenant-a", "alice")
+            .bind_gateway_customer("gw-1", "tenant-a", 100, "alice")
             .expect("bind");
         store
-            .bind_gateway_customer("gw-1", "tenant-b", "alice")
+            .bind_gateway_customer("gw-1", "tenant-b", 100, "alice")
             .expect("rebind");
 
         assert!(

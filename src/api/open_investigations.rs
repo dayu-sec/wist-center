@@ -522,7 +522,7 @@ mod tests {
     ) {
         state
             .store
-            .bind_gateway_customer("gw-001", "cust-a", "admin")
+            .bind_gateway_customer("gw-001", "cust-a", 100, "admin")
             .await
             .expect("bind customer");
         state

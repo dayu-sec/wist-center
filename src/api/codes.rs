@@ -65,6 +65,8 @@ codes! {
     GATEWAY_AGENTS_LOAD_FAILED => "gateway_agents_load_failed",
     GATEWAY_ALREADY_EXISTS => "gateway_already_exists",
     GATEWAY_ARCHIVE_FAILED => "gateway_archive_failed",
+    GATEWAY_BINDING_NOT_FOUND => "gateway_binding_not_found",
+    GATEWAY_BINDING_RELEASE_FAILED => "gateway_binding_release_failed",
     GATEWAY_BIND_FAILED => "gateway_bind_failed",
     GATEWAY_BINDING_HISTORY_LOAD_FAILED => "gateway_binding_history_load_failed",
     GATEWAY_CREATE_FAILED => "gateway_create_failed",
@@ -77,9 +79,11 @@ codes! {
     GATEWAY_LIST_FAILED => "gateway_list_failed",
     GATEWAY_LOAD_FAILED => "gateway_load_failed",
     GATEWAY_NAME_AND_REQUESTED_BY_REQUIRED => "gateway_name_and_requested_by_required",
+    GATEWAY_NOT_ARCHIVED => "gateway_not_archived",
     GATEWAY_NOT_FOUND => "gateway_not_found",
     GATEWAY_NOT_REPORTED => "gateway_not_reported",
     GATEWAY_ONLINE_CANNOT_ARCHIVE => "gateway_online_cannot_archive",
+    GATEWAY_ONLINE_CANNOT_RELEASE => "gateway_online_cannot_release",
     GATEWAY_STATUS_UPDATE_FAILED => "gateway_status_update_failed",
     GATEWAY_STORE_UNAVAILABLE => "gateway_store_unavailable",
     INSTALL_ALL_UNAVAILABLE => "install_all_unavailable",
@@ -182,6 +186,8 @@ codes! {
     WPARSE_TAG_SOURCE_UNAUTHORIZED => "wparse_tag_source_unauthorized",
     WPARSE_TAG_SOURCE_UNAVAILABLE => "wparse_tag_source_unavailable",
     WPARSE_TAG_VERIFICATION_REQUIRED => "wparse_tag_verification_required",
+    WP_INS_ID_CONFLICT => "wp_ins_id_conflict",
+    WP_INS_ID_INVALID => "wp_ins_id_invalid",
 }
 
 #[cfg(test)]
@@ -200,6 +206,14 @@ mod tests {
         // 业务身份绑定（前端/脚本按它分支）。
         assert_eq!(CUSTOMER_ID_NOT_TAG_SAFE, "customer_id_not_tag_safe");
         assert_eq!(GATEWAY_BIND_FAILED, "gateway_bind_failed");
+        assert_eq!(WP_INS_ID_CONFLICT, "wp_ins_id_conflict");
+        assert_eq!(WP_INS_ID_INVALID, "wp_ins_id_invalid");
+        assert_eq!(GATEWAY_NOT_ARCHIVED, "gateway_not_archived");
+        assert_eq!(GATEWAY_BINDING_NOT_FOUND, "gateway_binding_not_found");
+        assert_eq!(
+            GATEWAY_ONLINE_CANNOT_RELEASE,
+            "gateway_online_cannot_release"
+        );
         assert_eq!(
             GATEWAY_BINDING_HISTORY_LOAD_FAILED,
             "gateway_binding_history_load_failed"

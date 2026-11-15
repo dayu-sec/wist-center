@@ -65,6 +65,9 @@ CREATE TABLE IF NOT EXISTS gateway_customer_bindings (
   status TEXT NOT NULL DEFAULT 'bound',
   bound_at TIMESTAMPTZ NOT NULL,
   revision BIGINT NOT NULL DEFAULT 1,
+  wp_ins_id BIGINT NOT NULL DEFAULT 100,
+  wp_ins_id_released_at TIMESTAMPTZ,
+  wp_ins_id_released_by TEXT,
   applied_revision BIGINT,
   applied_at TIMESTAMPTZ,
   reported_tenant_id TEXT,
@@ -73,6 +76,9 @@ CREATE TABLE IF NOT EXISTS gateway_customer_bindings (
 
 -- 幂等补列（既有库；老版本可能只建了前四列，甚至整张表都没建）。
 ALTER TABLE gateway_customer_bindings ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;
+ALTER TABLE gateway_customer_bindings ADD COLUMN IF NOT EXISTS wp_ins_id BIGINT NOT NULL DEFAULT 100;
+ALTER TABLE gateway_customer_bindings ADD COLUMN IF NOT EXISTS wp_ins_id_released_at TIMESTAMPTZ;
+ALTER TABLE gateway_customer_bindings ADD COLUMN IF NOT EXISTS wp_ins_id_released_by TEXT;
 ALTER TABLE gateway_customer_bindings ADD COLUMN IF NOT EXISTS applied_revision BIGINT;
 ALTER TABLE gateway_customer_bindings ADD COLUMN IF NOT EXISTS applied_at TIMESTAMPTZ;
 ALTER TABLE gateway_customer_bindings ADD COLUMN IF NOT EXISTS reported_tenant_id TEXT;
@@ -84,10 +90,12 @@ CREATE TABLE IF NOT EXISTS gateway_binding_audit (
   gateway_id TEXT NOT NULL,
   customer_id TEXT NOT NULL,
   previous_customer_id TEXT,
+  wp_ins_id BIGINT NOT NULL DEFAULT 100,
   revision BIGINT NOT NULL DEFAULT 1,
   requested_by TEXT NOT NULL DEFAULT '',
   at TIMESTAMPTZ NOT NULL
 );
+ALTER TABLE gateway_binding_audit ADD COLUMN IF NOT EXISTS wp_ins_id BIGINT NOT NULL DEFAULT 100;
 CREATE INDEX IF NOT EXISTS idx_binding_audit_gateway ON gateway_binding_audit (gateway_id);
 
 -- 网关注册 Token（映射模型 GatewayEnrollmentToken）：只存 hash，限量/状态/有效期，

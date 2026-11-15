@@ -12,8 +12,9 @@ use crate::config::GatewayCredentialSeed;
 
 use super::commands::{CommandRecord, TargetCommandRecord};
 use super::{
-    CancelOutcome, EnrollmentTokenIssue, GatewayBindingAuditEvent, GatewayCustomerBindingRecord,
-    GatewayStatusUpdate, JobProgress, JobRecord, LifecycleEvent, ReleaseRecord, Store, StoredAgent,
+    AllocateWpInsIdOutcome, BindGatewayCustomerError, CancelOutcome, EnrollmentTokenIssue,
+    GatewayBindingAuditEvent, GatewayCustomerBindingRecord, GatewayStatusUpdate, JobProgress,
+    JobRecord, LifecycleEvent, ReleaseRecord, ReleaseWpInsIdError, Store, StoredAgent,
     StoredEnrollmentToken, StoredGateway, StoredGatewayCredentialStatus, UpgradePlanRecord,
     normalize_upgrade_plan, sha256_hex,
 };
@@ -22,6 +23,10 @@ use super::{
 pub struct PgStore {
     pool: PgPool,
 }
+
+/// 绑定事务里用来串行化 `wp_ins_id` 分配的 advisory lock 键（字面量 `WPINSID`）。
+/// 只影响并发 bind（低频管理操作），不影响 30s 一次的状态心跳写入。
+const WP_INS_ID_ADVISORY_LOCK: i64 = 0x5750_494E_5349_44;
 
 impl PgStore {
     pub async fn connect(database_url: &str) -> Result<Self, StoreError> {
@@ -120,6 +125,7 @@ struct BindingAuditRow {
     gateway_id: String,
     customer_id: String,
     previous_customer_id: Option<String>,
+    wp_ins_id: i64,
     revision: i64,
     requested_by: String,
     at: chrono::DateTime<chrono::Utc>,
@@ -131,6 +137,7 @@ impl BindingAuditRow {
             gateway_id: self.gateway_id,
             customer_id: self.customer_id,
             previous_customer_id: self.previous_customer_id,
+            wp_ins_id: self.wp_ins_id,
             revision: self.revision,
             requested_by: self.requested_by,
             at: DateTime::from_rfc3339(&self.at.to_rfc3339()).unwrap_or_else(DateTime::now),
@@ -1479,61 +1486,115 @@ impl Store for PgStore {
         &self,
         gateway_id: &str,
         customer_id: &str,
+        wp_ins_id: i64,
         requested_by: &str,
-    ) -> Result<GatewayCustomerBindingRecord, StoreError> {
+    ) -> Result<GatewayCustomerBindingRecord, BindGatewayCustomerError> {
         let bound_at = chrono::Utc::now();
-        // 事务 +行锁：读旧值、改绑定、写审计必须原子，否则并发两次换绑会写出错的 previous。
+        // 事务 + 行锁：读旧值、改绑定、写审计必须原子，否则并发两次换绑会写出错的 previous。
         let mut tx = self
             .pool
             .begin()
             .await
             .source_raw_err(StoreReason::Sql, "begin bind transaction")?;
-        let previous: Option<String> = sqlx::query_scalar(
-            "SELECT customer_id FROM gateway_customer_bindings WHERE gateway_id = $1 FOR UPDATE",
+        // 全中心唯一：分配车道是低频管理操作，用固定 advisory lock 串行化
+        // （不能用“先 SELECT 再 INSERT”：两个并发 bind 会同时查到空闲）。
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(WP_INS_ID_ADVISORY_LOCK)
+            .execute(&mut *tx)
+            .await
+            .source_raw_err(StoreReason::Sql, "lock wp_ins_id allocation")?;
+        let occupant: Option<String> = sqlx::query_scalar(
+            "SELECT gateway_id FROM gateway_customer_bindings \
+              WHERE wp_ins_id = $1 AND gateway_id <> $2 AND wp_ins_id_released_at IS NULL LIMIT 1",
+        )
+        .bind(wp_ins_id)
+        .bind(gateway_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .source_raw_err(StoreReason::Sql, "check wp_ins_id uniqueness")?;
+        if let Some(occupant) = occupant {
+            tx.rollback()
+                .await
+                .source_raw_err(StoreReason::Sql, "rollback bind conflict")?;
+            return Err(BindGatewayCustomerError::LaneTaken {
+                gateway_id: occupant,
+                wp_ins_id,
+            });
+        }
+        let previous: Option<(String, i64, bool)> = sqlx::query_as(
+            "SELECT customer_id, wp_ins_id, (wp_ins_id_released_at IS NOT NULL) \
+               FROM gateway_customer_bindings WHERE gateway_id = $1 FOR UPDATE",
         )
         .bind(gateway_id)
         .fetch_optional(&mut *tx)
         .await
         .source_raw_err(StoreReason::Sql, "lock customer binding")?;
-        // 同客户重绑：revision 不递增、保留 applied 证据，但回到「待生效」（重新下发语义）。
+        // 同客户且同实例号重绑：revision 不递增、保留 applied 证据，但回到「待生效」（重新下发语义）。
+        // 客户或实例号任一变化都递增 —— 数据面得按新值重落 `.env` 并重启 wparse。
         let row = sqlx::query(
             "INSERT INTO gateway_customer_bindings \
-                 (gateway_id, customer_id, status, bound_at, revision) \
-             VALUES ($1, $2, 'bound', $3, 1) \
+                 (gateway_id, customer_id, wp_ins_id, status, bound_at, revision) \
+             VALUES ($1, $2, $3, 'bound', $4, 1) \
              ON CONFLICT (gateway_id) DO UPDATE SET \
                  customer_id = EXCLUDED.customer_id, \
+                 wp_ins_id = EXCLUDED.wp_ins_id, \
                  status = 'bound', \
                  bound_at = EXCLUDED.bound_at, \
+                 wp_ins_id_released_at = CASE WHEN gateway_customer_bindings.customer_id = EXCLUDED.customer_id \
+                                                   AND gateway_customer_bindings.wp_ins_id = EXCLUDED.wp_ins_id \
+                                                   AND gateway_customer_bindings.wp_ins_id_released_at IS NULL \
+                                              THEN gateway_customer_bindings.wp_ins_id_released_at ELSE NULL END, \
+                 wp_ins_id_released_by = CASE WHEN gateway_customer_bindings.customer_id = EXCLUDED.customer_id \
+                                                   AND gateway_customer_bindings.wp_ins_id = EXCLUDED.wp_ins_id \
+                                                   AND gateway_customer_bindings.wp_ins_id_released_at IS NULL \
+                                              THEN gateway_customer_bindings.wp_ins_id_released_by ELSE NULL END, \
                  revision = CASE WHEN gateway_customer_bindings.customer_id = EXCLUDED.customer_id \
+                                      AND gateway_customer_bindings.wp_ins_id = EXCLUDED.wp_ins_id \
+                                      AND gateway_customer_bindings.wp_ins_id_released_at IS NULL \
                                  THEN gateway_customer_bindings.revision \
                                  ELSE gateway_customer_bindings.revision + 1 END, \
                  applied_revision = CASE WHEN gateway_customer_bindings.customer_id = EXCLUDED.customer_id \
+                                              AND gateway_customer_bindings.wp_ins_id = EXCLUDED.wp_ins_id \
+                                              AND gateway_customer_bindings.wp_ins_id_released_at IS NULL \
                                          THEN gateway_customer_bindings.applied_revision ELSE NULL END, \
                  applied_at = CASE WHEN gateway_customer_bindings.customer_id = EXCLUDED.customer_id \
+                                        AND gateway_customer_bindings.wp_ins_id = EXCLUDED.wp_ins_id \
+                                        AND gateway_customer_bindings.wp_ins_id_released_at IS NULL \
                                    THEN gateway_customer_bindings.applied_at ELSE NULL END, \
                  reported_tenant_id = CASE WHEN gateway_customer_bindings.customer_id = EXCLUDED.customer_id \
+                                                AND gateway_customer_bindings.wp_ins_id = EXCLUDED.wp_ins_id \
+                                                AND gateway_customer_bindings.wp_ins_id_released_at IS NULL \
                                            THEN gateway_customer_bindings.reported_tenant_id ELSE NULL END, \
                  last_error = NULL \
-             RETURNING gateway_id, customer_id, status, bound_at, revision, \
+             RETURNING gateway_id, customer_id, wp_ins_id, wp_ins_id_released_at, wp_ins_id_released_by, \
+                       status, bound_at, revision, \
                        applied_revision, applied_at, reported_tenant_id, last_error",
         )
         .bind(gateway_id)
         .bind(customer_id)
+        .bind(wp_ins_id)
         .bind(bound_at)
         .fetch_one(&mut *tx)
         .await
         .source_raw_err(StoreReason::Sql, "bind gateway customer")?;
         let binding = binding_from_row(&row);
-        // 只有**归属变化**才记审计（同客户重绑不改归属，不刷屏）。
-        if previous.as_deref() != Some(binding.customer_id.as_str()) {
+        // 只有**归属或实例号变化**才记审计（同客户同实例号重绑不刷屏）。
+        let changed = match previous.as_ref() {
+            None => true,
+            Some((customer, ins_id, released)) => {
+                customer != customer_id || *ins_id != wp_ins_id || *released
+            }
+        };
+        if changed {
             sqlx::query(
                 "INSERT INTO gateway_binding_audit \
-                     (gateway_id, customer_id, previous_customer_id, revision, requested_by, at) \
-                 VALUES ($1, $2, $3, $4, $5, $6)",
+                     (gateway_id, customer_id, previous_customer_id, wp_ins_id, revision, requested_by, at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
             )
             .bind(&binding.gateway_id)
             .bind(&binding.customer_id)
-            .bind(previous.as_deref())
+            .bind(previous.as_ref().map(|(customer, _, _)| customer.as_str()))
+            .bind(binding.wp_ins_id)
             .bind(binding.revision)
             .bind(requested_by.trim())
             .bind(bound_at)
@@ -1551,7 +1612,8 @@ impl Store for PgStore {
         &self,
     ) -> Result<Vec<GatewayCustomerBindingRecord>, StoreError> {
         let rows = sqlx::query(
-            "SELECT gateway_id, customer_id, status, bound_at, revision, \
+            "SELECT gateway_id, customer_id, wp_ins_id, wp_ins_id_released_at, wp_ins_id_released_by, \
+                    status, bound_at, revision, \
                     applied_revision, applied_at, reported_tenant_id, last_error \
                FROM gateway_customer_bindings",
         )
@@ -1566,7 +1628,8 @@ impl Store for PgStore {
         gateway_id: &str,
     ) -> Result<Option<GatewayCustomerBindingRecord>, StoreError> {
         let row = sqlx::query(
-            "SELECT gateway_id, customer_id, status, bound_at, revision, \
+            "SELECT gateway_id, customer_id, wp_ins_id, wp_ins_id_released_at, wp_ins_id_released_by, \
+                    status, bound_at, revision, \
                     applied_revision, applied_at, reported_tenant_id, last_error \
                FROM gateway_customer_bindings WHERE gateway_id = $1",
         )
@@ -1600,7 +1663,9 @@ impl Store for PgStore {
                                       WHEN $3 > revision THEN 'gateway reported newer revision' \
                                       ELSE NULL END \
               WHERE gateway_id = $1 \
-             RETURNING gateway_id, customer_id, status, bound_at, revision, \
+                AND wp_ins_id_released_at IS NULL \
+             RETURNING gateway_id, customer_id, wp_ins_id, wp_ins_id_released_at, wp_ins_id_released_by, \
+                       status, bound_at, revision, \
                        applied_revision, applied_at, reported_tenant_id, last_error",
         )
         .bind(gateway_id)
@@ -1621,7 +1686,8 @@ impl Store for PgStore {
         let affected = sqlx::query(
             "UPDATE gateway_customer_bindings \
                 SET status = 'failed', last_error = $3 \
-              WHERE gateway_id = $1 AND revision = $2",
+              WHERE gateway_id = $1 AND revision = $2 \
+                AND wp_ins_id_released_at IS NULL",
         )
         .bind(gateway_id)
         .bind(revision)
@@ -1639,7 +1705,7 @@ impl Store for PgStore {
         gateway_id: &str,
     ) -> Result<Vec<GatewayBindingAuditEvent>, StoreError> {
         let rows: Vec<BindingAuditRow> = sqlx::query_as(
-            "SELECT gateway_id, customer_id, previous_customer_id, revision, requested_by, at \
+            "SELECT gateway_id, customer_id, previous_customer_id, wp_ins_id, revision, requested_by, at \
                FROM gateway_binding_audit WHERE gateway_id = $1 ORDER BY at DESC, id DESC LIMIT 100",
         )
         .bind(gateway_id)
@@ -1651,6 +1717,180 @@ impl Store for PgStore {
         // 与 FileStore 一致：**升序**返回（新→旧取自 SQL），前端自己决定怎么展示。
         events.reverse();
         Ok(events)
+    }
+
+    async fn release_gateway_wp_ins_id(
+        &self,
+        gateway_id: &str,
+        requested_by: &str,
+    ) -> Result<GatewayCustomerBindingRecord, ReleaseWpInsIdError> {
+        // 统一锁序：advisory → 行锁，避免与 bind / allocate 反向加锁死锁。
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .source_raw_err(StoreReason::Sql, "begin release transaction")?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(WP_INS_ID_ADVISORY_LOCK)
+            .execute(&mut *tx)
+            .await
+            .source_raw_err(StoreReason::Sql, "lock wp_ins_id release")?;
+        let archived: Option<Option<chrono::DateTime<chrono::Utc>>> =
+            sqlx::query_scalar("SELECT archived_at FROM gateways WHERE gateway_id = $1 FOR UPDATE")
+                .bind(gateway_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .source_raw_err(StoreReason::Sql, "check gateway archived")?;
+        let Some(archived_at) = archived else {
+            tx.rollback()
+                .await
+                .source_raw_err(StoreReason::Sql, "rollback release")?;
+            return Err(ReleaseWpInsIdError::BindingNotFound);
+        };
+        if archived_at.is_none() {
+            tx.rollback()
+                .await
+                .source_raw_err(StoreReason::Sql, "rollback release")?;
+            return Err(ReleaseWpInsIdError::GatewayNotArchived);
+        }
+        let released_at = chrono::Utc::now();
+        let released_by: String = requested_by.trim().chars().take(128).collect();
+        let row = sqlx::query(
+            "UPDATE gateway_customer_bindings \
+                SET wp_ins_id_released_at = COALESCE(wp_ins_id_released_at, $2), \
+                    wp_ins_id_released_by = COALESCE(wp_ins_id_released_by, $3), \
+                    status = CASE WHEN wp_ins_id_released_at IS NULL THEN 'released' ELSE status END, \
+                    last_error = CASE WHEN wp_ins_id_released_at IS NULL THEN NULL ELSE last_error END \
+              WHERE gateway_id = $1 \
+             RETURNING gateway_id, customer_id, wp_ins_id, wp_ins_id_released_at, wp_ins_id_released_by, \
+                       status, bound_at, revision, \
+                       applied_revision, applied_at, reported_tenant_id, last_error",
+        )
+        .bind(gateway_id)
+        .bind(released_at)
+        .bind(&released_by)
+        .fetch_optional(&mut *tx)
+        .await
+        .source_raw_err(StoreReason::Sql, "release wp_ins_id")?;
+        let Some(row) = row else {
+            tx.rollback()
+                .await
+                .source_raw_err(StoreReason::Sql, "rollback release")?;
+            return Err(ReleaseWpInsIdError::BindingNotFound);
+        };
+        tx.commit()
+            .await
+            .source_raw_err(StoreReason::Sql, "commit release transaction")?;
+        Ok(binding_from_row(&row))
+    }
+
+    async fn allocate_wp_ins_id_if_released(
+        &self,
+        gateway_id: &str,
+    ) -> Result<AllocateWpInsIdOutcome, StoreError> {
+        // 统一锁序：advisory → 行锁（与 bind / release 一致）。
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .source_raw_err(StoreReason::Sql, "begin allocate transaction")?;
+        // 常见路径（未释放）先做一次无锁读：不给 30s 一次的心跳加 advisory 锁竞争。
+        let peek: Option<Option<chrono::DateTime<chrono::Utc>>> = sqlx::query_scalar(
+            "SELECT wp_ins_id_released_at FROM gateway_customer_bindings WHERE gateway_id = $1",
+        )
+        .bind(gateway_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .source_raw_err(StoreReason::Sql, "peek released binding")?;
+        let Some(peeked) = peek else {
+            tx.rollback()
+                .await
+                .source_raw_err(StoreReason::Sql, "rollback allocate")?;
+            return Ok(AllocateWpInsIdOutcome::NotReleased);
+        };
+        if peeked.is_none() {
+            tx.rollback()
+                .await
+                .source_raw_err(StoreReason::Sql, "rollback allocate")?;
+            return Ok(AllocateWpInsIdOutcome::NotReleased);
+        }
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(WP_INS_ID_ADVISORY_LOCK)
+            .execute(&mut *tx)
+            .await
+            .source_raw_err(StoreReason::Sql, "lock wp_ins_id allocation")?;
+        let released: Option<Option<chrono::DateTime<chrono::Utc>>> = sqlx::query_scalar(
+            "SELECT wp_ins_id_released_at FROM gateway_customer_bindings \
+              WHERE gateway_id = $1 FOR UPDATE",
+        )
+        .bind(gateway_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .source_raw_err(StoreReason::Sql, "lock released binding")?;
+        let Some(released_at) = released else {
+            tx.rollback()
+                .await
+                .source_raw_err(StoreReason::Sql, "rollback allocate")?;
+            return Ok(AllocateWpInsIdOutcome::NotReleased);
+        };
+        if released_at.is_none() {
+            tx.rollback()
+                .await
+                .source_raw_err(StoreReason::Sql, "rollback allocate")?;
+            return Ok(AllocateWpInsIdOutcome::NotReleased);
+        }
+        let lane: Option<i64> = sqlx::query_scalar(
+            "SELECT candidate FROM generate_series($1::bigint, $2::bigint) AS candidate \
+              WHERE NOT EXISTS ( \
+                    SELECT 1 FROM gateway_customer_bindings b \
+                     WHERE b.wp_ins_id = candidate \
+                       AND b.gateway_id <> $3 \
+                       AND b.wp_ins_id_released_at IS NULL) \
+              ORDER BY candidate LIMIT 1",
+        )
+        .bind(wist_control::WP_INS_ID_MIN)
+        .bind(wist_control::WP_INS_ID_MAX)
+        .bind(gateway_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .source_raw_err(StoreReason::Sql, "pick free wp_ins_id")?;
+        let Some(lane) = lane else {
+            sqlx::query(
+                "UPDATE gateway_customer_bindings \
+                    SET status = 'failed', last_error = $2 \
+                  WHERE gateway_id = $1",
+            )
+            .bind(gateway_id)
+            .bind("no free wp_ins_id (100..=1123 all in use)")
+            .execute(&mut *tx)
+            .await
+            .source_raw_err(StoreReason::Sql, "mark wp_ins_id exhausted")?;
+            tx.commit()
+                .await
+                .source_raw_err(StoreReason::Sql, "commit allocate transaction")?;
+            return Ok(AllocateWpInsIdOutcome::Exhausted);
+        };
+        let bound_at = chrono::Utc::now();
+        let row = sqlx::query(
+            "UPDATE gateway_customer_bindings \
+                SET wp_ins_id = $2, wp_ins_id_released_at = NULL, wp_ins_id_released_by = NULL, \
+                    revision = revision + 1, applied_revision = NULL, applied_at = NULL, \
+                    reported_tenant_id = NULL, status = 'bound', last_error = NULL, bound_at = $3 \
+              WHERE gateway_id = $1 \
+             RETURNING gateway_id, customer_id, wp_ins_id, wp_ins_id_released_at, wp_ins_id_released_by, \
+                       status, bound_at, revision, \
+                       applied_revision, applied_at, reported_tenant_id, last_error",
+        )
+        .bind(gateway_id)
+        .bind(lane)
+        .bind(bound_at)
+        .fetch_one(&mut *tx)
+        .await
+        .source_raw_err(StoreReason::Sql, "allocate wp_ins_id")?;
+        tx.commit()
+            .await
+            .source_raw_err(StoreReason::Sql, "commit allocate transaction")?;
+        Ok(AllocateWpInsIdOutcome::Allocated(binding_from_row(&row)))
     }
 }
 
@@ -1664,6 +1904,11 @@ fn binding_from_row(row: &sqlx::postgres::PgRow) -> GatewayCustomerBindingRecord
         status: row.get("status"),
         bound_at: DateTime::from_rfc3339(&bound_at.to_rfc3339()).unwrap_or_else(DateTime::now),
         revision: row.get("revision"),
+        wp_ins_id: row.get("wp_ins_id"),
+        wp_ins_id_released_at: row
+            .get::<Option<chrono::DateTime<chrono::Utc>>, _>("wp_ins_id_released_at")
+            .and_then(|at| DateTime::from_rfc3339(&at.to_rfc3339())),
+        wp_ins_id_released_by: row.get("wp_ins_id_released_by"),
         applied_revision: row.get("applied_revision"),
         applied_at: applied_at.and_then(|at| DateTime::from_rfc3339(&at.to_rfc3339())),
         reported_tenant_id: row.get("reported_tenant_id"),
@@ -2046,11 +2291,28 @@ mod tests {
         let gateway_id = format!("pg-bind-{nanos}");
 
         let first = store
-            .bind_gateway_customer(&gateway_id, "tenant-a", "alice")
+            .bind_gateway_customer(&gateway_id, "tenant-a", 100, "alice")
             .await
             .expect("bind");
         assert_eq!(first.revision, 1);
         assert_eq!(first.status, "bound");
+
+        // 全中心唯一：另一台网关抢同一实例号 → LaneTaken。
+        let other_gateway = format!("{gateway_id}-other");
+        let err = store
+            .bind_gateway_customer(&other_gateway, "tenant-x", 100, "alice")
+            .await
+            .expect_err("lane conflict");
+        match err {
+            BindGatewayCustomerError::LaneTaken {
+                gateway_id: occupant,
+                wp_ins_id,
+            } => {
+                assert_eq!(occupant, gateway_id);
+                assert_eq!(wp_ins_id, 100);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
 
         let applied = store
             .record_customer_binding_report(&gateway_id, "tenant-a", 1)
@@ -2071,7 +2333,7 @@ mod tests {
 
         // 同客户重绑：不递增 revision，但回到「待生效」。
         let same = store
-            .bind_gateway_customer(&gateway_id, "tenant-a", "bob")
+            .bind_gateway_customer(&gateway_id, "tenant-a", 100, "bob")
             .await
             .expect("repeat");
         assert_eq!(same.revision, 1);
@@ -2079,7 +2341,7 @@ mod tests {
 
         // 换绑：递增并清 applied。
         let changed = store
-            .bind_gateway_customer(&gateway_id, "tenant-b", "bob")
+            .bind_gateway_customer(&gateway_id, "tenant-b", 100, "bob")
             .await
             .expect("rebind");
         assert_eq!(changed.revision, 2);
@@ -2349,5 +2611,100 @@ mod tests {
             .execute(&store.pool)
             .await
             .expect("cleanup jobs");
+    }
+
+    /// 集成测试：实例号释放 / 重新分配（车道唯一性只看未释放行）。需本地 PostgreSQL。
+    ///
+    /// 运行：`cargo test -p wist-center -- --ignored pg_store_release_and_reallocate_wp_ins_id`
+    #[tokio::test]
+    #[ignore = "需要本地 PostgreSQL（docker compose up -d postgres）"]
+    async fn pg_store_release_and_reallocate_wp_ins_id() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let database_url = std::env::var("WARP_INSIGHT_CENTER_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://demo:demo@127.0.0.1:55432/insight_demo".to_string());
+        let store = PgStore::connect(&database_url).await.expect("connect pg");
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let gateway_id = format!("pg-rel-{nanos}");
+        let other_gateway = format!("pg-rel-{nanos}-2");
+
+        store
+            .create_gateway(&gateway_id, "tok")
+            .await
+            .expect("create gateway");
+        store
+            .create_gateway(&other_gateway, "tok2")
+            .await
+            .expect("create other gateway");
+        store
+            .bind_gateway_customer(&gateway_id, "tenant-a", 100, "alice")
+            .await
+            .expect("bind");
+
+        // 未归档不能释放。
+        let err = store
+            .release_gateway_wp_ins_id(&gateway_id, "alice")
+            .await
+            .expect_err("not archived");
+        match err {
+            ReleaseWpInsIdError::GatewayNotArchived => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        store
+            .set_gateway_archived(&gateway_id, Some(DateTime::now()))
+            .await
+            .expect("archive");
+        let released = store
+            .release_gateway_wp_ins_id(&gateway_id, "alice")
+            .await
+            .expect("release");
+        assert!(released.wp_ins_id_released_at.is_some());
+        assert_eq!(released.wp_ins_id_released_by.as_deref(), Some("alice"));
+        assert_eq!(released.status, "released");
+
+        // 释放后 100 可被另一台网关使用。
+        store
+            .bind_gateway_customer(&other_gateway, "tenant-b", 100, "bob")
+            .await
+            .expect("take freed lane");
+
+        // 原网关回来：自动分到 101，revision 递增。
+        match store
+            .allocate_wp_ins_id_if_released(&gateway_id)
+            .await
+            .expect("allocate")
+        {
+            AllocateWpInsIdOutcome::Allocated(binding) => {
+                assert_eq!(binding.wp_ins_id, 101);
+                assert_eq!(binding.revision, 2);
+                assert!(binding.wp_ins_id_released_at.is_none());
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        sqlx::query("DELETE FROM gateway_binding_audit WHERE gateway_id = $1 OR gateway_id = $2")
+            .bind(&gateway_id)
+            .bind(&other_gateway)
+            .execute(&store.pool)
+            .await
+            .expect("cleanup audit");
+        sqlx::query(
+            "DELETE FROM gateway_customer_bindings WHERE gateway_id = $1 OR gateway_id = $2",
+        )
+        .bind(&gateway_id)
+        .bind(&other_gateway)
+        .execute(&store.pool)
+        .await
+        .expect("cleanup bindings");
+        sqlx::query("DELETE FROM gateways WHERE gateway_id = $1 OR gateway_id = $2")
+            .bind(&gateway_id)
+            .bind(&other_gateway)
+            .execute(&store.pool)
+            .await
+            .expect("cleanup gateways");
     }
 }

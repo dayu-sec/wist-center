@@ -18,7 +18,10 @@ use wist_control::{
     GlobalPolicyDispatch,
 };
 
-use crate::infra::{GatewayCustomerBindingRecord, StoreReason, StoredGateway};
+use crate::infra::{
+    BindGatewayCustomerError, GatewayCustomerBindingRecord, ReleaseWpInsIdError, StoreReason,
+    StoredGateway,
+};
 
 use super::{
     ApiState, PeerConnectInfo,
@@ -87,6 +90,14 @@ pub struct AdminGatewayInstanceView {
     pub binding_status: Option<String>,
     #[serde(default)]
     pub binding_revision: Option<i64>,
+    /// wparse 事件号的实例段（`WP_INS_ID`）：页面在「当前绑定」里展示。
+    #[serde(default)]
+    pub wp_ins_id: Option<i64>,
+    /// 实例号显式释放的时刻 / 操作者；非空 = 已释放（可被其他网关使用）。
+    #[serde(default)]
+    pub wp_ins_id_released_at: Option<DateTime>,
+    #[serde(default)]
+    pub wp_ins_id_released_by: Option<String>,
     #[serde(default)]
     pub applied_revision: Option<i64>,
     #[serde(default)]
@@ -123,6 +134,9 @@ fn gateway_instance_view(
         customer_id: binding.map(|binding| binding.customer_id.clone()),
         binding_status: binding.map(|binding| binding.status.clone()),
         binding_revision: binding.map(|binding| binding.revision),
+        wp_ins_id: binding.map(|binding| binding.wp_ins_id),
+        wp_ins_id_released_at: binding.and_then(|binding| binding.wp_ins_id_released_at.clone()),
+        wp_ins_id_released_by: binding.and_then(|binding| binding.wp_ins_id_released_by.clone()),
         applied_revision: binding.and_then(|binding| binding.applied_revision),
         applied_at: binding.and_then(|binding| binding.applied_at.clone()),
         binding_last_error: binding.and_then(|binding| binding.last_error.clone()),
@@ -1801,9 +1815,36 @@ pub async fn admin_set_release_status(
 
 /// 绑定客户请求体：对齐模型 AdminBindGatewayCustomer。
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BindGatewayCustomerRequest {
     pub gateway_id: String,
     pub customer_id: String,
+    /// wparse 事件号的实例段（`wp_event_id` 的 10 bit 实例位），取值 100..=1123。
+    pub wp_ins_id: i64,
+    pub requested_by: String,
+}
+
+/// 绑定记录 → 管理面回执（绑定 / 释放两个端点共用）。
+fn gateway_customer_binding_view(binding: GatewayCustomerBindingRecord) -> GatewayCustomerBinding {
+    GatewayCustomerBinding {
+        gateway_id: binding.gateway_id,
+        customer_id: binding.customer_id,
+        status: binding.status,
+        bound_at: binding.bound_at,
+        revision: binding.revision,
+        wp_ins_id: binding.wp_ins_id,
+        wp_ins_id_released_at: binding.wp_ins_id_released_at,
+        wp_ins_id_released_by: binding.wp_ins_id_released_by,
+        applied_revision: binding.applied_revision,
+        applied_at: binding.applied_at,
+        last_error: binding.last_error,
+    }
+}
+
+/// 显式释放实例号请求体（对齐模型 AdminReleaseGatewayWpInsId）。
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseGatewayWpInsIdRequest {
     pub requested_by: String,
 }
 
@@ -1838,6 +1879,18 @@ pub async fn admin_bind_gateway_customer(
         )
         .into_response();
     }
+    // 实例段是 `wp_event_id` 的一段位（10 bit）：越界会让 wparse 启动失败，这里先挡住。
+    if !wist_control::is_valid_wp_ins_id(request.wp_ins_id) {
+        return super::error::ApiError::bad_request(
+            super::codes::WP_INS_ID_INVALID,
+            format!(
+                "wp_ins_id must be in {}..={} (wparse event-id instance lane)",
+                wist_control::WP_INS_ID_MIN,
+                wist_control::WP_INS_ID_MAX
+            ),
+        )
+        .into_response();
+    }
     // 不存在的网关不允许绑定（先创建实例）。
     let gateway = match state.store.get_gateway(gateway_id).await {
         Ok(Some(gateway)) => gateway,
@@ -1859,11 +1912,31 @@ pub async fn admin_bind_gateway_customer(
     };
     let binding = match state
         .store
-        .bind_gateway_customer(gateway_id, customer_id, request.requested_by.trim())
+        .bind_gateway_customer(
+            gateway_id,
+            customer_id,
+            request.wp_ins_id,
+            request.requested_by.trim(),
+        )
         .await
     {
         Ok(binding) => binding,
-        Err(err) => {
+        Err(BindGatewayCustomerError::LaneTaken {
+            gateway_id: occupant,
+            wp_ins_id,
+        }) => {
+            // 全中心唯一：这个实例号已经属于另一台网关。
+            return super::error::ApiError::conflict(
+                super::codes::WP_INS_ID_CONFLICT,
+                format!(
+                    "wp_ins_id {wp_ins_id} is already used by gateway {occupant}; pick a free lane in {}..={}",
+                    wist_control::WP_INS_ID_MIN,
+                    wist_control::WP_INS_ID_MAX
+                ),
+            )
+            .into_response();
+        }
+        Err(BindGatewayCustomerError::Store(err)) => {
             return super::error::internal_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 super::codes::GATEWAY_BIND_FAILED,
@@ -1880,6 +1953,7 @@ pub async fn admin_bind_gateway_customer(
                 let payload = serde_json::json!({
                     "tenant_id": binding.customer_id,
                     "revision": binding.revision,
+                    "wp_ins_id": binding.wp_ins_id,
                 })
                 .to_string();
                 match proxy
@@ -1914,23 +1988,119 @@ pub async fn admin_bind_gateway_customer(
         }
     }
     log::info!(
-        "event=GatewayCustomerBound gateway_id={} customer_id={} requested_by={} revision={}",
+        "event=GatewayCustomerBound gateway_id={} customer_id={} wp_ins_id={} requested_by={} revision={}",
         gateway_id,
         binding.customer_id,
+        binding.wp_ins_id,
         request.requested_by.trim(),
         binding.revision
     );
-    Json(GatewayCustomerBinding {
-        gateway_id: binding.gateway_id,
-        customer_id: binding.customer_id,
-        status: binding.status,
-        bound_at: binding.bound_at,
-        revision: binding.revision,
-        applied_revision: binding.applied_revision,
-        applied_at: binding.applied_at,
-        last_error: binding.last_error,
-    })
-    .into_response()
+    Json(gateway_customer_binding_view(binding)).into_response()
+}
+
+/// 显式释放已归档网关的实例号：POST /api/v1/admin/gateways/:gateway_id/wp-ins-id:release。
+///
+/// 释放后该车道不再参与全中心唯一性，可被其他网关绑定；绑定行保留原值 + 释放时刻 / 操作者
+/// （用于展示与审计）。网关若重新上线，状态回执里会自动分配一个空闲车道。
+pub async fn admin_release_gateway_wp_ins_id(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    client: PeerConnectInfo,
+    Path(gateway_id): Path<String>,
+    ApiJson(request): ApiJson<ReleaseGatewayWpInsIdRequest>,
+) -> Response {
+    let client_key = rate_limit::client_key(client);
+    if let Err(response) = require_admin_bearer(&state, &headers, &client_key) {
+        return response;
+    }
+    let requested_by = request.requested_by.trim();
+    if requested_by.is_empty() {
+        return super::error::ApiError::bad_request(
+            super::codes::REQUESTED_BY_REQUIRED,
+            "requested_by must not be empty",
+        )
+        .into_response();
+    }
+    let gateway_id = gateway_id.trim();
+    if gateway_id.is_empty() {
+        return super::error::ApiError::bad_request(
+            super::codes::GATEWAY_NOT_FOUND,
+            "gateway_id must not be empty",
+        )
+        .into_response();
+    }
+    // 先给出可读的 404 / 409；store 侧还会在同一事务里再校一次「已归档」，防竞态。
+    match state.store.get_gateway(gateway_id).await {
+        Ok(Some(gateway)) => {
+            if gateway.archived_at.is_none() {
+                return super::error::ApiError::conflict(
+                    super::codes::GATEWAY_NOT_ARCHIVED,
+                    format!(
+                        "gateway {gateway_id} is not archived; archive it before releasing its wp_ins_id"
+                    ),
+                )
+                .into_response();
+            }
+            // 归档只是标记（可能被自动清除），释放前再确认它确实离线：
+            // 在线网关车道被释放后可能被别人占用，而它自己还在继续发号。
+            if gateway_is_online(&gateway) {
+                return super::error::ApiError::conflict(
+                    super::codes::GATEWAY_ONLINE_CANNOT_RELEASE,
+                    format!(
+                        "gateway {gateway_id} is online; only an offline gateway can release its wp_ins_id"
+                    ),
+                )
+                .into_response();
+            }
+        }
+        Ok(None) => {
+            return super::error::ApiError::not_found(
+                super::codes::GATEWAY_NOT_FOUND,
+                format!("unknown gateway {gateway_id}"),
+            )
+            .into_response();
+        }
+        Err(err) => {
+            return super::error::internal_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                super::codes::GATEWAY_LOAD_FAILED,
+                "failed to load gateway",
+                err.display_chain(),
+            );
+        }
+    }
+    match state
+        .store
+        .release_gateway_wp_ins_id(gateway_id, requested_by)
+        .await
+    {
+        Ok(binding) => {
+            log::info!(
+                "event=GatewayWpInsIdReleased gateway_id={} customer_id={} wp_ins_id={} requested_by={}",
+                gateway_id,
+                binding.customer_id,
+                binding.wp_ins_id,
+                requested_by
+            );
+            Json(gateway_customer_binding_view(binding)).into_response()
+        }
+        Err(ReleaseWpInsIdError::BindingNotFound) => super::error::ApiError::not_found(
+            super::codes::GATEWAY_BINDING_NOT_FOUND,
+            format!("gateway {gateway_id} has no customer binding"),
+        )
+        .into_response(),
+        Err(ReleaseWpInsIdError::GatewayNotArchived) => super::error::ApiError::conflict(
+            super::codes::GATEWAY_NOT_ARCHIVED,
+            format!("gateway {gateway_id} is not archived; archive it first"),
+        )
+        .into_response(),
+        Err(ReleaseWpInsIdError::Store(err)) => super::error::internal_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            super::codes::GATEWAY_BINDING_RELEASE_FAILED,
+            "failed to release wp_ins_id",
+            err.display_chain(),
+        ),
+    }
 }
 
 /// 查询某网关最近一次 `bind-tenant` 命令：GET /api/v1/admin/gateways/:gateway_id/bind-command。
@@ -2022,6 +2192,12 @@ pub async fn admin_get_gateway_initial_config(
         enrollment_token_id,
         tenant_id: binding.as_ref().map(|binding| binding.customer_id.clone()),
         binding_revision: binding.as_ref().map(|binding| binding.revision),
+        wp_ins_id: binding.as_ref().and_then(|binding| {
+            binding
+                .wp_ins_id_released_at
+                .is_none()
+                .then_some(binding.wp_ins_id)
+        }),
     })
 }
 
@@ -3140,7 +3316,7 @@ mod tests {
     /// 绑定业务身份：校验 tag-safe、存在性、revision 幂等/递增。
     #[tokio::test]
     async fn bind_customer_validates_and_returns_revision() {
-        let state = state_with_store(gateway_store(1));
+        let state = state_with_store(gateway_store(2));
         let app = super::super::router_for(state.clone());
 
         let (status, body) = post_json(
@@ -3149,12 +3325,14 @@ mod tests {
             serde_json::json!({
                 "gateway_id": "gw-001",
                 "customer_id": "tenant-acme",
+                "wp_ins_id": 100,
                 "requested_by": "admin",
             }),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["customer_id"], "tenant-acme");
+        assert_eq!(body["wp_ins_id"], 100);
         assert_eq!(body["revision"], 1);
         assert_eq!(body["status"], "bound");
 
@@ -3165,6 +3343,7 @@ mod tests {
             serde_json::json!({
                 "gateway_id": "gw-001",
                 "customer_id": "tenant-acme",
+                "wp_ins_id": 100,
                 "requested_by": "admin",
             }),
         )
@@ -3179,12 +3358,52 @@ mod tests {
             serde_json::json!({
                 "gateway_id": "gw-001",
                 "customer_id": "tenant-b",
+                "wp_ins_id": 101,
                 "requested_by": "admin",
             }),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["revision"], 2);
+        assert_eq!(body["wp_ins_id"], 101);
+
+        // 实例段越界（wparse 只接受 100..=1123）：400，且不落库。
+        for invalid in [0, 99, 1124] {
+            let (status, body) = post_json(
+                &app,
+                "/api/v1/admin/gateways/bind",
+                serde_json::json!({
+                    "gateway_id": "gw-001",
+                    "customer_id": "tenant-acme",
+                    "wp_ins_id": invalid,
+                    "requested_by": "admin",
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{invalid}: {body}");
+            assert_eq!(
+                body["error"]["code"],
+                super::super::codes::WP_INS_ID_INVALID,
+                "{invalid}"
+            );
+        }
+
+        // 缺 `wp_ins_id`：请求体不合法（必填参数，不能默默按默认值下发）。
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/admin/gateways/bind",
+            serde_json::json!({
+                "gateway_id": "gw-001",
+                "customer_id": "tenant-acme",
+                "requested_by": "admin",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(
+            body["error"]["code"],
+            super::super::codes::INVALID_REQUEST_BODY
+        );
 
         // tag-safe 校验：空格直接 400。
         let (status, body) = post_json(
@@ -3193,6 +3412,7 @@ mod tests {
             serde_json::json!({
                 "gateway_id": "gw-001",
                 "customer_id": "tenant acme",
+                "wp_ins_id": 100,
                 "requested_by": "admin",
             }),
         )
@@ -3210,6 +3430,7 @@ mod tests {
             serde_json::json!({
                 "gateway_id": "gw-999",
                 "customer_id": "tenant-acme",
+                "wp_ins_id": 100,
                 "requested_by": "admin",
             }),
         )
@@ -3219,6 +3440,48 @@ mod tests {
             body["error"]["code"],
             super::super::codes::GATEWAY_NOT_FOUND
         );
+
+        // 全中心唯一：gw-002 抢 gw-001 的实例号 → 409，且不改绑定。
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/admin/gateways/bind",
+            serde_json::json!({
+                "gateway_id": "gw-002",
+                "customer_id": "tenant-b",
+                "wp_ins_id": 101,
+                "requested_by": "admin",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            body["error"]["code"],
+            super::super::codes::WP_INS_ID_CONFLICT
+        );
+        assert!(
+            state
+                .store
+                .get_customer_binding("gw-002")
+                .await
+                .expect("get")
+                .is_none(),
+            "冲突不能落下绑定"
+        );
+
+        // 换一个空闲车道 → 成功。
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/admin/gateways/bind",
+            serde_json::json!({
+                "gateway_id": "gw-002",
+                "customer_id": "tenant-b",
+                "wp_ins_id": 102,
+                "requested_by": "admin",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["wp_ins_id"], 102);
 
         // 换绑审计：只记**归属变化**（首绑 + 换绑），同客户重复绑定不入库。
         let events = state
@@ -3237,6 +3500,8 @@ mod tests {
         );
         assert_eq!(events[1].revision, 2);
         assert_eq!(events[1].requested_by, "admin");
+        assert_eq!(events[0].wp_ins_id, 100);
+        assert_eq!(events[1].wp_ins_id, 101);
 
         // 管理面可查：GET .../bindings（升序）。
         let (status, history) = get_json(&app, "/api/v1/admin/gateways/gw-001/bindings").await;
@@ -3245,6 +3510,201 @@ mod tests {
         assert_eq!(history.len(), 2);
         assert_eq!(history[1]["customer_id"], "tenant-b");
         assert_eq!(history[1]["previous_customer_id"], "tenant-acme");
+    }
+
+    /// 释放实例号：只允许已归档网关；释放后车道可被其他网关使用。
+    #[tokio::test]
+    async fn release_wp_ins_id_requires_archive_and_frees_the_lane() {
+        let state = state_with_store(gateway_store(2));
+        let app = super::super::router_for(state.clone());
+
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/admin/gateways/bind",
+            serde_json::json!({
+                "gateway_id": "gw-001",
+                "customer_id": "tenant-acme",
+                "wp_ins_id": 100,
+                "requested_by": "admin",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        // 未归档 → 409。
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/admin/gateways/gw-001/wp-ins-id:release",
+            serde_json::json!({ "requested_by": "admin" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            body["error"]["code"],
+            super::super::codes::GATEWAY_NOT_ARCHIVED
+        );
+
+        state
+            .store
+            .set_gateway_archived("gw-001", Some(DateTime::now()))
+            .await
+            .expect("archive gateway");
+
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/admin/gateways/gw-001/wp-ins-id:release",
+            serde_json::json!({ "requested_by": "admin" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "released");
+        assert!(body["wp_ins_id_released_at"].is_string(), "{body}");
+        assert_eq!(body["wp_ins_id_released_by"], "admin");
+        assert_eq!(body["wp_ins_id"], 100);
+        let released_at = body["wp_ins_id_released_at"].clone();
+
+        // 重复释放幂等：保留首次时刻 / 操作者。
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/admin/gateways/gw-001/wp-ins-id:release",
+            serde_json::json!({ "requested_by": "carol" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["wp_ins_id_released_at"], released_at);
+        assert_eq!(body["wp_ins_id_released_by"], "admin");
+
+        // 缺操作人 → 400。
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/admin/gateways/gw-001/wp-ins-id:release",
+            serde_json::json!({ "requested_by": "  " }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            body["error"]["code"],
+            super::super::codes::REQUESTED_BY_REQUIRED
+        );
+
+        // 释放后该车道可被另一台网关使用。
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/admin/gateways/bind",
+            serde_json::json!({
+                "gateway_id": "gw-002",
+                "customer_id": "tenant-b",
+                "wp_ins_id": 100,
+                "requested_by": "admin",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["wp_ins_id"], 100);
+
+        // 不存在的网关 → 404。
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/admin/gateways/gw-999/wp-ins-id:release",
+            serde_json::json!({ "requested_by": "admin" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(
+            body["error"]["code"],
+            super::super::codes::GATEWAY_NOT_FOUND
+        );
+    }
+
+    /// 释放的两个前置：必须离线（归档标记可能滞后）+ 必须已有绑定。
+    #[tokio::test]
+    async fn release_wp_ins_id_requires_offline_and_a_binding() {
+        let state = state_with_store(gateway_store(2));
+        let app = super::super::router_for(state.clone());
+
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/admin/gateways/bind",
+            serde_json::json!({
+                "gateway_id": "gw-001",
+                "customer_id": "tenant-acme",
+                "wp_ins_id": 100,
+                "requested_by": "admin",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        // 状态仍是 online（心跳频繁），但归档标记已被绕过写进去了 —— 这种窗口不能释放。
+        state
+            .store
+            .upsert_gateway_status(&crate::infra::GatewayStatusUpdate {
+                gateway_id: "gw-001".to_string(),
+                instance_id: "inst-1".to_string(),
+                version: "0.1.0".to_string(),
+                gops_version: None,
+                gx_version: None,
+                gwlinkd_version: None,
+                status: "online".to_string(),
+                health: "ok".to_string(),
+                memory_bytes: None,
+                cpu_percent: None,
+                public_base_url: None,
+                last_seen_at: DateTime::now(),
+                uptime_seconds: None,
+                agent_count: None,
+                online_agents: None,
+                offline_agents: None,
+                last_seen_lag_seconds: None,
+                store_bytes: None,
+                ingest_accepted_total: None,
+                ingest_rejected_total: None,
+                last_ingest_at: None,
+                memory_total_bytes: None,
+                load_1m: None,
+                load_5m: None,
+                load_15m: None,
+                disk_usage_percent: None,
+                disk_total_bytes: None,
+                disk_available_bytes: None,
+            })
+            .await
+            .expect("mark online");
+        state
+            .store
+            .set_gateway_archived("gw-001", Some(DateTime::now()))
+            .await
+            .expect("archive online gateway");
+
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/admin/gateways/gw-001/wp-ins-id:release",
+            serde_json::json!({ "requested_by": "admin" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            body["error"]["code"],
+            super::super::codes::GATEWAY_ONLINE_CANNOT_RELEASE
+        );
+
+        // 已归档但没有客户绑定 → 404 binding_not_found。
+        state
+            .store
+            .set_gateway_archived("gw-002", Some(DateTime::now()))
+            .await
+            .expect("archive gw-002");
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/admin/gateways/gw-002/wp-ins-id:release",
+            serde_json::json!({ "requested_by": "admin" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(
+            body["error"]["code"],
+            super::super::codes::GATEWAY_BINDING_NOT_FOUND
+        );
     }
 
     /// 建一份计划（目标都已在册），返回 (state, app, plan_id)。
